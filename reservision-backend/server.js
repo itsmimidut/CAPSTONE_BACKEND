@@ -12,6 +12,7 @@
  * Dependencies:
  * - express: Web framework for handling HTTP requests
  * - cors: Middleware to enable Cross-Origin Resource Sharing
+ * - dotenv: Load environment variables from .env file
  * 
  * Features:
  * - CORS enabled for frontend communication
@@ -21,6 +22,7 @@
  *   - Promotional Pricing
  *   - Seasonal Pricing
  *   - Restaurant Management (tables, menu, orders, inventory)
+ *   - AI-powered Chatbot
  * 
  * Server Configuration:
  * - PORT: 8000
@@ -28,11 +30,16 @@
  * 
  * Environment Setup:
  * - Ensure database is configured in config/db.js
+ * - Create .env file with API keys
  * - Node version: 14+ required
  * 
  * Usage:
  * npm start
  */
+
+// Load environment variables from .env file
+import dotenv from 'dotenv';
+dotenv.config();
 
 import express from "express";
 import cors from "cors";
@@ -51,6 +58,7 @@ import menuRoutes from "./routes/restaurant/menu.js";
 import inventoryRoutes from "./routes/restaurant/inventory.js";
 import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
+import chatbotRoutes from "./routes/chatbot.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -115,6 +123,9 @@ app.use("/api/rates", ratesRoutes);
 
 // Swimming Enrollment Management
 app.use("/api/swimming", swimmingRoutes);
+
+// Chatbot AI Assistant
+app.use("/api/resort", chatbotRoutes);
 
 // ============================================================
 // SERVER STARTUP
