@@ -216,3 +216,73 @@ INSERT INTO swimming_coaches (name, specialization, experience_years, certificat
 ('Coach Maria Santos', 'Beginner & Kids Training', 8, 'PSIA Level 3, First Aid & CPR Certified', 'Experienced swimming instructor specializing in teaching children and beginners. Patient and encouraging teaching style.', 'Monday-Friday: 8AM-5PM, Saturday: 8AM-12PM', 15),
 ('Coach Juan Dela Cruz', 'Advanced Training & Competitive Swimming', 12, 'PSIA Level 4, Olympic Training Certified', 'Former competitive swimmer with 12 years of coaching experience. Specializes in stroke refinement and competitive training.', 'Monday-Saturday: 6AM-2PM', 10),
 ('Coach Sarah Reyes', 'Private Lessons & Adult Swimming', 6, 'PSIA Level 3, Aqua Aerobics Certified', 'Specializes in one-on-one coaching and helping adults overcome their fear of water. Gentle and supportive approach.', 'Tuesday-Sunday: 10AM-6PM', 12);
+
+-- ============================================================
+-- POS (Point of Sale) TABLES
+-- ============================================================
+
+-- Create pos_transactions table
+CREATE TABLE IF NOT EXISTS pos_transactions (
+  transaction_id INT AUTO_INCREMENT PRIMARY KEY,
+  receipt_no VARCHAR(50) NOT NULL UNIQUE,
+  items LONGTEXT NOT NULL,
+  type VARCHAR(50) DEFAULT 'Walk-in',
+  payment_method VARCHAR(50) NOT NULL,
+  total_amount DECIMAL(10, 2) NOT NULL,
+  transaction_date DATE NOT NULL,
+  transaction_time TIME NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_receipt (receipt_no),
+  INDEX idx_date (transaction_date),
+  INDEX idx_payment (payment_method)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Create pos_items table (catalog of services/items for sale)
+CREATE TABLE IF NOT EXISTS pos_items (
+  item_id INT AUTO_INCREMENT PRIMARY KEY,
+  category VARCHAR(50) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  price DECIMAL(10, 2) NOT NULL,
+  description TEXT,
+  available BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_category (category),
+  INDEX idx_available (available)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Insert sample POS items
+INSERT INTO pos_items (category, name, price, description) VALUES
+-- Restaurant Items
+('restaurant', 'Breakfast Set', 350.00, 'Complete breakfast meal'),
+('restaurant', 'Lunch Buffet', 450.00, 'All-you-can-eat lunch buffet'),
+('restaurant', 'Dinner Set', 500.00, 'Premium dinner set meal'),
+('restaurant', 'Coffee', 80.00, 'Hot or iced coffee'),
+('restaurant', 'Soft Drinks', 50.00, 'Assorted soft drinks'),
+('restaurant', 'Dessert', 120.00, 'Daily dessert selection'),
+
+-- Room Items
+('rooms', 'Standard Room', 2500.00, 'Comfortable standard room'),
+('rooms', 'Deluxe Room', 3500.00, 'Deluxe room with amenities'),
+('rooms', 'Suite Room', 5000.00, 'Premium suite accommodation'),
+('rooms', 'Extra Bed', 800.00, 'Additional bed for room'),
+('rooms', 'Room Upgrade', 1500.00, 'Upgrade to higher room category'),
+('rooms', 'Room Service', 200.00, 'In-room service charge'),
+
+-- Cottage Items
+('cottage', 'Small Cottage', 1500.00, 'Cozy cottage for small groups'),
+('cottage', 'Medium Cottage', 2500.00, 'Mid-size cottage rental'),
+('cottage', 'Large Cottage', 3500.00, 'Spacious cottage for large groups'),
+('cottage', 'Pool Access', 200.00, 'Swimming pool access'),
+('cottage', 'BBQ Grill', 300.00, 'BBQ grill rental'),
+('cottage', 'Karaoke', 500.00, 'Karaoke system rental'),
+
+-- Event Items
+('event', 'Wedding Package', 50000.00, 'Complete wedding package'),
+('event', 'Birthday Package', 15000.00, 'Birthday celebration package'),
+('event', 'Conference Package', 25000.00, 'Business conference package'),
+('event', 'Event Venue', 10000.00, 'Event venue rental'),
+('event', 'Catering Service', 8000.00, 'Full catering service'),
+('event', 'Sound System', 3000.00, 'Professional sound system rental');
+

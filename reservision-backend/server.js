@@ -51,6 +51,7 @@ import menuRoutes from "./routes/restaurant/menu.js";
 import inventoryRoutes from "./routes/restaurant/inventory.js";
 import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
+import posRoutes from "./routes/pos.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -115,6 +116,42 @@ app.use("/api/rates", ratesRoutes);
 
 // Swimming Enrollment Management
 app.use("/api/swimming", swimmingRoutes);
+
+// POS (Point of Sale) Management
+app.use("/api/pos", posRoutes);
+
+// ============================================================
+// ROOT ROUTE - API INFO
+// ============================================================
+/**
+ * Welcome/Info endpoint
+ * Provides API documentation and available endpoints
+ */
+app.get("/", (req, res) => {
+  res.json({
+    message: "Reservision Backend API",
+    version: "1.0.0",
+    status: "Running",
+    endpoints: {
+      rooms: "/api/rooms",
+      promos: "/api/promos",
+      seasons: "/api/seasons",
+      restaurant: {
+        tables: "/api/restaurant/tables",
+        menu: "/api/restaurant/menu",
+        orders: "/api/restaurant/orders",
+        inventory: "/api/restaurant/inventory"
+      },
+      rates: "/api/rates",
+      swimming: "/api/swimming",
+      pos: {
+        items: "/api/pos/items",
+        transactions: "/api/pos/transactions"
+      }
+    },
+    documentation: "Visit /api/{endpoint} to access resources"
+  });
+});
 
 // ============================================================
 // SERVER STARTUP
