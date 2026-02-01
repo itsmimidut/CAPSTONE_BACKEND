@@ -52,6 +52,8 @@ import inventoryRoutes from "./routes/restaurant/inventory.js";
 import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
 import posRoutes from "./routes/pos.js";
+import xenditRoutes from "./routes/xendit.js";
+import paymongoRoutes from "./routes/paymongo.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -119,6 +121,12 @@ app.use("/api/swimming", swimmingRoutes);
 
 // POS (Point of Sale) Management
 app.use("/api/pos", posRoutes);
+
+// Xendit Payment Gateway
+app.use("/api/xendit", xenditRoutes);
+
+// PayMongo Payment Gateway
+app.use("/api/paymongo", paymongoRoutes);
 
 // ============================================================
 // ROOT ROUTE - API INFO
