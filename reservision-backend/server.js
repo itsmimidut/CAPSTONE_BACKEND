@@ -53,6 +53,8 @@ import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
 import posRoutes from "./routes/pos.js";
 import bookingsRoutes from "./routes/bookings.js";
+import xenditRoutes from "./routes/xendit.js";
+import paymongoRoutes from "./routes/paymongo.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -123,6 +125,11 @@ app.use("/api/pos", posRoutes);
 
 // Bookings/Reservations Management
 app.use("/api/bookings", bookingsRoutes);
+// Xendit Payment Gateway
+app.use("/api/xendit", xenditRoutes);
+
+// PayMongo Payment Gateway
+app.use("/api/paymongo", paymongoRoutes);
 
 // ============================================================
 // ROOT ROUTE - API INFO

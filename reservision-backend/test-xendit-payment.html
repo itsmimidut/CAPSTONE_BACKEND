@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xendit Payment Test</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    
+    .container {
+      background: white;
+      border-radius: 20px;
+      padding: 40px;
+      max-width: 600px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    }
+    
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+      font-size: 28px;
+    }
+    
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    
+    .form-group {
+      margin-bottom: 20px;
+    }
+    
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: #333;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    
+    input, select {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e2e8f0;
+      border-radius: 10px;
+      font-size: 14px;
+      transition: all 0.3s;
+    }
+    
+    input:focus, select:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    .payment-methods {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    
+    .payment-method {
+      padding: 16px;
+      border: 2px solid #e2e8f0;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: all 0.3s;
+      text-align: center;
+    }
+    
+    .payment-method:hover {
+      border-color: #667eea;
+      transform: translateY(-2px);
+    }
+    
+    .payment-method.active {
+      border-color: #667eea;
+      background: #f0f4ff;
+    }
+    
+    .payment-method-icon {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+    
+    .payment-method-name {
+      font-weight: 600;
+      font-size: 14px;
+      color: #333;
+    }
+    
+    button {
+      width: 100%;
+      padding: 16px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+    
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+    }
+    
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+    
+    .result {
+      margin-top: 20px;
+      padding: 16px;
+      border-radius: 12px;
+      display: none;
+    }
+    
+    .result.success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+    
+    .result.error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+    
+    .result-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    
+    .invoice-link {
+      margin-top: 12px;
+      padding: 12px;
+      background: white;
+      border-radius: 8px;
+      word-break: break-all;
+    }
+    
+    .invoice-link a {
+      color: #667eea;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    
+    .loading {
+      display: none;
+      text-align: center;
+      margin-top: 20px;
+    }
+    
+    .spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 1s linear infinite;
+      margin: 0 auto;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔒 Xendit Payment Test</h1>
+    <p class="subtitle">Test your payment integration</p>
+    
+    <form id="paymentForm">
+      <div class="form-group">
+        <label>Customer Name *</label>
+        <input type="text" id="customerName" value="Juan Dela Cruz" required>
+      </div>
+      
+      <div class="form-group">
+        <label>Email *</label>
+        <input type="email" id="email" value="customer@example.com" required>
+      </div>
+      
+      <div class="form-group">
+        <label>Amount (PHP) *</label>
+        <input type="number" id="amount" value="1000" min="1" required>
+      </div>
+      
+      <div class="form-group">
+        <label>Payment Method *</label>
+        <div class="payment-methods">
+          <div class="payment-method active" data-method="gcash">
+            <div class="payment-method-icon">💳</div>
+            <div class="payment-method-name">GCash</div>
+          </div>
+          <div class="payment-method" data-method="paymaya">
+            <div class="payment-method-icon">📱</div>
+            <div class="payment-method-name">PayMaya</div>
+          </div>
+          <div class="payment-method" data-method="bank">
+            <div class="payment-method-icon">🏦</div>
+            <div class="payment-method-name">Bank</div>
+          </div>
+        </div>
+      </div>
+      
+      <button type="submit" id="submitBtn">
+        🚀 Create Payment
+      </button>
+    </form>
+    
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+      <p style="margin-top: 12px; color: #666;">Creating payment...</p>
+    </div>
+    
+    <div class="result" id="result"></div>
+  </div>
+
+  <script>
+    let selectedPaymentMethod = 'gcash';
+    
+    // Payment method selection
+    document.querySelectorAll('.payment-method').forEach(method => {
+      method.addEventListener('click', () => {
+        document.querySelectorAll('.payment-method').forEach(m => m.classList.remove('active'));
+        method.classList.add('active');
+        selectedPaymentMethod = method.dataset.method;
+      });
+    });
+    
+    // Form submission
+    document.getElementById('paymentForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      const submitBtn = document.getElementById('submitBtn');
+      const loading = document.getElementById('loading');
+      const result = document.getElementById('result');
+      
+      // Show loading
+      submitBtn.disabled = true;
+      loading.style.display = 'block';
+      result.style.display = 'none';
+      
+      const bookingId = 'TEST' + Date.now().toString().slice(-8);
+      
+      const payload = {
+        amount: parseFloat(document.getElementById('amount').value),
+        email: document.getElementById('email').value,
+        bookingId: bookingId,
+        customerName: document.getElementById('customerName').value,
+        paymentMethod: selectedPaymentMethod,
+        description: `Test Payment - ${bookingId}`
+      };
+      
+      try {
+        const response = await fetch('http://localhost:8000/api/xendit/create-payment', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+        
+        const data = await response.json();
+        
+        loading.style.display = 'none';
+        result.style.display = 'block';
+        
+        if (response.ok && data.success) {
+          result.className = 'result success';
+          result.innerHTML = `
+            <div class="result-title">✅ Payment Created Successfully!</div>
+            <p><strong>Invoice ID:</strong> ${data.invoice_id}</p>
+            <p><strong>Booking ID:</strong> ${data.external_id}</p>
+            <p><strong>Amount:</strong> ₱${data.amount.toLocaleString()}</p>
+            <p><strong>Status:</strong> ${data.status}</p>
+            <div class="invoice-link">
+              <strong>Payment URL:</strong><br>
+              <a href="${data.invoice_url}" target="_blank">${data.invoice_url}</a>
+            </div>
+            <button onclick="window.open('${data.invoice_url}', '_blank')" 
+                    style="margin-top: 12px; background: #28a745;">
+              🔗 Open Payment Page
+            </button>
+          `;
+        } else {
+          result.className = 'result error';
+          result.innerHTML = `
+            <div class="result-title">❌ Payment Failed</div>
+            <p><strong>Error:</strong> ${data.error || 'Unknown error'}</p>
+            ${data.details ? `<pre style="margin-top: 8px; font-size: 12px;">${JSON.stringify(data.details, null, 2)}</pre>` : ''}
+          `;
+        }
+        
+      } catch (error) {
+        loading.style.display = 'none';
+        result.style.display = 'block';
+        result.className = 'result error';
+        result.innerHTML = `
+          <div class="result-title">❌ Connection Error</div>
+          <p>Cannot connect to backend server.</p>
+          <p><strong>Make sure:</strong></p>
+          <ul style="margin-left: 20px; margin-top: 8px;">
+            <li>Backend is running on port 8000</li>
+            <li>XENDIT_SECRET_KEY is set in .env</li>
+            <li>CORS is enabled</li>
+          </ul>
+          <p style="margin-top: 8px; font-size: 12px; color: #666;">${error.message}</p>
+        `;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
