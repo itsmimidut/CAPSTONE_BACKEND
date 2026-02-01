@@ -1,0 +1,249 @@
+import db from '../config/db.js';
+
+// Using Google Gemini AI (FREE!)
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// Initialize Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Optional: OpenAI (if you want to switch later)
+// import OpenAI from 'openai';
+// const openai = new OpenAI({
+//   apiKey: process.env.OPENAI_API_KEY
+// });
+
+// Helper function to get resort data for AI context
+async function getResortContext() {
+  try {
+    const [rooms] = await db.query(
+      'SELECT item_id, category, category_type, room_number, name, description, max_guests, price, status FROM inventory_items WHERE category = "Room" ORDER BY price ASC'
+    );
+    
+    const [cottages] = await db.query(
+      'SELECT item_id, category, category_type, room_number, name, description, max_guests, price, status FROM inventory_items WHERE category = "Cottage" ORDER BY price ASC'
+    );
+    
+    const [promos] = await db.query(
+      'SELECT code, type, value, description, startDate, endDate FROM promos WHERE endDate >= CURDATE() ORDER BY value DESC'
+    );
+    
+    const [entranceRates] = await db.query(
+      'SELECT label, value FROM rate_entries WHERE category = "entrance"'
+    );
+    
+    const [cottageRates] = await db.query(
+      'SELECT label, value FROM rate_entries WHERE category = "cottages"'
+    );
+    
+    const [packageRates] = await db.query(
+      'SELECT label, value FROM rate_entries WHERE category = "packages"'
+    );
+    
+    const [menu] = await db.query(
+      'SELECT name, price, category, available, description FROM menu_items WHERE available = TRUE ORDER BY category, name'
+    );
+    
+    const [coaches] = await db.query(
+      'SELECT name, specialization, experience_years, certification, availability FROM swimming_coaches WHERE status = "Active"'
+    );
+    
+    return {
+      rooms,
+      cottages,
+      promos,
+      rates: {
+        entrance: entranceRates,
+        cottages: cottageRates,
+        packages: packageRates
+      },
+      menu,
+      coaches,
+      generalInfo: {
+        name: "Eduardo's Resort",
+        location: "Eduardo's Resort, [Your Address]",
+        email: "info@eduardosresort.com",
+        phone: "[Your Phone Number]",
+        hours: "24/7 for guests, Office: 8AM-6PM",
+        amenities: [
+          "Swimming Pool",
+          "Restaurant",
+          "Beach Access",
+          "Videoke Rooms",
+          "Function Hall",
+          "Parking Area",
+          "WiFi Available"
+        ]
+      }
+    };
+  } catch (error) {
+    console.error('Error fetching resort context:', error);
+    return null;
+  }
+}
+
+// Main chat endpoint with AI
+export const chat = async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+    
+    // Get real-time resort data
+    const resortData = await getResortContext();
+    
+    if (!resortData) {
+      return res.status(500).json({ 
+        reply: 'Sorry, may technical issue ako ngayon. Please try again later! 😊'
+      });
+    }
+    
+    // Build context for AI
+    const systemPrompt = `You are a helpful, friendly assistant for Eduardo's Resort in the Philippines. 
+You speak both English and Tagalog/Filipino. Be conversational, warm, and helpful.
+
+IMPORTANT RULES:
+- Always use REAL DATA from the context provided below
+- Never make up information - only use data from the context
+- Format prices as ₱X,XXX (Philippine Peso)
+- Be concise but informative
+- Use emojis appropriately (🏨🏖️💰🍽️🏊 etc.)
+- If asked about availability, show actual available rooms/cottages
+- If asked about prices, show real prices from database
+- For promos, show active promo codes and discounts
+
+CURRENT RESORT DATA (Use this for answers):
+
+AVAILABLE ROOMS (${resortData.rooms.filter(r => r.status === 'Available').length} available):
+${JSON.stringify(resortData.rooms, null, 2)}
+
+AVAILABLE COTTAGES (${resortData.cottages.filter(c => c.status === 'Available').length} available):
+${JSON.stringify(resortData.cottages, null, 2)}
+
+ACTIVE PROMOS (${resortData.promos.length} active):
+${JSON.stringify(resortData.promos, null, 2)}
+
+ENTRANCE RATES:
+${JSON.stringify(resortData.rates.entrance, null, 2)}
+
+COTTAGE RENTAL RATES:
+${JSON.stringify(resortData.rates.cottages, null, 2)}
+
+PACKAGE RATES:
+${JSON.stringify(resortData.rates.packages, null, 2)}
+
+RESTAURANT MENU:
+${JSON.stringify(resortData.menu, null, 2)}
+
+SWIMMING COACHES:
+${JSON.stringify(resortData.coaches, null, 2)}
+
+CONTACT INFO:
+${JSON.stringify(resortData.generalInfo, null, 2)}
+
+Remember: Be helpful, friendly, and ONLY use the real data provided above!`;
+
+    // Call OpenAI API
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo", // or "gpt-4" for better quality
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: message }
+      ],
+      temperature: 0.7,
+      max_tokens: 500
+    });
+    
+    const reply = completion.choices[0].message.content;
+    
+    res.json({
+      reply,
+      model: 'openai-gpt-3.5-turbo',
+      timestamp: new Date()
+    });
+    
+  } catch (error) {
+    console.error('Chatbot AI error:', error);
+    
+    // Fallback response
+    res.status(500).json({ 
+      error: 'Chatbot error',
+      reply: 'Sorry, may problema ako ngayon. Please try again or contact our staff directly! 😊'
+    });
+  }
+};
+
+// Alternative: Google Gemini Version
+export const chatWithGemini = async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+    
+    // Initialize Gemini
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    
+    // Get resort data
+    const resortData = await getResortContext();
+    
+    const prompt = `You are Eduardo's Resort assistant. Answer this question using ONLY the real data below.
+
+Question: ${message}
+
+Resort Data:
+- Available Rooms: ${JSON.stringify(resortData.rooms.filter(r => r.status === 'Available'))}
+- Active Promos: ${JSON.stringify(resortData.promos)}
+- Menu: ${JSON.stringify(resortData.menu)}
+- Coaches: ${JSON.stringify(resortData.coaches)}
+
+Be helpful, use emojis, and speak English/Tagalog.`;
+
+    const result = await model.generateContent(prompt);
+    const reply = result.response.text();
+    
+    res.json({
+      reply,
+      model: 'google-gemini-pro',
+      timestamp: new Date()
+    });
+    
+  } catch (error) {
+    console.error('Gemini error:', error);
+    res.status(500).json({ 
+      reply: 'Sorry, may problema ako ngayon. Please try again later! 😊'
+    });
+  }
+};
+
+// Get chatbot statistics
+export const getStats = async (req, res) => {
+  try {
+    const [rooms] = await db.query(
+      'SELECT COUNT(*) as count FROM inventory_items WHERE category = "Room" AND status = "Available"'
+    );
+    const [cottages] = await db.query(
+      'SELECT COUNT(*) as count FROM inventory_items WHERE category = "Cottage" AND status = "Available"'
+    );
+    const [promos] = await db.query(
+      'SELECT COUNT(*) as count FROM promos WHERE endDate >= CURDATE()'
+    );
+    const [coaches] = await db.query(
+      'SELECT COUNT(*) as count FROM swimming_coaches WHERE status = "Active"'
+    );
+    
+    res.json({
+      availableRooms: rooms[0].count,
+      availableCottages: cottages[0].count,
+      activePromos: promos[0].count,
+      activeCoaches: coaches[0].count,
+      timestamp: new Date()
+    });
+  } catch (error) {
+    console.error('Stats error:', error);
+    res.status(500).json({ error: 'Failed to get stats' });
+  }
+};
