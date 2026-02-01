@@ -52,6 +52,7 @@ import inventoryRoutes from "./routes/restaurant/inventory.js";
 import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
 import posRoutes from "./routes/pos.js";
+import bookingsRoutes from "./routes/bookings.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -120,6 +121,9 @@ app.use("/api/swimming", swimmingRoutes);
 // POS (Point of Sale) Management
 app.use("/api/pos", posRoutes);
 
+// Bookings/Reservations Management
+app.use("/api/bookings", bookingsRoutes);
+
 // ============================================================
 // ROOT ROUTE - API INFO
 // ============================================================
@@ -147,6 +151,13 @@ app.get("/", (req, res) => {
       pos: {
         items: "/api/pos/items",
         transactions: "/api/pos/transactions"
+      },
+      bookings: {
+        all: "/api/bookings",
+        create: "/api/bookings",
+        byId: "/api/bookings/:id",
+        byReference: "/api/bookings/reference/:reference",
+        occupiedDates: "/api/bookings/occupied-dates"
       }
     },
     documentation: "Visit /api/{endpoint} to access resources"
