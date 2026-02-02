@@ -55,6 +55,9 @@ import posRoutes from "./routes/pos.js";
 import bookingsRoutes from "./routes/bookings.js";
 import xenditRoutes from "./routes/xendit.js";
 import paymongoRoutes from "./routes/paymongo.js";
+import chatbotRoutes from "./routes/chatbot.js";
+import otpRoutes from "./routes/otp.js";
+import customersRoutes from "./routes/customers.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -130,6 +133,15 @@ app.use("/api/xendit", xenditRoutes);
 
 // PayMongo Payment Gateway
 app.use("/api/paymongo", paymongoRoutes);
+
+// Chatbot AI Assistant
+app.use("/api/resort", chatbotRoutes);
+
+// OTP Email Verification
+app.use("/api/otp", otpRoutes);
+
+// Customer Management
+app.use("/api/customers", customersRoutes);
 
 // ============================================================
 // ROOT ROUTE - API INFO
