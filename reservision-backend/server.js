@@ -36,6 +36,9 @@
 
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 // ============================================================
 // ROUTE IMPORTS
@@ -55,6 +58,9 @@ import posRoutes from "./routes/pos.js";
 import bookingsRoutes from "./routes/bookings.js";
 import xenditRoutes from "./routes/xendit.js";
 import paymongoRoutes from "./routes/paymongo.js";
+import customersRoutes from "./routes/customers.js";
+import otpRoutes from "./routes/otp.js";
+import chatbotRoutes from "./routes/chatbot.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -131,6 +137,13 @@ app.use("/api/xendit", xenditRoutes);
 // PayMongo Payment Gateway
 app.use("/api/paymongo", paymongoRoutes);
 
+// Customers & Email OTP Verification
+app.use("/api/customers", customersRoutes);
+app.use("/api/otp", otpRoutes);
+
+// Resort Chatbot (Groq/Llama)
+app.use("/api/resort", chatbotRoutes);
+
 // ============================================================
 // ROOT ROUTE - API INFO
 // ============================================================
@@ -165,6 +178,11 @@ app.get("/", (req, res) => {
         byId: "/api/bookings/:id",
         byReference: "/api/bookings/reference/:reference",
         occupiedDates: "/api/bookings/occupied-dates"
+      },
+      resort: {
+        chatGroq: "/api/resort/chat/groq",
+        chat: "/api/resort/chat",
+        stats: "/api/resort/stats"
       }
     },
     documentation: "Visit /api/{endpoint} to access resources"
