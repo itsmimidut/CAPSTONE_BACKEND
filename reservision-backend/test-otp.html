@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test OTP Email System</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        h1 {
+            color: #2B6CB0;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        
+        .subtitle {
+            color: #718096;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .step {
+            background: #F7FAFC;
+            border-left: 4px solid #4299E1;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        
+        .step h3 {
+            color: #2D3748;
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+        
+        .input-group {
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            color: #4A5568;
+            margin-bottom: 5px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        
+        input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #E2E8F0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #4299E1;
+            box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1);
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: transform 0.2s;
+            width: 100%;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .result {
+            margin-top: 15px;
+            padding: 12px 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .result.success {
+            background: #C6F6D5;
+            color: #22543D;
+            border: 1px solid #9AE6B4;
+        }
+        
+        .result.error {
+            background: #FED7D7;
+            color: #742A2A;
+            border: 1px solid #FC8181;
+        }
+        
+        .result.info {
+            background: #BEE3F8;
+            color: #2C5282;
+            border: 1px solid #90CDF4;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            background: #48BB78;
+            color: white;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="badge">🧪 Test Mode</div>
+        <h1>📧 OTP Email Test</h1>
+        <p class="subtitle">Eduardo's Resort - Booking System</p>
+        
+        <!-- STEP 1: Send OTP -->
+        <div class="step">
+            <h3>Step 1: Send OTP Email</h3>
+            <div class="input-group">
+                <label for="email">Email Address</label>
+                <input 
+                    type="email" 
+                    id="email" 
+                    placeholder="your-email@gmail.com"
+                    value="">
+            </div>
+            <div class="input-group">
+                <label for="firstName">First Name (Optional)</label>
+                <input 
+                    type="text" 
+                    id="firstName" 
+                    placeholder="Juan"
+                    value="Guest">
+            </div>
+            <button id="sendOtpBtn" onclick="sendOTP()">
+                Send Verification Code
+            </button>
+            <div id="sendResult" class="result"></div>
+        </div>
+        
+        <!-- STEP 2: Verify OTP -->
+        <div class="step">
+            <h3>Step 2: Verify OTP Code</h3>
+            <div class="input-group">
+                <label for="otpCode">6-Digit Code (from email)</label>
+                <input 
+                    type="text" 
+                    id="otpCode" 
+                    placeholder="123456"
+                    maxlength="6"
+                    pattern="\d{6}">
+            </div>
+            <button id="verifyOtpBtn" onclick="verifyOTP()">
+                Verify Code
+            </button>
+            <div id="verifyResult" class="result"></div>
+        </div>
+        
+        <!-- STEP 3: Resend OTP -->
+        <div class="step">
+            <h3>Step 3: Resend OTP (Optional)</h3>
+            <p style="color: #718096; font-size: 13px; margin-bottom: 15px;">
+                If you didn't receive the email or code expired
+            </p>
+            <button id="resendOtpBtn" onclick="resendOTP()">
+                Resend Code
+            </button>
+            <div id="resendResult" class="result"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000/api';
+        
+        // Helper function to show result
+        function showResult(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.textContent = message;
+            element.className = `result ${type}`;
+            element.style.display = 'block';
+        }
+        
+        // Helper function to set loading state
+        function setLoading(buttonId, isLoading) {
+            const button = document.getElementById(buttonId);
+            button.disabled = isLoading;
+            if (isLoading) {
+                button.innerHTML = '<span class="loading"></span>Processing...';
+            }
+        }
+        
+        // Send OTP
+        async function sendOTP() {
+            const email = document.getElementById('email').value.trim();
+            const firstName = document.getElementById('firstName').value.trim() || 'Guest';
+            
+            if (!email) {
+                showResult('sendResult', '❌ Please enter your email address', 'error');
+                return;
+            }
+            
+            // Basic email validation
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                showResult('sendResult', '❌ Please enter a valid email address', 'error');
+                return;
+            }
+            
+            setLoading('sendOtpBtn', true);
+            
+            try {
+                const response = await fetch(`${API_BASE}/otp/send`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, firstName })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showResult('sendResult', 
+                        `✅ ${data.message}! Check your inbox (and spam folder). Code expires in ${data.expiresIn / 60} minutes.`, 
+                        'success');
+                } else {
+                    showResult('sendResult', `❌ ${data.error}`, 'error');
+                }
+            } catch (error) {
+                console.error('Send OTP error:', error);
+                showResult('sendResult', 
+                    '❌ Failed to send email. Make sure backend server is running and RESEND_API_KEY is configured.', 
+                    'error');
+            } finally {
+                // Reset button
+                const button = document.getElementById('sendOtpBtn');
+                button.disabled = false;
+                button.textContent = 'Send Verification Code';
+            }
+        }
+        
+        // Verify OTP
+        async function verifyOTP() {
+            const email = document.getElementById('email').value.trim();
+            const otp = document.getElementById('otpCode').value.trim();
+            
+            if (!email) {
+                showResult('verifyResult', '❌ Please enter your email address first', 'error');
+                return;
+            }
+            
+            if (!otp || otp.length !== 6 || !/^\d{6}$/.test(otp)) {
+                showResult('verifyResult', '❌ Please enter a valid 6-digit code', 'error');
+                return;
+            }
+            
+            setLoading('verifyOtpBtn', true);
+            
+            try {
+                const response = await fetch(`${API_BASE}/otp/verify`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, otp })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showResult('verifyResult', `✅ ${data.message}! You can now proceed with booking.`, 'success');
+                } else {
+                    if (data.expired) {
+                        showResult('verifyResult', `❌ ${data.error} Click "Resend Code" below.`, 'error');
+                    } else {
+                        showResult('verifyResult', `❌ ${data.error}`, 'error');
+                    }
+                }
+            } catch (error) {
+                console.error('Verify OTP error:', error);
+                showResult('verifyResult', '❌ Failed to verify code. Please try again.', 'error');
+            } finally {
+                const button = document.getElementById('verifyOtpBtn');
+                button.disabled = false;
+                button.textContent = 'Verify Code';
+            }
+        }
+        
+        // Resend OTP
+        async function resendOTP() {
+            const email = document.getElementById('email').value.trim();
+            const firstName = document.getElementById('firstName').value.trim() || 'Guest';
+            
+            if (!email) {
+                showResult('resendResult', '❌ Please enter your email address first', 'error');
+                return;
+            }
+            
+            setLoading('resendOtpBtn', true);
+            
+            try {
+                const response = await fetch(`${API_BASE}/otp/resend`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, firstName })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showResult('resendResult', 
+                        `✅ New verification code sent! Check your email. Code expires in ${data.expiresIn / 60} minutes.`, 
+                        'success');
+                    // Clear old OTP input
+                    document.getElementById('otpCode').value = '';
+                } else {
+                    showResult('resendResult', `❌ ${data.error}`, 'error');
+                }
+            } catch (error) {
+                console.error('Resend OTP error:', error);
+                showResult('resendResult', '❌ Failed to resend code. Please try again.', 'error');
+            } finally {
+                const button = document.getElementById('resendOtpBtn');
+                button.disabled = false;
+                button.textContent = 'Resend Code';
+            }
+        }
+        
+        // Auto-format OTP input (6 digits only)
+        document.getElementById('otpCode').addEventListener('input', function(e) {
+            this.value = this.value.replace(/\D/g, '').substring(0, 6);
+        });
+        
+        // Submit on Enter key
+        document.getElementById('email').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') sendOTP();
+        });
+        
+        document.getElementById('otpCode').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') verifyOTP();
+        });
+    </script>
+</body>
+</html>

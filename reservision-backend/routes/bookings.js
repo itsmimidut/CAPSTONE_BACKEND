@@ -29,6 +29,11 @@ import {
   getOccupiedDates,
   getAllOccupiedDates
 } from "../controllers/bookingsController.js";
+import {
+  createBookingConfirmation,
+  updatePaymentStatus,
+  getBookingDetails
+} from "../controllers/bookingConfirmationController.js";
 
 const router = express.Router();
 
@@ -44,8 +49,17 @@ router.get("/occupied-dates/:itemId", getOccupiedDates);
 // Get booking by reference
 router.get("/reference/:reference", getBookingByReference);
 
+// Get booking details with customer and payment info
+router.get("/:id/details", getBookingDetails);
+
 // Get single booking by ID
 router.get("/:id", getBooking);
+
+// Create complete booking with customer and payment (Booking Confirmation Page)
+router.post("/confirm", createBookingConfirmation);
+
+// Update payment status (Called by PayMongo webhook or frontend after payment)
+router.post("/update-payment", updatePaymentStatus);
 
 // Create new booking
 router.post("/", createBooking);

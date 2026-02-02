@@ -34,10 +34,22 @@ router.post("/send", async (req, res) => {
     const apiKey = process.env.RESEND_API_KEY;
     const fromEmail = process.env.RESEND_FROM || "onboarding@resend.dev";
     const displayName = process.env.RESEND_FROM_NAME || "Eduardo's Resort";
-  const devMode = process.env.NODE_ENV !== "production";
 
-  if (!apiKey || devMode) {
-    console.warn(`OTP for ${email}: ${otp} (expires in 10 minutes)`);
+    if (!apiKey) {
+        console.warn("RESEND_API_KEY is not set. Skipping email send.");
+        return res.json({ success: true, dev: true, otp });
+    }
+
+    try {
+        const response = await fetch("https://api.resend.com/emails", {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                from: `${displayName} <${fromEmail}>`,
+                to: [email],
                 subject: "Your booking verification code",
                 html: `
           <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111827;">
