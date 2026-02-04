@@ -27,7 +27,8 @@ import {
   updateBooking,
   deleteBooking,
   getOccupiedDates,
-  getAllOccupiedDates
+  getAllOccupiedDates,
+  getAdminReservations
 } from "../controllers/bookingsController.js";
 import {
   createBookingConfirmation,
@@ -36,6 +37,9 @@ import {
 } from "../controllers/bookingConfirmationController.js";
 
 const router = express.Router();
+
+// Admin reservations endpoint (must be before /:id routes)
+router.get("/admin/reservations", getAdminReservations);
 
 // Get all bookings
 router.get("/", getBookings);

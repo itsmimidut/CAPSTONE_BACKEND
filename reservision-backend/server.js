@@ -205,3 +205,5 @@ app.get("/", (req, res) => {
  * curl http://localhost:8000/api/rooms
  */
 app.listen(8000, () => console.log("Server running at http://localhost:8000"));
+
+// npm run dev:all to run all backend and frontend servers concurrently

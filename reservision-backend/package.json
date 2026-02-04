@@ -6,12 +6,14 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "dev:all": "concurrently -k -n backend,frontend,ngrok -c blue,green,magenta \"npm start\" \"npm --prefix ../../CAPSTONE_FRONTEND/reservision run dev\" \".\\ngrok.exe http 8000\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@getbrevo/brevo": "^3.0.1",
     "@google/generative-ai": "^0.24.1",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
@@ -20,5 +22,9 @@
     "mysql2": "^3.16.1",
     "node-fetch": "^2.7.0",
     "resend": "^6.9.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
   }
 }
+

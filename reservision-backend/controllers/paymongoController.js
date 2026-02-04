@@ -1,5 +1,6 @@
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
+import db from '../config/db.js';
 
 dotenv.config();
 
@@ -11,8 +12,8 @@ export const createPaymentLink = async (req, res) => {
     // Validate API key
     if (!PAYMONGO_SECRET_KEY) {
       console.error('❌ PAYMONGO_SECRET_KEY is not configured in .env file');
-      return res.status(500).json({ 
-        error: 'Payment service not configured. Please contact administrator.' 
+      return res.status(500).json({
+        error: 'Payment service not configured. Please contact administrator.'
       });
     }
 
@@ -26,8 +27,8 @@ export const createPaymentLink = async (req, res) => {
 
     // Validate required fields
     if (!amount || !description || !bookingId) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: amount, description, bookingId' 
+      return res.status(400).json({
+        error: 'Missing required fields: amount, description, bookingId'
       });
     }
 
@@ -52,9 +53,7 @@ export const createPaymentLink = async (req, res) => {
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
 
-    // Create payment link
-    // Note: Payment Links redirect to PayMongo's default success page
-    // For custom redirects, you'd need to use Checkout Session API (requires business verification)
+    // Create payment link with success/cancel redirects
     const paymentLinkData = {
       data: {
         attributes: {
@@ -62,7 +61,18 @@ export const createPaymentLink = async (req, res) => {
           description: description,
           remarks: bookingId,
           // Use customer's selected payment method
-          payment_method_types: selectedMethods
+          payment_method_types: selectedMethods,
+          // Redirect to payment verification page (will check status and auto-redirect to confirmation)
+          success_url: `${frontendUrl}/payment-return?bookingId=${bookingId}`,
+          cancel_url: `${frontendUrl}/booking-confirmation?cancelled=true&bookingId=${bookingId}`,
+          line_items: [
+            {
+              name: description,
+              amount: amountInCentavos,
+              currency: 'PHP',
+              quantity: 1
+            }
+          ]
         }
       }
     };
@@ -112,8 +122,8 @@ export const createPaymentLink = async (req, res) => {
 export const createPaymentIntent = async (req, res) => {
   try {
     if (!PAYMONGO_SECRET_KEY) {
-      return res.status(500).json({ 
-        error: 'Payment service not configured.' 
+      return res.status(500).json({
+        error: 'Payment service not configured.'
       });
     }
 
@@ -125,8 +135,8 @@ export const createPaymentIntent = async (req, res) => {
     } = req.body;
 
     if (!amount || !description) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: amount, description' 
+      return res.status(400).json({
+        error: 'Missing required fields: amount, description'
       });
     }
 
@@ -204,12 +214,17 @@ export const getPaymentStatus = async (req, res) => {
       });
     }
 
+    const status = data.data.attributes.status;
+    const payments = data.data.attributes.payments || [];
+    const isPaid = payments.length > 0 && payments[0].attributes.status === 'paid';
+
     res.json({
       success: true,
-      status: data.data.attributes.status,
+      status: status,
+      isPaid: isPaid,
       amount: data.data.attributes.amount / 100,
       reference_number: data.data.attributes.reference_number,
-      payments: data.data.attributes.payments
+      payments: payments
     });
 
   } catch (error) {
@@ -224,35 +239,69 @@ export const getPaymentStatus = async (req, res) => {
 export const webhookHandler = async (req, res) => {
   try {
     const event = req.body;
-    
+
     console.log('📨 PayMongo Webhook Received:', {
       type: event.data?.attributes?.type,
       status: event.data?.attributes?.data?.attributes?.status
     });
 
+    // Log full event data for debugging
+    console.log('🔍 Full webhook data:', JSON.stringify(event, null, 2));
+
     const eventType = event.data?.attributes?.type;
-    
+
     if (eventType === 'link.payment.paid') {
       const paymentLink = event.data.attributes.data.attributes;
       const bookingId = paymentLink.remarks;
       const referenceNumber = paymentLink.reference_number;
-      
+      const amount = paymentLink.amount / 100;
+
+      // Get actual payment method from payments array
+      const payments = paymentLink.payments || [];
+      console.log('💳 Payments array:', JSON.stringify(payments, null, 2));
+
+      let paymentMethod = 'Online Payment';
+
+      if (payments.length > 0) {
+        // Correct path: payments[0].data.attributes.source.type
+        const paymentAttributes = payments[0].data?.attributes || {};
+        const paymentType = paymentAttributes.source?.type || 'unknown';
+
+        console.log('💳 Detected payment type:', paymentType);
+
+        // Map PayMongo payment types to readable names
+        const methodMap = {
+          'gcash': 'GCash',
+          'paymaya': 'PayMaya',
+          'grab_pay': 'GrabPay',
+          'grab': 'GrabPay',
+          'card': 'Card Payment',
+          'billease': 'BillEase'
+        };
+        paymentMethod = methodMap[paymentType.toLowerCase()] || paymentType;
+      }
+
       console.log('💰 Payment successful:', {
         bookingId: bookingId,
         reference: referenceNumber,
-        amount: paymentLink.amount / 100
+        amount: amount,
+        method: paymentMethod
       });
-      
-      // TODO: Update booking status in database
-      // Example:
-      // await db.query(
-      //   'UPDATE bookings SET payment_status = ?, payment_reference = ? WHERE booking_id = ?', 
-      //   ['paid', referenceNumber, bookingId]
-      // );
-      
-      // TODO: Send confirmation email
-      // await sendBookingConfirmationEmail(bookingId);
-      
+
+      try {
+        // Update booking status in database with actual payment method
+        const updateResult = await db.query(
+          'UPDATE bookings SET payment_status = ?, payment_method = ?, updated_at = NOW() WHERE booking_id = ?',
+          ['Paid', paymentMethod, bookingId]
+        );
+
+        console.log('✅ Booking updated as paid:', bookingId, 'with method:', paymentMethod);
+        console.log('📊 Update result:', updateResult);
+
+      } catch (dbError) {
+        console.error('❌ Error updating booking:', dbError);
+      }
+
     } else if (eventType === 'payment.paid') {
       const payment = event.data.attributes.data.attributes;
       console.log('✅ Payment confirmed:', {

@@ -1,5 +1,5 @@
 import express from "express";
-import fetch from "node-fetch";
+import * as SibApiV3Sdk from "@getbrevo/brevo";
 
 const router = express.Router();
 
@@ -31,48 +31,46 @@ router.post("/send", async (req, res) => {
     const otp = generateOtp();
     saveOtp(email, otp);
 
-    const apiKey = process.env.RESEND_API_KEY;
-    const fromEmail = process.env.RESEND_FROM || "onboarding@resend.dev";
-    const displayName = process.env.RESEND_FROM_NAME || "Eduardo's Resort";
+    const apiKey = process.env.BREVO_API_KEY;
+    const fromEmail = process.env.BREVO_FROM_EMAIL;
+    const displayName = process.env.BREVO_FROM_NAME || "Eduardo's Resort";
 
-    if (!apiKey) {
-        console.warn("RESEND_API_KEY is not set. Skipping email send.");
+    if (!apiKey || !fromEmail) {
+        console.warn("BREVO_API_KEY or BREVO_FROM_EMAIL is not set. Skipping email send.");
         return res.json({ success: true, dev: true, otp });
     }
 
     try {
-        const response = await fetch("https://api.resend.com/emails", {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                from: `${displayName} <${fromEmail}>`,
-                to: [email],
-                subject: "Your booking verification code",
-                html: `
-          <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111827;">
-            <h2>Hi ${firstName || "Guest"},</h2>
-            <p>Your verification code is:</p>
-            <div style="font-size: 28px; font-weight: 700; letter-spacing: 4px; margin: 12px 0;">${otp}</div>
-            <p>This code will expire in 10 minutes.</p>
-            <p>If you did not request this, you can ignore this email.</p>
-          </div>
-        `
-            })
-        });
+        const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+        apiInstance.setApiKey(SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey, apiKey);
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error("Resend API error:", errorText);
-            return res.status(500).json({ success: false, error: "Failed to send verification code" });
-        }
+        await apiInstance.sendTransacEmail({
+            sender: { email: fromEmail, name: displayName },
+            to: [{ email }],
+            subject: "Your booking verification code",
+            htmlContent: `
+                    <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111827;">
+                        <h2>Hi ${firstName || "Guest"},</h2>
+                        <p>Your verification code is:</p>
+                        <div style="font-size: 28px; font-weight: 700; letter-spacing: 4px; margin: 12px 0;">${otp}</div>
+                        <p>This code will expire in 10 minutes.</p>
+                        <p>If you did not request this, you can ignore this email.</p>
+                    </div>
+                `
+        });
 
         return res.json({ success: true });
     } catch (error) {
-        console.error("Send OTP error:", error);
-        return res.status(500).json({ success: false, error: "Failed to send verification code" });
+        const errorMsg = error?.response?.data?.message || error?.message || "Failed to send verification code";
+        console.error("Send OTP error:", errorMsg);
+
+        // If IP is not whitelisted, return OTP in dev mode for testing
+        if (errorMsg.includes("unrecognised IP")) {
+            console.warn(`⚠️ IP not whitelisted in Brevo. OTP: ${otp}`);
+            return res.json({ success: true, dev: true, otp, warning: "Email not sent - IP not whitelisted" });
+        }
+
+        return res.status(500).json({ success: false, error: errorMsg });
     }
 });
 
