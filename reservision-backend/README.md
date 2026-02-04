@@ -1,5 +1,56 @@
 # Restaurant Management Module - Complete Delivery Package
 
+## ▶️ Run the Backend (Windows)
+
+### ✅ Prerequisites (install once)
+1. **Node.js LTS** (includes npm)
+2. **MySQL 8+** (or compatible MariaDB)
+3. **Git** (optional, only if you pull updates)
+
+### 1️⃣ Set up the Database
+1. Create a database (default name in code is `eduardos`).
+2. Import the base schema:
+  - `database-setup.sql`
+3. (Optional) Import additional modules if needed:
+  - `schema/restaurant.sql`
+  - `schema/bookings.sql`
+  - `schema/customers.sql`
+  - `schema/payments.sql`
+  - `schema/otp_verifications.sql`
+
+> If your DB name/user/password is different, update `config/db.js`.
+
+### 2️⃣ Install Backend Dependencies
+1. Open PowerShell.
+2. Go to the backend folder:
+  - `cd "C:\Users\John Rhey Tamares\CAPSTONE_BACKEND\reservision-backend"`
+3. Install packages:
+  - `npm install`
+
+### 3️⃣ Start the Backend Server
+1. Run:
+  - `npm start`
+2. API will be available at:
+  - `http://localhost:8000`
+
+### 4️⃣ (Optional) Run Frontend + Backend Together
+From the same backend folder, run:
+  - `npm run dev:all`
+
+### 5️⃣ (Important) Activate ngrok (public URL)
+If you want a public URL for the backend:
+1. Download ngrok and place `ngrok.exe` inside:
+  - `C:\Users\John Rhey Tamares\CAPSTONE_BACKEND\reservision-backend`
+2. (One-time) Add your auth token:
+  - `ngrok config add-authtoken YOUR_TOKEN`
+3. Start ngrok for port 8000:
+  - `ngrok http 8000`
+4. Copy the **Forwarding** URL and use it as your public API base.
+
+> Tip: `npm run dev:all` already starts ngrok automatically using `ngrok.exe` in this folder.
+
+---
+
 ## 📦 What You're Getting
 
 A complete, production-ready Restaurant Management system with:
