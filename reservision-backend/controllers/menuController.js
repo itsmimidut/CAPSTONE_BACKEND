@@ -181,6 +181,21 @@ export const createMenuItem = async (req, res) => {
             return res.status(400).json({ message: 'Name, price, and category are required' });
         }
 
+        // Fix auto-increment if needed (check if auto_increment is at 0 or broken)
+        const [tables] = await db.query(`
+            SELECT AUTO_INCREMENT 
+            FROM information_schema.TABLES 
+            WHERE TABLE_SCHEMA = DATABASE() 
+            AND TABLE_NAME = 'menu_items'
+        `);
+        
+        if (tables[0] && tables[0].AUTO_INCREMENT <= 1) {
+            // Get the max menu_id and reset auto_increment
+            const [maxResult] = await db.query('SELECT MAX(menu_id) as max_id FROM menu_items');
+            const nextId = (maxResult[0].max_id || 0) + 1;
+            await db.query(`ALTER TABLE menu_items AUTO_INCREMENT = ${nextId}`);
+        }
+
         const [result] = await db.query(
             'INSERT INTO menu_items (name, price, category, available, prep_time, description, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
             [name, price, category, available, prep_time, description, image_url]

@@ -71,12 +71,13 @@ INSERT INTO restaurant_tables (table_number, capacity, status, guests, ordered_t
 ('3', 6, 'occupied', 3, NOW(), 'Birthday'),
 ('4', 4, 'reserved', 0, DATE_ADD(NOW(), INTERVAL 1 HOUR), 'Reservation');
 
-INSERT INTO menu_items (name, price, category, available, prep_time) VALUES
-('Caesar Salad', 320, 'Appetizers', TRUE, 5),
-('Grilled Salmon', 580, 'Mains', TRUE, 25),
-('Spaghetti Carbonara', 450, 'Mains', FALSE, 20),
-('Margherita Pizza', 380, 'Mains', TRUE, 15),
-('Chocolate Cake', 180, 'Desserts', TRUE, 5);
+-- Test menu items removed - add your own items through the admin panel
+-- INSERT INTO menu_items (name, price, category, available, prep_time) VALUES
+-- ('Caesar Salad', 320, 'Appetizers', TRUE, 5),
+-- ('Grilled Salmon', 580, 'Seafood', TRUE, 25),
+-- ('Spaghetti Carbonara', 450, 'Pasta', FALSE, 20),
+-- ('Margherita Pizza', 380, 'Pasta', TRUE, 15),
+-- ('Chocolate Cake', 180, 'Desserts', TRUE, 5);
 
 INSERT INTO orders (table_id, status, special_requests) VALUES
 (1, 'preparing', 'No croutons'),
