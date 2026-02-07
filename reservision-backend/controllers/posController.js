@@ -102,29 +102,56 @@ export const getTransaction = async (req, res) => {
  */
 export const createTransaction = async (req, res) => {
     try {
-        const { receiptNo, items, type, payment, total, date, time } = req.body;
+        const {
+            receiptNo,
+            items,
+            type,
+            payment,
+            total,
+            date,
+            time,
+            receipt_no,
+            payment_method,
+            total_amount,
+            transaction_date,
+            transaction_time
+        } = req.body;
+
+        const normalizedReceiptNo = receiptNo ?? receipt_no;
+        const normalizedItems = items;
+        const normalizedPayment = payment ?? payment_method;
+        const normalizedTotal = total ?? total_amount;
+        const normalizedDate = date ?? transaction_date;
+        const normalizedTime = time ?? transaction_time;
         
         // Validate required fields
-        if (!receiptNo || !items || !payment || total === undefined) {
+        if (!normalizedReceiptNo || !normalizedItems || !normalizedPayment || normalizedTotal === undefined) {
             return res.status(400).json({ 
                 error: 'Missing required fields: receiptNo, items, payment, total' 
             });
         }
         
         // Convert items array to JSON string for storage
-        const itemsJson = JSON.stringify(items);
+        const itemsJson = JSON.stringify(normalizedItems);
         
         const [result] = await db.query(
             `INSERT INTO pos_transactions 
-            (receipt_no, items, type, payment_method, total_amount, transaction_date, transaction_time) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [receiptNo, itemsJson, type || 'Walk-in', payment, total, date, time]
+            (receipt_no, items, payment_method, total_amount, transaction_date, transaction_time) 
+            VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+                normalizedReceiptNo,
+                itemsJson,
+                normalizedPayment,
+                normalizedTotal,
+                normalizedDate,
+                normalizedTime
+            ]
         );
         
         res.status(201).json({
             message: 'Transaction created successfully',
             transactionId: result.insertId,
-            receiptNo
+            receiptNo: normalizedReceiptNo
         });
     } catch (error) {
         console.error('Error creating transaction:', error);
@@ -153,7 +180,7 @@ export const deleteTransaction = async (req, res) => {
         if (result.affectedRows === 0) {
             return res.status(404).json({ error: 'Transaction not found' });
         }
-        
+
         res.json({ message: 'Transaction deleted successfully' });
     } catch (error) {
         console.error('Error deleting transaction:', error);
