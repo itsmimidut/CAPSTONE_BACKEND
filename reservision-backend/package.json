@@ -15,10 +15,12 @@
   "dependencies": {
     "@getbrevo/brevo": "^3.0.1",
     "@google/generative-ai": "^0.24.1",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "groq-sdk": "^0.8.0",
+    "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.16.1",
     "node-fetch": "^2.7.0",
     "resend": "^6.9.1"
@@ -27,4 +29,3 @@
     "concurrently": "^9.2.0"
   }
 }
-

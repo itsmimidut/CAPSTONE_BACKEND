@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS customers (
   full_name VARCHAR(200) GENERATED ALWAYS AS (CONCAT(first_name, ' ', last_name)) STORED,
   email VARCHAR(255) NOT NULL,
   phone VARCHAR(20) NOT NULL,
+  profile_image LONGTEXT,
   address TEXT,
   city VARCHAR(100),
   country VARCHAR(100) DEFAULT 'Philippines',

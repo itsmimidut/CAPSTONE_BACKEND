@@ -145,7 +145,6 @@ app.use("/api/otp", otpRoutes);
 
 // Customer Management
 app.use("/api/customers", customersRoutes);
-
 // ============================================================
 // ROOT ROUTE - API INFO
 // ============================================================

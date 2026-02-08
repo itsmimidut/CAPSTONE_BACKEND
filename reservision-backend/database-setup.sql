@@ -252,6 +252,28 @@ CREATE TABLE IF NOT EXISTS pos_items (
   INDEX idx_available (available)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================
+-- SERVICE REQUESTS TABLE
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS service_requests (
+  request_id INT AUTO_INCREMENT PRIMARY KEY,
+  customer_name VARCHAR(200) NOT NULL,
+  customer_email VARCHAR(255) NOT NULL,
+  room_number VARCHAR(50),
+  category VARCHAR(100) NOT NULL,
+  priority VARCHAR(50) DEFAULT 'Normal',
+  subject VARCHAR(255) NOT NULL,
+  message LONGTEXT NOT NULL,
+  status VARCHAR(50) DEFAULT 'Open',
+  assigned_to VARCHAR(200),
+  response_note LONGTEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_request_email (customer_email),
+  INDEX idx_request_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- Insert sample POS items
 INSERT INTO pos_items (category, name, price, description) VALUES
 -- Restaurant Items
