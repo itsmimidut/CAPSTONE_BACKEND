@@ -8,25 +8,113 @@ import jwt from 'jsonwebtoken';
 export const customerSignup = async (req, res) => {
   try {
     const { firstName, lastName, email, password, contactNumber } = req.body;
+
+    // Validate required fields
     if (!firstName || !lastName || !email || !password) {
-      return res.status(400).json({ success: false, error: 'Missing required fields' });
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: firstName, lastName, email, password'
+      });
     }
-    // Check if email already exists
-    const [existing] = await db.query('SELECT user_id FROM user WHERE email = ? LIMIT 1', [email]);
-    if (existing.length > 0) {
-      return res.status(400).json({ success: false, error: 'Email already registered' });
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid email format'
+      });
     }
+
+    // Validate password strength (min 6 characters)
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 6 characters long'
+      });
+    }
+
+    // Check if email already exists in user table
+    const [existingUsers] = await db.query(
+      'SELECT user_id FROM user WHERE email = ? LIMIT 1',
+      [email]
+    );
+
+    if (existingUsers.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email already registered'
+      });
+    }
+
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
-    // Insert new customer
-    const [result] = await db.query(
-      'INSERT INTO user (first_name, last_name, email, password, phone) VALUES (?, ?, ?, ?, ?)',
-      [firstName, lastName, email, hashedPassword, contactNumber || null]
-    );
-    res.json({ success: true, customerId: result.insertId });
+
+    // Start transaction to create both user and customer records
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+
+      // Insert into user table (authentication + basic info)
+      const [userResult] = await connection.query(
+        `INSERT INTO user (first_name, last_name, email, phone, password, role, created_at) 
+         VALUES (?, ?, ?, ?, ?, 'customer', NOW())`,
+        [firstName, lastName, email, contactNumber || null, hashedPassword]
+      );
+
+      const userId = userResult.insertId;
+
+      // Insert into customers table (only link via user_id, profile data empty initially)
+      await connection.query(
+        `INSERT INTO customers (user_id, created_at) 
+         VALUES (?, NOW())`,
+        [userId]
+      );
+
+      await connection.commit();
+      connection.release();
+
+      // Generate JWT token
+      const token = jwt.sign(
+        {
+          id: userId,
+          email: email,
+          role: 'customer',
+          name: `${firstName} ${lastName}`
+        },
+        process.env.JWT_SECRET || 'your-secret-key',
+        { expiresIn: '7d' }
+      );
+
+      // Log signup success
+      console.log(`✅ Customer signup successful: ${email} (User ID: ${userId})`);
+
+      res.status(201).json({
+        success: true,
+        token,
+        customer: {
+          id: userId,
+          firstName,
+          lastName,
+          email,
+          phone: contactNumber,
+          role: 'customer'
+        },
+        message: 'Account created successfully'
+      });
+
+    } catch (transactionError) {
+      await connection.rollback();
+      connection.release();
+      throw transactionError;
+    }
+
   } catch (error) {
-    console.error('Signup error:', error);
-    res.status(500).json({ success: false, error: 'Failed to register customer' });
+    console.error('❌ Signup error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to register customer. Please try again later.'
+    });
   }
 };
 
@@ -37,36 +125,89 @@ export const customerSignup = async (req, res) => {
 export const customerLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
+
+    // Validate required fields
     if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Missing email or password' });
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password are required'
+      });
     }
-    const [customers] = await db.query('SELECT user_id, first_name, last_name, email, password FROM user WHERE email = ? LIMIT 1', [email]);
-    if (customers.length === 0) {
-      return res.status(400).json({ success: false, error: 'Invalid email or password' });
+
+    // Find user by email (all roles can login through this endpoint)
+    const [users] = await db.query(
+      `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone, u.password, u.role
+         FROM user u
+         WHERE u.email = ? AND u.role IN ('customer', 'admin', 'restaurantstaff', 'receptionist')
+         LIMIT 1`,
+      [email]
+    );
+
+    if (users.length === 0) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
     }
-    const customer = customers[0];
-    const match = await bcrypt.compare(password, customer.password);
-    if (!match) {
-      return res.status(400).json({ success: false, error: 'Invalid email or password' });
+
+    const customer = users[0];
+
+    // Verify password
+    const isPasswordValid = await bcrypt.compare(password, customer.password);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
     }
+
     // Generate JWT token
-    const token = jwt.sign({ id: customer.user_id, email: customer.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '1d' });
+    const token = jwt.sign(
+      {
+        id: customer.user_id,
+        email: customer.email,
+        role: customer.role,
+        name: `${customer.first_name} ${customer.last_name}`
+      },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    // Update last login timestamp
+    await db.query(
+      'UPDATE user SET created_at = NOW() WHERE user_id = ?',
+      [customer.user_id]
+    );
+
+    // Log successful login
+    console.log(`✅ Customer login successful: ${email} (ID: ${customer.user_id})`);
+
     res.json({
-      success: true, token, customer: {
+      success: true,
+      token,
+      customer: {
         id: customer.user_id,
         firstName: customer.first_name,
         lastName: customer.last_name,
-        email: customer.email
-      }
+        email: customer.email,
+        phone: customer.phone,
+        role: customer.role
+      },
+      message: 'Login successful'
     });
+
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ success: false, error: 'Failed to login' });
+    console.error('❌ Login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to login. Please try again later.'
+    });
   }
 };
 
 /**
- * Check if email exists in customers table
+ * Check if email exists in user table (for customers)
  * GET /api/customers/check-email/:email
  */
 export const checkEmailExists = async (req, res) => {
@@ -80,20 +221,23 @@ export const checkEmailExists = async (req, res) => {
       });
     }
 
-    // Check if email exists in customers table
-    const [customers] = await db.query(
-      'SELECT customer_id, first_name, last_name, email FROM customers WHERE email = ? LIMIT 1',
+    // Check if email exists (get from user table)
+    const [users] = await db.query(
+      `SELECT u.user_id, u.first_name, u.last_name, u.email
+       FROM user u
+       WHERE u.email = ? AND u.role = 'customer'
+       LIMIT 1`,
       [email]
     );
 
     res.json({
       success: true,
-      exists: customers.length > 0,
-      customer: customers.length > 0 ? {
-        id: customers[0].customer_id,
-        firstName: customers[0].first_name,
-        lastName: customers[0].last_name,
-        email: customers[0].email
+      exists: users.length > 0,
+      customer: users.length > 0 ? {
+        id: users[0].user_id,
+        firstName: users[0].first_name,
+        lastName: users[0].last_name,
+        email: users[0].email
       } : null
     });
 
@@ -121,27 +265,30 @@ export const getCustomerProfile = async (req, res) => {
       });
     }
 
-    const [customers] = await db.query(
-      `SELECT customer_id, first_name, last_name, email, phone, address, city, country, postal_code, profile_image
-       FROM customers
-       WHERE email = ?
+    // Get customer profile (LEFT JOIN to handle missing customer records)
+    const [users] = await db.query(
+      `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone, 
+              c.address, c.city, c.country, c.postal_code, c.profile_image
+       FROM user u
+       LEFT JOIN customers c ON u.user_id = c.user_id
+       WHERE u.email = ? AND u.role = 'customer'
        LIMIT 1`,
       [email]
     );
 
-    if (customers.length === 0) {
+    if (users.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'Customer not found'
       });
     }
 
-    const customer = customers[0];
+    const customer = users[0];
 
     res.json({
       success: true,
       customer: {
-        id: customer.customer_id,
+        id: customer.user_id,
         firstName: customer.first_name,
         lastName: customer.last_name,
         email: customer.email,
@@ -177,22 +324,33 @@ export const updateCustomerProfile = async (req, res) => {
       });
     }
 
-    const [customers] = await db.query(
-      `SELECT customer_id, first_name, last_name, email, phone, address, city, country, postal_code, profile_image
-       FROM customers
-       WHERE email = ?
+    // Get current user data
+    const [users] = await db.query(
+      `SELECT user_id, first_name, last_name, email, phone
+       FROM user
+       WHERE email = ? AND role = 'customer'
        LIMIT 1`,
       [email]
     );
 
-    if (customers.length === 0) {
+    if (users.length === 0) {
       return res.status(404).json({
         success: false,
-        error: 'Customer not found'
+        error: 'User not found'
       });
     }
 
-    const current = customers[0];
+    const user = users[0];
+
+    // Check if customer record exists
+    const [customers] = await db.query(
+      `SELECT customer_id, address, city, country, postal_code, profile_image
+       FROM customers
+       WHERE user_id = ?
+       LIMIT 1`,
+      [user.user_id]
+    );
+
     const {
       firstName,
       lastName,
@@ -205,37 +363,67 @@ export const updateCustomerProfile = async (req, res) => {
     } = req.body || {};
 
     const updated = {
-      firstName: firstName ?? current.first_name,
-      lastName: lastName ?? current.last_name,
-      phone: phone ?? current.phone,
-      address: address ?? current.address,
-      city: city ?? current.city,
-      country: country ?? current.country,
-      postalCode: postalCode ?? current.postal_code,
-      profileImage: profileImage ?? current.profile_image
+      firstName: firstName ?? user.first_name,
+      lastName: lastName ?? user.last_name,
+      phone: phone ?? user.phone,
+      address: address ?? (customers.length > 0 ? customers[0].address : null),
+      city: city ?? (customers.length > 0 ? customers[0].city : null),
+      country: country ?? (customers.length > 0 ? customers[0].country : 'Philippines'),
+      postalCode: postalCode ?? (customers.length > 0 ? customers[0].postal_code : null),
+      profileImage: profileImage ?? (customers.length > 0 ? customers[0].profile_image : null)
     };
 
+    // Update user table (first_name, last_name, phone)
     await db.query(
-      `UPDATE customers
-       SET first_name = ?, last_name = ?, phone = ?, address = ?, city = ?, country = ?, postal_code = ?, profile_image = ?
-       WHERE email = ?`,
+      `UPDATE user
+       SET first_name = ?, last_name = ?, phone = ?
+       WHERE user_id = ?`,
       [
         updated.firstName,
         updated.lastName,
         updated.phone,
-        updated.address,
-        updated.city,
-        updated.country,
-        updated.postalCode,
-        updated.profileImage,
-        email
+        user.user_id
       ]
     );
+
+    // Insert or update customers table
+    if (customers.length === 0) {
+      // Create customer record if it doesn't exist
+      await db.query(
+        `INSERT INTO customers (user_id, address, city, country, postal_code, profile_image, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          user.user_id,
+          updated.address,
+          updated.city,
+          updated.country,
+          updated.postalCode,
+          updated.profileImage
+        ]
+      );
+      console.log(`✅ Created customer record for user_id: ${user.user_id}`);
+    } else {
+      // Update existing customer record
+      await db.query(
+        `UPDATE customers
+         SET address = ?, city = ?, country = ?, postal_code = ?, profile_image = ?
+         WHERE customer_id = ?`,
+        [
+          updated.address,
+          updated.city,
+          updated.country,
+          updated.postalCode,
+          updated.profileImage,
+          customers[0].customer_id
+        ]
+      );
+      console.log(`✅ Updated customer record for customer_id: ${customers[0].customer_id}`);
+    }
 
     res.json({
       success: true,
       customer: {
-        id: current.customer_id,
+        id: user.user_id,
         firstName: updated.firstName,
         lastName: updated.lastName,
         email,

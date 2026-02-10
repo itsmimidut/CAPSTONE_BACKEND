@@ -1,3 +1,47 @@
+-- ============================================================
+-- USER AUTHENTICATION & CUSTOMER PROFILE TABLES
+-- ============================================================
+
+-- Create user table (authentication)
+CREATE TABLE IF NOT EXISTS user (
+  user_id INT AUTO_INCREMENT PRIMARY KEY,
+  first_name VARCHAR(255),
+  last_name VARCHAR(255),
+  email VARCHAR(255) NOT NULL UNIQUE,
+  phone VARCHAR(20) NOT NULL,
+  password VARCHAR(255) NOT NULL,
+  role VARCHAR(50) DEFAULT 'customer',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_user_email (email),
+  INDEX idx_user_role (role)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Create customers table (customer profile data)
+CREATE TABLE IF NOT EXISTS customers (
+  customer_id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL UNIQUE,
+  first_name VARCHAR(100) NOT NULL,
+  last_name VARCHAR(100) NOT NULL,
+  phone VARCHAR(20),
+  address VARCHAR(255),
+  city VARCHAR(100),
+  country VARCHAR(100) DEFAULT 'Philippines',
+  postal_code VARCHAR(20),
+  profile_image TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  -- Foreign key to link with user table
+  CONSTRAINT fk_customer_user FOREIGN KEY (user_id) REFERENCES user(user_id) ON DELETE CASCADE,
+  
+  -- Indexes for better query performance
+  INDEX idx_customer_user_id (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- INVENTORY & PRICING TABLES
+-- ============================================================
+
 -- Create inventory_items table (for rooms and cottages)
 CREATE TABLE IF NOT EXISTS inventory_items (
   item_id INT AUTO_INCREMENT PRIMARY KEY,
