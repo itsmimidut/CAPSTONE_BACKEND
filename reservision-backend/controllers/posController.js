@@ -34,13 +34,13 @@ export const getAllTransactions = async (req, res) => {
         const [rows] = await db.query(
             'SELECT * FROM pos_transactions ORDER BY created_at DESC'
         );
-        
+
         // Parse items JSON string back to array
         const transactions = rows.map(row => ({
             ...row,
             items: JSON.parse(row.items || '[]')
         }));
-        
+
         res.json(transactions);
     } catch (error) {
         console.error('Error fetching POS transactions:', error);
@@ -64,16 +64,16 @@ export const getTransaction = async (req, res) => {
             'SELECT * FROM pos_transactions WHERE transaction_id = ?',
             [id]
         );
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ error: 'Transaction not found' });
         }
-        
+
         const transaction = {
             ...rows[0],
             items: JSON.parse(rows[0].items || '[]')
         };
-        
+
         res.json(transaction);
     } catch (error) {
         console.error('Error fetching transaction:', error);
@@ -123,17 +123,17 @@ export const createTransaction = async (req, res) => {
         const normalizedTotal = total ?? total_amount;
         const normalizedDate = date ?? transaction_date;
         const normalizedTime = time ?? transaction_time;
-        
+
         // Validate required fields
         if (!normalizedReceiptNo || !normalizedItems || !normalizedPayment || normalizedTotal === undefined) {
-            return res.status(400).json({ 
-                error: 'Missing required fields: receiptNo, items, payment, total' 
+            return res.status(400).json({
+                error: 'Missing required fields: receiptNo, items, payment, total'
             });
         }
-        
+
         // Convert items array to JSON string for storage
         const itemsJson = JSON.stringify(normalizedItems);
-        
+
         const [result] = await db.query(
             `INSERT INTO pos_transactions 
             (receipt_no, items, payment_method, total_amount, transaction_date, transaction_time) 
@@ -147,7 +147,7 @@ export const createTransaction = async (req, res) => {
                 normalizedTime
             ]
         );
-        
+
         res.status(201).json({
             message: 'Transaction created successfully',
             transactionId: result.insertId,
@@ -171,12 +171,12 @@ export const createTransaction = async (req, res) => {
 export const deleteTransaction = async (req, res) => {
     try {
         const { id } = req.params;
-        
+
         const [result] = await db.query(
             'DELETE FROM pos_transactions WHERE transaction_id = ?',
             [id]
         );
-        
+
         if (result.affectedRows === 0) {
             return res.status(404).json({ error: 'Transaction not found' });
         }
@@ -218,13 +218,17 @@ export const clearAllTransactions = async (req, res) => {
 export const getAllItems = async (req, res) => {
     try {
         let allItems = [];
-        
+
+        console.log('🔍 Fetching POS items...');
+
         // Get restaurant items from menu_items table
         try {
             const [menuItems] = await db.query(
                 'SELECT name, price, category as description FROM menu_items WHERE available = 1'
             );
-            
+
+            console.log('🍔 Found', menuItems.length, 'restaurant items from menu_items');
+
             const restaurantItems = menuItems.map(item => ({
                 category: 'restaurant',
                 name: item.name,
@@ -232,23 +236,26 @@ export const getAllItems = async (req, res) => {
                 description: item.description,
                 available: 1
             }));
-            
+
             allItems.push(...restaurantItems);
         } catch (menuError) {
-            console.log('menu_items table not found, using pos_items for restaurant');
+            console.log('⚠️ menu_items table not found, using pos_items for restaurant');
         }
-        
+
         // Get rooms and cottages from inventory_items table
         try {
             const [inventoryItems] = await db.query(
                 `SELECT name, price, category, category_type 
                  FROM inventory_items 
-                 WHERE status = 'Available' AND category IN ('Room', 'Cottage')`
+                 WHERE status = 'Available' AND (category LIKE '%Room%' OR category = 'Cottage')`
             );
-            
-            // Format rooms
+
+            console.log('🏨 Found', inventoryItems.length, 'inventory items (rooms/cottages)');
+            console.log('🏨 Inventory items:', inventoryItems);
+
+            // Format rooms (any category containing "Room")
             const rooms = inventoryItems
-                .filter(item => item.category === 'Room')
+                .filter(item => item.category && item.category.toLowerCase().includes('room'))
                 .map(item => ({
                     category: 'rooms',
                     name: item.name,
@@ -256,10 +263,12 @@ export const getAllItems = async (req, res) => {
                     description: item.category_type,
                     available: 1
                 }));
-            
+
+            console.log('🛏️ Formatted', rooms.length, 'rooms');
+
             // Format cottages
             const cottages = inventoryItems
-                .filter(item => item.category === 'Cottage')
+                .filter(item => item.category && item.category.toLowerCase().includes('cottage'))
                 .map(item => ({
                     category: 'cottage',
                     name: item.name,
@@ -267,18 +276,31 @@ export const getAllItems = async (req, res) => {
                     description: item.category_type,
                     available: 1
                 }));
-            
+
+            console.log('🏡 Formatted', cottages.length, 'cottages');
+
             allItems.push(...rooms, ...cottages);
         } catch (inventoryError) {
-            console.log('inventory_items table not found, using pos_items for rooms/cottages');
+            console.log('⚠️ inventory_items table not found, using pos_items for rooms/cottages');
+            console.error('Inventory error:', inventoryError.message);
         }
-        
+
         // Get event items from pos_items (or add Events table later)
         const [eventItems] = await db.query(
             'SELECT * FROM pos_items WHERE category = "event" AND available = 1'
         );
+        console.log('🎉 Found', eventItems.length, 'event items from pos_items');
+
         allItems.push(...eventItems);
-        
+
+        console.log('✅ Total items to return:', allItems.length);
+        console.log('📋 Items by category:', {
+            restaurant: allItems.filter(i => i.category === 'restaurant').length,
+            rooms: allItems.filter(i => i.category === 'rooms').length,
+            cottage: allItems.filter(i => i.category === 'cottage').length,
+            event: allItems.filter(i => i.category === 'event').length
+        });
+
         res.json(allItems);
     } catch (error) {
         console.error('Error fetching POS items:', error);
@@ -297,14 +319,14 @@ export const getAllItems = async (req, res) => {
 export const getItemsByCategory = async (req, res) => {
     try {
         const { category } = req.params;
-        
+
         // Restaurant items from menu_items table
         if (category === 'restaurant') {
             try {
                 const [menuItems] = await db.query(
                     'SELECT name, price, category as description FROM menu_items WHERE available = 1 ORDER BY name'
                 );
-                
+
                 const items = menuItems.map(item => ({
                     category: 'restaurant',
                     name: item.name,
@@ -312,13 +334,13 @@ export const getItemsByCategory = async (req, res) => {
                     description: item.description,
                     available: 1
                 }));
-                
+
                 return res.json(items);
             } catch (error) {
                 console.log('Using pos_items for restaurant');
             }
         }
-        
+
         // Rooms from inventory_items table
         if (category === 'rooms') {
             try {
@@ -328,7 +350,7 @@ export const getItemsByCategory = async (req, res) => {
                      WHERE status = 'Available' AND category = 'Room' 
                      ORDER BY name`
                 );
-                
+
                 const items = roomItems.map(item => ({
                     category: 'rooms',
                     name: item.name,
@@ -336,13 +358,13 @@ export const getItemsByCategory = async (req, res) => {
                     description: item.category_type,
                     available: 1
                 }));
-                
+
                 return res.json(items);
             } catch (error) {
                 console.log('Using pos_items for rooms');
             }
         }
-        
+
         // Cottages from inventory_items table
         if (category === 'cottage') {
             try {
@@ -352,7 +374,7 @@ export const getItemsByCategory = async (req, res) => {
                      WHERE status = 'Available' AND category = 'Cottage' 
                      ORDER BY name`
                 );
-                
+
                 const items = cottageItems.map(item => ({
                     category: 'cottage',
                     name: item.name,
@@ -360,13 +382,13 @@ export const getItemsByCategory = async (req, res) => {
                     description: item.category_type,
                     available: 1
                 }));
-                
+
                 return res.json(items);
             } catch (error) {
                 console.log('Using pos_items for cottages');
             }
         }
-        
+
         // Fallback to pos_items for any category
         const [rows] = await db.query(
             'SELECT * FROM pos_items WHERE category = ? AND available = 1 ORDER BY name',

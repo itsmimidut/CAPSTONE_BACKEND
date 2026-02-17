@@ -56,6 +56,34 @@ export const createOrder = async (req, res) => {
 
         await connection.beginTransaction();
 
+        // Check ingredient availability for all menu items
+        for (const item of items) {
+            const [ingredients] = await connection.query(`
+                SELECT 
+                    mi.quantity_needed,
+                    i.inventory_id,
+                    i.item_name,
+                    i.quantity as inventory_quantity,
+                    i.unit
+                FROM menu_ingredients mi
+                JOIN inventory i ON mi.inventory_id = i.inventory_id
+                WHERE mi.menu_id = ?
+            `, [item.menu_id]);
+
+            // Check if there are enough ingredients
+            for (const ingredient of ingredients) {
+                const requiredQuantity = ingredient.quantity_needed * item.quantity;
+                if (ingredient.inventory_quantity < requiredQuantity) {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        success: false,
+                        message: `Insufficient ${ingredient.item_name}. Required: ${requiredQuantity} ${ingredient.unit}, Available: ${ingredient.inventory_quantity} ${ingredient.unit}`,
+                        insufficientIngredient: ingredient.item_name
+                    });
+                }
+            }
+        }
+
         // Create order
         const [orderResult] = await connection.query(
             'INSERT INTO orders (table_id, status, special_requests) VALUES (?, ?, ?)',
@@ -64,12 +92,35 @@ export const createOrder = async (req, res) => {
 
         const order_id = orderResult.insertId;
 
-        // Add order items
+        // Add order items and deduct inventory
         for (const item of items) {
             await connection.query(
                 'INSERT INTO order_items (order_id, menu_id, quantity, unit_price) VALUES (?, ?, ?, ?)',
                 [order_id, item.menu_id, item.quantity, item.unit_price]
             );
+
+            // Deduct ingredients from inventory
+            const [ingredients] = await connection.query(`
+                SELECT inventory_id, quantity_needed
+                FROM menu_ingredients
+                WHERE menu_id = ?
+            `, [item.menu_id]);
+
+            for (const ingredient of ingredients) {
+                const deductAmount = ingredient.quantity_needed * item.quantity;
+
+                // Update inventory quantity
+                await connection.query(`
+                    UPDATE inventory 
+                    SET quantity = quantity - ?,
+                        status = CASE
+                            WHEN (quantity - ?) <= threshold * 0.25 THEN 'critical'
+                            WHEN (quantity - ?) <= threshold THEN 'low'
+                            ELSE 'good'
+                        END
+                    WHERE inventory_id = ?
+                `, [deductAmount, deductAmount, deductAmount, ingredient.inventory_id]);
+            }
         }
 
         // Update table status to occupied
@@ -81,13 +132,14 @@ export const createOrder = async (req, res) => {
         await connection.commit();
 
         res.status(201).json({
-            message: 'Order created successfully',
+            success: true,
+            message: 'Order created successfully and inventory updated',
             order_id: order_id
         });
     } catch (error) {
         await connection.rollback();
         console.error('Error creating order:', error);
-        res.status(500).json({ error: 'Error creating order' });
+        res.status(500).json({ success: false, error: 'Error creating order', message: error.message });
     } finally {
         connection.release();
     }

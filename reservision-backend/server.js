@@ -51,6 +51,7 @@ import seasonalRoutes from "./routes/seasonalPricing.js";
 import tablesRoutes from "./routes/restaurant/tables.js";
 import ordersRoutes from "./routes/restaurant/orders.js";
 import menuRoutes from "./routes/restaurant/menu.js";
+import menuIngredientsRoutes from "./routes/restaurant/menuIngredients.js";
 import inventoryRoutes from "./routes/restaurant/inventory.js";
 import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
@@ -121,6 +122,7 @@ app.use("/api/seasons", seasonalRoutes);
 app.use("/api/restaurant/tables", tablesRoutes);
 app.use("/api/restaurant/orders", ordersRoutes);
 app.use("/api/restaurant/menu", menuRoutes);
+app.use("/api/restaurant", menuIngredientsRoutes);
 app.use("/api/restaurant/inventory", inventoryRoutes);
 app.use("/api/rates", ratesRoutes);
 
