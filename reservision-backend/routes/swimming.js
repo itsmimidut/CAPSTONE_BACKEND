@@ -25,6 +25,18 @@ import { db } from "../config/db.js";
 
 const router = express.Router();
 
+const lessonRateMap = {
+    '7 Years Old & Above': 3000,
+    '6 Years Old & Below': 4000,
+    'Group Lessons': 3000,
+    'Private Lessons': 4000
+};
+
+const generateSwimmingBookingReference = () => {
+    const stamp = Date.now().toString().slice(-8);
+    return `SWM${stamp}`;
+};
+
 // ============================================================
 // ENROLLMENT ENDPOINTS
 // ============================================================
@@ -55,46 +67,23 @@ router.post("/enrollments", async (req, res) => {
             height,
             preferredCoach,
             address,
-            homePhone,
             mobilePhone,
             email,
 
             // Parent/Guardian Information
             fatherName,
-            fatherOccupation,
-            fatherPhone,
             motherName,
-            motherOccupation,
-            motherPhone,
             emergencyContactName,
             emergencyContactPhone,
-            emergencyContactRelationship,
-
-            // Medical Information
-            medicalConditions,
-            allergies,
-            medications,
-            physicianName,
             physicianPhone,
 
             // Swimming Details
             lessonType,
             skillLevel,
-            previousExperience,
-            swimmingGoals,
-
-            // Schedule Preferences
-            preferredDays,
-            preferredTime,
-            startDate,
-
-            // Additional Information
-            howDidYouHear,
-            specialRequests,
 
             // Agreement
             agreedToTerms,
-            agreedToWaiver
+            agriedToWaiver
         } = req.body;
 
         // Validate required fields
@@ -114,29 +103,23 @@ router.post("/enrollments", async (req, res) => {
         const sql = `
       INSERT INTO swimming_enrollments (
         first_name, middle_name, last_name, date_of_birth,
-        sex, weight, height, preferred_coach, address, home_phone, mobile_phone, email,
-        father_name, father_occupation, father_phone,
-        mother_name, mother_occupation, mother_phone,
-        emergency_contact_name, emergency_contact_phone, emergency_contact_relationship,
-        medical_conditions, allergies, medications, physician_name, physician_phone,
-        lesson_type, skill_level, previous_experience, swimming_goals,
-        preferred_days, preferred_time, start_date,
-        how_did_you_hear, special_requests,
+        sex, weight, height, preferred_coach, address, mobile_phone, email,
+        father_name, mother_name,
+        emergency_contact_name, emergency_contact_phone,
+        physician_phone,
+        lesson_type, skill_level,
         agreed_to_terms, agreed_to_waiver
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
         const values = [
             firstName, middleName, lastName, dateOfBirth,
-            sex, weight, height, preferredCoach, address, homePhone, mobilePhone, email,
-            fatherName, fatherOccupation, fatherPhone,
-            motherName, motherOccupation, motherPhone,
-            emergencyContactName, emergencyContactPhone, emergencyContactRelationship,
-            medicalConditions, allergies, medications, physicianName, physicianPhone,
-            lessonType, skillLevel, previousExperience, swimmingGoals,
-            preferredDays, preferredTime, startDate,
-            howDidYouHear, specialRequests,
-            agreedToTerms ? 1 : 0, agreedToWaiver ? 1 : 0
+            sex || 'Male', weight, height, preferredCoach, address, mobilePhone, email,
+            fatherName || null, motherName || null,
+            emergencyContactName || null, emergencyContactPhone || null,
+            physicianPhone || null,
+            lessonType, skillLevel || 'Beginner',
+            agreedToTerms ? 1 : 0, agriedToWaiver ? 1 : 0
         ];
 
         const [result] = await db.query(sql, values);
@@ -280,7 +263,8 @@ router.put("/enrollments/:id", async (req, res) => {
         const allowedFields = [
             'first_name', 'middle_name', 'last_name', 'email', 'mobile_phone',
             'address', 'preferred_coach', 'lesson_type', 'skill_level',
-            'preferred_days', 'preferred_time', 'start_date', 'special_requests'
+            'sex', 'weight', 'height', 'father_name', 'mother_name',
+            'emergency_contact_name', 'emergency_contact_phone', 'physician_phone'
         ];
 
         Object.keys(updateFields).forEach(field => {
@@ -362,16 +346,20 @@ router.get("/coaches", async (req, res) => {
         const { status = 'Active' } = req.query;
 
         const [coaches] = await db.query(
-            "SELECT * FROM swimming_coaches WHERE status = ? ORDER BY name",
+            "SELECT coach_id, name, specialization, experience_years, certification, bio, availability FROM swimming_coaches WHERE status = ? ORDER BY name",
             [status]
         );
 
-        res.json(coaches);
+        res.json({
+            success: true,
+            data: coaches
+        });
 
     } catch (error) {
         console.error("Error fetching coaches:", error);
         res.status(500).json({
-            error: "Failed to fetch coaches",
+            success: false,
+            error: 'Failed to fetch coaches',
             details: error.message
         });
     }
@@ -505,6 +493,449 @@ router.put("/coaches/:id", async (req, res) => {
         console.error("Error updating coach:", error);
         res.status(500).json({
             error: "Failed to update coach",
+            details: error.message
+        });
+    }
+});
+
+// ============================================================
+// SWIMMING CLASS BOOKINGS (CONNECTED TO MAIN RESERVATIONS)
+// ============================================================
+
+/**
+ * POST /api/swimming/class-bookings
+ * Creates a swimming reservation entry in bookings + booking_items
+ * so it appears in Admin Reservation Management for the selected date.
+ */
+router.post("/class-bookings", async (req, res) => {
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        const {
+            fullName,
+            email,
+            phone,
+            lessonType,
+            skillLevel,
+            preferredDate,
+            preferredTime,
+            participants = 1,
+            notes,
+            paymentMethod = 'Cash'
+        } = req.body;
+
+        if (!fullName || !email || !phone || !lessonType || !preferredDate || !preferredTime) {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                error: 'Missing required fields',
+                required: ['fullName', 'email', 'phone', 'lessonType', 'preferredDate', 'preferredTime']
+            });
+        }
+
+        const safeParticipants = Math.max(parseInt(participants) || 1, 1);
+        const [firstName, ...lastParts] = String(fullName).trim().split(/\s+/);
+        const lastName = lastParts.join(' ') || '-';
+        const unitPrice = lessonRateMap[lessonType] || 0;
+        const totalAmount = unitPrice * safeParticipants;
+        const bookingReference = generateSwimmingBookingReference();
+
+        let customerId;
+        const [existingCustomer] = await connection.query(
+            'SELECT customer_id FROM customers WHERE email = ? LIMIT 1',
+            [email]
+        );
+
+        if (existingCustomer.length > 0) {
+            customerId = existingCustomer[0].customer_id;
+            await connection.query(
+                `UPDATE customers
+                 SET first_name = ?, last_name = ?, phone = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE customer_id = ?`,
+                [firstName, lastName, phone, customerId]
+            );
+        } else {
+            const [customerResult] = await connection.query(
+                `INSERT INTO customers (first_name, last_name, email, phone, city, country)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [firstName, lastName, email, phone, 'Calapan', 'Philippines']
+            );
+            customerId = customerResult.insertId;
+        }
+
+        const [bookingResult] = await connection.query(
+            `INSERT INTO bookings (
+                booking_reference,
+                customer_id,
+                first_name,
+                last_name,
+                email,
+                phone,
+                address,
+                city,
+                country,
+                check_in_date,
+                check_out_date,
+                nights,
+                adults,
+                children,
+                arrival_time,
+                special_requests,
+                subtotal,
+                total,
+                booking_status,
+                payment_status,
+                payment_method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 'Unpaid', ?)`,
+            [
+                bookingReference,
+                customerId,
+                firstName,
+                lastName,
+                email,
+                phone,
+                'Swimming Lesson Reservation',
+                'Calapan',
+                'Philippines',
+                preferredDate,
+                preferredDate,
+                0,
+                safeParticipants,
+                0,
+                preferredTime,
+                notes || null,
+                totalAmount,
+                totalAmount,
+                paymentMethod
+            ]
+        );
+
+        const bookingId = bookingResult.insertId;
+
+        await connection.query(
+            `INSERT INTO booking_items (
+                booking_id,
+                item_type,
+                item_name,
+                item_description,
+                unit_price,
+                quantity,
+                nights,
+                total_price,
+                guests,
+                per_night
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                bookingId,
+                'Event',
+                `Swimming Lesson - ${lessonType}`,
+                `Lesson Type: ${lessonType} | Skill: ${skillLevel || 'N/A'} | Time: ${preferredTime}`,
+                unitPrice,
+                safeParticipants,
+                0,
+                totalAmount,
+                safeParticipants,
+                false
+            ]
+        );
+
+        await connection.query(
+            `INSERT INTO booking_logs (booking_id, action, new_status, description, performed_by)
+             VALUES (?, 'Created', 'Pending', ?, 'Swimming Website')`,
+            [bookingId, `Swimming lesson booking created (${lessonType})`]
+        );
+
+        await connection.commit();
+
+        return res.status(201).json({
+            success: true,
+            message: 'Swimming class booking submitted successfully',
+            data: {
+                bookingId,
+                bookingReference,
+                reservationType: 'Swimming Lesson',
+                lessonType,
+                preferredDate,
+                preferredTime,
+                participants: safeParticipants,
+                totalAmount,
+                email
+            }
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error creating swimming class booking:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to create swimming class booking',
+            details: error.message
+        });
+    } finally {
+        connection.release();
+    }
+});
+
+/**
+ * GET /api/swimming/class-bookings
+ * Optional helper endpoint for daily swimming lesson reservations.
+ */
+router.get('/class-bookings', async (req, res) => {
+    try {
+        const { date } = req.query;
+
+        let sql = `
+            SELECT
+                b.booking_id,
+                b.booking_reference,
+                b.check_in_date,
+                b.arrival_time,
+                b.first_name,
+                b.last_name,
+                b.email,
+                b.phone,
+                b.booking_status,
+                b.payment_status,
+                b.total,
+                bi.item_name,
+                bi.item_description,
+                bi.quantity,
+                bi.unit_price
+            FROM bookings b
+            INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
+            WHERE bi.item_name LIKE 'Swimming Lesson - %'
+        `;
+        const params = [];
+
+        if (date) {
+            sql += ' AND b.check_in_date = ?';
+            params.push(date);
+        }
+
+        sql += ' ORDER BY b.check_in_date DESC, b.created_at DESC';
+
+        const [rows] = await db.query(sql, params);
+
+        return res.json({
+            success: true,
+            count: rows.length,
+            data: rows
+        });
+    } catch (error) {
+        console.error('Error fetching swimming class bookings:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to fetch swimming class bookings',
+            details: error.message
+        });
+    }
+});
+
+// ============================================================
+// SWIMMING CLASS BOOKINGS (FOR ENROLLMENT CLASSES)
+// ============================================================
+
+/**
+ * POST /api/swimming/class-bookings
+ * Book a class schedule for an enrollment
+ */
+router.post("/class-bookings", async (req, res) => {
+    try {
+        const {
+            enrollmentId,
+            classDate,
+            classTime,
+            coachName,
+            remarks
+        } = req.body;
+
+        // Validate required fields
+        if (!enrollmentId || !classDate || !classTime || !coachName) {
+            return res.status(400).json({
+                error: "Missing required fields",
+                required: ["enrollmentId", "classDate", "classTime", "coachName"]
+            });
+        }
+
+        const sql = `
+            INSERT INTO swimming_class_bookings (
+                enrollment_id, class_date, class_time, coach_name, remarks
+            ) VALUES (?, ?, ?, ?, ?)
+        `;
+
+        const [result] = await db.query(sql, [
+            enrollmentId, classDate, classTime, coachName, remarks || null
+        ]);
+
+        // Fetch the created booking
+        const [booking] = await db.query(
+            "SELECT * FROM swimming_class_bookings WHERE booking_id = ?",
+            [result.insertId]
+        );
+
+        res.status(201).json({
+            message: "Class booking created successfully",
+            booking: booking[0]
+        });
+
+    } catch (error) {
+        console.error("Error creating class booking:", error);
+        res.status(500).json({
+            error: "Failed to create class booking",
+            details: error.message
+        });
+    }
+});
+
+/**
+ * GET /api/swimming/class-bookings
+ * Get all class bookings, optionally filtered by enrollment
+ */
+router.get("/class-bookings", async (req, res) => {
+    try {
+        const { enrollmentId } = req.query;
+
+        let sql = "SELECT * FROM swimming_class_bookings WHERE 1=1";
+        const params = [];
+
+        if (enrollmentId) {
+            sql += " AND enrollment_id = ?";
+            params.push(enrollmentId);
+        }
+
+        sql += " ORDER BY class_date DESC";
+
+        const [bookings] = await db.query(sql, params);
+
+        res.json({
+            success: true,
+            data: bookings
+        });
+
+    } catch (error) {
+        console.error("Error fetching class bookings:", error);
+        res.status(500).json({
+            error: "Failed to fetch class bookings",
+            details: error.message
+        });
+    }
+});
+
+/**
+ * GET /api/swimming/class-bookings/:id
+ * Get a specific class booking
+ */
+router.get("/class-bookings/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const [bookings] = await db.query(
+            "SELECT * FROM swimming_class_bookings WHERE booking_id = ?",
+            [id]
+        );
+
+        if (bookings.length === 0) {
+            return res.status(404).json({ error: "Class booking not found" });
+        }
+
+        res.json(bookings[0]);
+
+    } catch (error) {
+        console.error("Error fetching class booking:", error);
+        res.status(500).json({
+            error: "Failed to fetch class booking",
+            details: error.message
+        });
+    }
+});
+
+/**
+ * PUT /api/swimming/class-bookings/:id
+ * Update class booking status or details
+ */
+router.put("/class-bookings/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { classDate, classTime, coachName, status, remarks } = req.body;
+
+        const updates = [];
+        const values = [];
+
+        if (classDate) {
+            updates.push("class_date = ?");
+            values.push(classDate);
+        }
+        if (classTime) {
+            updates.push("class_time = ?");
+            values.push(classTime);
+        }
+        if (coachName) {
+            updates.push("coach_name = ?");
+            values.push(coachName);
+        }
+        if (status) {
+            updates.push("status = ?");
+            values.push(status);
+        }
+        if (remarks !== undefined) {
+            updates.push("remarks = ?");
+            values.push(remarks || null);
+        }
+
+        if (updates.length === 0) {
+            return res.status(400).json({ error: "No fields to update" });
+        }
+
+        values.push(id);
+
+        const sql = `UPDATE swimming_class_bookings SET ${updates.join(", ")} WHERE booking_id = ?`;
+
+        await db.query(sql, values);
+
+        // Fetch updated booking
+        const [booking] = await db.query(
+            "SELECT * FROM swimming_class_bookings WHERE booking_id = ?",
+            [id]
+        );
+
+        res.json({
+            message: "Class booking updated successfully",
+            booking: booking[0]
+        });
+
+    } catch (error) {
+        console.error("Error updating class booking:", error);
+        res.status(500).json({
+            error: "Failed to update class booking",
+            details: error.message
+        });
+    }
+});
+
+/**
+ * DELETE /api/swimming/class-bookings/:id
+ * Delete a class booking
+ */
+router.delete("/class-bookings/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const [result] = await db.query(
+            "DELETE FROM swimming_class_bookings WHERE booking_id = ?",
+            [id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: "Class booking not found" });
+        }
+
+        res.json({ message: "Class booking deleted successfully" });
+
+    } catch (error) {
+        console.error("Error deleting class booking:", error);
+        res.status(500).json({
+            error: "Failed to delete class booking",
             details: error.message
         });
     }

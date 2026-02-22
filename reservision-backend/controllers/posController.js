@@ -20,6 +20,25 @@
 
 import { db } from '../config/db.js';
 
+const mapRestaurantItems = (rows) => rows.map(item => ({
+    category: 'restaurant',
+    name: item.name,
+    price: parseFloat(item.price),
+    description: item.description || 'Uncategorized',
+    available: 1
+}));
+
+const fetchRestaurantItems = async () => {
+    const [menuItems] = await db.query(
+        `SELECT name, price, COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description
+         FROM menu_items
+         WHERE available = 1
+         ORDER BY name`
+    );
+
+    return mapRestaurantItems(menuItems);
+};
+
 // ============================================================
 // GET ALL TRANSACTIONS
 // ============================================================
@@ -87,12 +106,12 @@ export const getTransaction = async (req, res) => {
 /**
  * Handler: POST /api/pos/transactions
  * 
- * Purpose: Create a new POS transaction
+ * Purpose: Create a new POS transaction WITH INVENTORY DEDUCTION
  * 
  * Request Body:
  * {
  *   receiptNo: string,
- *   items: Array<{name: string, price: number}>,
+ *   items: Array<{name: string, price: number, menu_id?: number, quantity?: number}>,
  *   type: string (e.g., "Walk-in"),
  *   payment: string (e.g., "Cash", "GCash"),
  *   total: number,
@@ -101,6 +120,7 @@ export const getTransaction = async (req, res) => {
  * }
  */
 export const createTransaction = async (req, res) => {
+    const connection = await db.getConnection();
     try {
         const {
             receiptNo,
@@ -131,10 +151,55 @@ export const createTransaction = async (req, res) => {
             });
         }
 
+        // Start transaction for atomicity
+        await connection.beginTransaction();
+
+        // Deduct inventory for items that have menu_id
+        for (const item of normalizedItems) {
+            let menuId = item.menu_id;
+
+            // If no menu_id provided, try to find by name
+            if (!menuId && item.name) {
+                const [menuResult] = await connection.query(
+                    'SELECT menu_id FROM menu_items WHERE name = ? LIMIT 1',
+                    [item.name]
+                );
+                menuId = menuResult?.[0]?.menu_id;
+            }
+
+            // If we found a menu item, deduct its ingredients
+            if (menuId) {
+                const [ingredients] = await connection.query(`
+                    SELECT inventory_id, quantity_needed
+                    FROM menu_ingredients
+                    WHERE menu_id = ?
+                `, [menuId]);
+
+                const quantity = item.quantity || 1;
+
+                // Deduct each ingredient
+                for (const ingredient of ingredients) {
+                    const deductAmount = ingredient.quantity_needed * quantity;
+
+                    await connection.query(`
+                        UPDATE inventory 
+                        SET quantity = quantity - ?,
+                            status = CASE
+                                WHEN (quantity - ?) <= threshold * 0.25 THEN 'critical'
+                                WHEN (quantity - ?) <= threshold THEN 'low'
+                                ELSE 'good'
+                            END,
+                            updated_at = NOW()
+                        WHERE inventory_id = ?
+                    `, [deductAmount, deductAmount, deductAmount, ingredient.inventory_id]);
+                }
+            }
+        }
+
         // Convert items array to JSON string for storage
         const itemsJson = JSON.stringify(normalizedItems);
 
-        const [result] = await db.query(
+        const [result] = await connection.query(
             `INSERT INTO pos_transactions 
             (receipt_no, items, payment_method, total_amount, transaction_date, transaction_time) 
             VALUES (?, ?, ?, ?, ?, ?)`,
@@ -148,14 +213,21 @@ export const createTransaction = async (req, res) => {
             ]
         );
 
+        // Commit the transaction
+        await connection.commit();
+
         res.status(201).json({
-            message: 'Transaction created successfully',
+            message: 'Transaction created successfully with inventory deduction',
             transactionId: result.insertId,
             receiptNo: normalizedReceiptNo
         });
     } catch (error) {
+        // Rollback on error
+        await connection.rollback();
         console.error('Error creating transaction:', error);
-        res.status(500).json({ error: 'Failed to create transaction' });
+        res.status(500).json({ error: 'Failed to create transaction', details: error.message });
+    } finally {
+        connection.release();
     }
 };
 
@@ -173,7 +245,7 @@ export const deleteTransaction = async (req, res) => {
         const { id } = req.params;
 
         const [result] = await db.query(
-            'DELETE FROM pos_transactions WHERE transaction_id = ?',
+            'DELETE FROM pos_transactions WHERE id = ?',
             [id]
         );
 
@@ -223,19 +295,9 @@ export const getAllItems = async (req, res) => {
 
         // Get restaurant items from menu_items table
         try {
-            const [menuItems] = await db.query(
-                'SELECT name, price, category as description FROM menu_items WHERE available = 1'
-            );
+            const restaurantItems = await fetchRestaurantItems();
 
-            console.log('🍔 Found', menuItems.length, 'restaurant items from menu_items');
-
-            const restaurantItems = menuItems.map(item => ({
-                category: 'restaurant',
-                name: item.name,
-                price: parseFloat(item.price),
-                description: item.description,
-                available: 1
-            }));
+            console.log('🍔 Found', restaurantItems.length, 'restaurant items from menu_items category');
 
             allItems.push(...restaurantItems);
         } catch (menuError) {
@@ -323,19 +385,8 @@ export const getItemsByCategory = async (req, res) => {
         // Restaurant items from menu_items table
         if (category === 'restaurant') {
             try {
-                const [menuItems] = await db.query(
-                    'SELECT name, price, category as description FROM menu_items WHERE available = 1 ORDER BY name'
-                );
-
-                const items = menuItems.map(item => ({
-                    category: 'restaurant',
-                    name: item.name,
-                    price: parseFloat(item.price),
-                    description: item.description,
-                    available: 1
-                }));
-
-                return res.json(items);
+                const restaurantItems = await fetchRestaurantItems();
+                return res.json(restaurantItems);
             } catch (error) {
                 console.log('Using pos_items for restaurant');
             }

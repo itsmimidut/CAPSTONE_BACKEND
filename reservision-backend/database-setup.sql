@@ -267,7 +267,7 @@ INSERT INTO swimming_coaches (name, specialization, experience_years, certificat
 
 -- Create pos_transactions table
 CREATE TABLE IF NOT EXISTS pos_transactions (
-  transaction_id INT AUTO_INCREMENT PRIMARY KEY,
+  id INT AUTO_INCREMENT PRIMARY KEY,
   receipt_no VARCHAR(50) NOT NULL UNIQUE,
   items LONGTEXT NOT NULL,
   type VARCHAR(50) DEFAULT 'Walk-in',
