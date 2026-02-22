@@ -298,6 +298,17 @@ export const webhookHandler = async (req, res) => {
         console.log('✅ Booking updated as paid:', bookingId, 'with method:', paymentMethod);
         console.log('📊 Update result:', updateResult);
 
+        // Check if this booking has swimming items (for logging/future use)
+        const [bookingItems] = await db.query(
+          'SELECT * FROM booking_items WHERE booking_id = ? AND (item_type = ? OR item_type = ?)',
+          [bookingId, 'Swimming', 'Swimming Lesson']
+        );
+
+        if (bookingItems.length > 0) {
+          console.log(`🏊 Swimming booking confirmed! Booking ID: ${bookingId}, Reference: ${referenceNumber}`);
+          console.log(`   Use booking reference ${referenceNumber} as the class ID for swimming management`);
+        }
+
       } catch (dbError) {
         console.error('❌ Error updating booking:', dbError);
       }

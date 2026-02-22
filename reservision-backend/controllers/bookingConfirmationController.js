@@ -30,13 +30,14 @@ export const createBookingConfirmation = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { guest, checkIn, checkOut, items, paymentMethod, total, userId } = req.body;
+    const { guest, checkIn, checkOut, items, paymentMethod, total, userId, isSwimmingOnly } = req.body;
 
     // Debug logging
     console.log('🔍 Booking request received:');
     console.log('  - userId:', userId);
     console.log('  - guest email:', guest?.email);
     console.log('  - guest name:', guest?.firstName, guest?.lastName);
+    console.log('  - isSwimmingOnly:', isSwimmingOnly);
 
     // Validation
     if (!guest?.firstName || !guest?.lastName || !guest?.email || !guest?.phone) {
@@ -44,7 +45,8 @@ export const createBookingConfirmation = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Guest information is required' });
     }
 
-    if (!checkIn || !checkOut) {
+    // Skip date validation for swimming-only bookings
+    if (!isSwimmingOnly && (!checkIn || !checkOut)) {
       await connection.rollback();
       return res.status(400).json({ success: false, error: 'Check-in and check-out dates are required' });
     }
@@ -163,8 +165,43 @@ export const createBookingConfirmation = async (req, res) => {
 
     // Step 4: Add booking items
     for (const item of items) {
-      const nights = item.perNight ? Math.ceil((new Date(checkOut) - new Date(checkIn)) / 86400000) : 0;
+      // Calculate nights only for non-swimming items with valid dates
+      const nights = item.perNight && checkIn && checkOut
+        ? Math.ceil((new Date(checkOut) - new Date(checkIn)) / 86400000)
+        : 0;
       const totalPrice = item.price * item.qty * (item.perNight ? nights : 1);
+
+      // Get numeric inventory_item_id
+      const itemIdValue = item.item_id || item.id;
+      let numericItemId = null;
+
+      if (isNaN(itemIdValue)) {
+        // String ID - query database for numeric ID
+        const categoryName = item.swimmingDetails ? 'Swimming' : (item.category || 'Room');
+        const [inventoryItem] = await connection.query(
+          'SELECT item_id FROM inventory_items WHERE category = ? LIMIT 1',
+          [categoryName]
+        );
+
+        if (inventoryItem.length > 0) {
+          numericItemId = inventoryItem[0].item_id;
+        }
+      } else {
+        numericItemId = parseInt(itemIdValue);
+      }
+
+      // Determine item type - if has swimmingDetails, it's a swimming booking
+      const itemType = item.swimmingDetails ? 'Swimming' : (item.category || 'Room');
+      const itemName = item.swimmingDetails
+        ? (item.name || 'Swimming Lesson Package')
+        : (item.name || 'Item');
+
+      console.log(`📦 Adding booking item: ${itemType} - ${itemName}`, item.swimmingDetails ? '(Swimming)' : '');
+
+      // For swimming bookings, use participants from swimmingDetails, otherwise use guests
+      const guestCount = item.swimmingDetails && item.swimmingDetails.participants
+        ? item.swimmingDetails.participants
+        : (item.guests || 0);
 
       await connection.query(
         `INSERT INTO booking_items (
@@ -177,24 +214,47 @@ export const createBookingConfirmation = async (req, res) => {
           guests,
           nights,
           total_price,
-          per_night
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          per_night,
+          item_description
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
-          item.item_id || item.id,
-          item.category || 'Room',
-          item.name || 'Item',
+          numericItemId,
+          itemType,
+          itemName,
           item.price,
           item.qty,
-          item.guests,
+          guestCount,
           nights,
           totalPrice,
-          item.perNight || false
+          item.perNight || false,
+          item.swimmingDetails ? JSON.stringify(item.swimmingDetails) : null
         ]
       );
 
-      // Add occupied dates for rooms/cottages
-      if (item.perNight) {
+      // Add swimming session dates as occupied dates
+      if (item.swimmingDetails && item.swimmingDetails.dates && item.swimmingDetails.dates.length > 0) {
+        // Only insert if we have a valid numeric ID
+        if (numericItemId) {
+          const swimmingDates = item.swimmingDetails.dates.map(date => [
+            numericItemId,
+            bookingId,
+            date
+          ]);
+
+          await connection.query(
+            'INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date) VALUES ?',
+            [swimmingDates]
+          );
+
+          console.log(`🏊 Added ${swimmingDates.length} swimming session dates to occupied_dates`);
+        } else {
+          console.warn(`⚠️ No numeric item ID found for swimming, skipping occupied_dates`);
+        }
+      }
+
+      // Add occupied dates for rooms/cottages (skip for swimming - already handled above)
+      if (item.perNight && checkIn && checkOut && !item.swimmingDetails) {
         const dates = [];
         const start = new Date(checkIn);
         const end = new Date(checkOut);
