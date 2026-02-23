@@ -63,6 +63,7 @@ import chatbotRoutes from "./routes/chatbot.js";
 import otpRoutes from "./routes/otp.js";
 import customersRoutes from "./routes/customers.js";
 import userManagementRoutes from "./routes/userManagement.js";
+import analyticsRoutes from "./routes/analytics.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -148,6 +149,9 @@ app.use("/api/otp", otpRoutes);
 
 // Customer Management
 app.use("/api/customers", customersRoutes);
+
+// Analytics Dashboard
+app.use("/api/analytics", analyticsRoutes);
 
 // User Management (Admin)
 app.use("/api/users", userManagementRoutes);
