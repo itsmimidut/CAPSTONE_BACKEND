@@ -10,7 +10,7 @@
  * 
  * Database Tables:
  * - pos_transactions: Store all POS transactions
- * - pos_items: Catalog of services/items for sale
+ * - inventory_items: Catalog of services/items for sale
  * 
  * Features:
  * - Create and track transactions
@@ -347,13 +347,24 @@ export const getAllItems = async (req, res) => {
             console.error('Inventory error:', inventoryError.message);
         }
 
-        // Get event items from pos_items (or add Events table later)
+        // Get event items from inventory_items
         const [eventItems] = await db.query(
-            'SELECT * FROM pos_items WHERE category = "event" AND available = 1'
+            `SELECT name, price, category, category_type 
+             FROM inventory_items 
+             WHERE status = 'Available' AND category = 'Event'`
         );
-        console.log('🎉 Found', eventItems.length, 'event items from pos_items');
 
-        allItems.push(...eventItems);
+        const formattedEventItems = eventItems.map(item => ({
+            category: 'event',
+            name: item.name,
+            price: parseFloat(item.price),
+            description: item.category_type,
+            available: 1
+        }));
+
+        console.log('🎉 Found', formattedEventItems.length, 'event items from inventory_items');
+
+        allItems.push(...formattedEventItems);
 
         console.log('✅ Total items to return:', allItems.length);
         console.log('📋 Items by category:', {
@@ -440,12 +451,24 @@ export const getItemsByCategory = async (req, res) => {
             }
         }
 
-        // Fallback to pos_items for any category
+        // Fallback to inventory_items for any category
         const [rows] = await db.query(
-            'SELECT * FROM pos_items WHERE category = ? AND available = 1 ORDER BY name',
+            `SELECT name, price, category, category_type 
+             FROM inventory_items 
+             WHERE status = 'Available' AND category = ? 
+             ORDER BY name`,
             [category]
         );
-        res.json(rows);
+
+        const items = rows.map(item => ({
+            category: category.toLowerCase(),
+            name: item.name,
+            price: parseFloat(item.price),
+            description: item.category_type,
+            available: 1
+        }));
+
+        res.json(items);
     } catch (error) {
         console.error('Error fetching items by category:', error);
         res.status(500).json({ error: 'Failed to fetch items' });
