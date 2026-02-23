@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS booking_items (
   booking_id INT NOT NULL,
   
   -- Item Details
-  item_type ENUM('Room', 'Cottage', 'Food', 'Event') NOT NULL,
+  item_type ENUM('Room', 'Cottage', 'Event', 'Swimming') NOT NULL,
   item_name VARCHAR(255) NOT NULL,
   item_description TEXT,
   

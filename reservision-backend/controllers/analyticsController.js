@@ -426,6 +426,7 @@ export const getBookingsByType = async (req, res) => {
         const dateRange = getDateRange(period, startDate, endDate);
 
         console.log('📊 Fetching bookings by type for period:', period);
+        console.log('📅 Date range:', dateRange);
 
         // Get booking items grouped by type
         const [bookingItems] = await db.query(
@@ -441,21 +442,54 @@ export const getBookingsByType = async (req, res) => {
             [dateRange.start, dateRange.end]
         );
 
+        console.log('📦 Raw booking items from DB:', bookingItems);
+
         // Prepare labels and data
         const labels = bookingItems.map(item => item.item_type);
         const data = bookingItems.map(item => parseInt(item.count));
 
+        // Define colors for each category
+        const colorMap = {
+            'Room': { bg: 'rgba(99, 179, 237, 0.8)', border: 'rgb(99, 179, 237)', hover: 'rgba(99, 179, 237, 1)' },
+            'Cottage': { bg: 'rgba(56, 178, 172, 0.8)', border: 'rgb(56, 178, 172)', hover: 'rgba(56, 178, 172, 1)' },
+            'Event': { bg: 'rgba(129, 140, 248, 0.8)', border: 'rgb(129, 140, 248)', hover: 'rgba(129, 140, 248, 1)' },
+            'Swimming': { bg: 'rgba(59, 130, 246, 0.8)', border: 'rgb(59, 130, 246)', hover: 'rgba(59, 130, 246, 1)' }
+        };
+
+        // Map colors based on labels
+        const backgroundColor = labels.map(label => colorMap[label]?.bg || 'rgba(99, 179, 237, 0.8)');
+        const borderColor = labels.map(label => colorMap[label]?.border || 'rgb(99, 179, 237)');
+        const hoverBackgroundColor = labels.map(label => colorMap[label]?.hover || 'rgba(99, 179, 237, 1)');
+
         const chartData = {
-            labels: labels.length > 0 ? labels : ['Room', 'Cottage', 'Food', 'Event'],
+            labels: labels.length > 0 ? labels : ['Room', 'Cottage', 'Event', 'Swimming'],
             datasets: [{
                 label: 'Bookings',
                 data: data.length > 0 ? data : [0, 0, 0, 0],
-                backgroundColor: '#63B3ED',
-                borderRadius: 5
+                backgroundColor: backgroundColor.length > 0 ? backgroundColor : [
+                    'rgba(99, 179, 237, 0.8)',
+                    'rgba(56, 178, 172, 0.8)',
+                    'rgba(129, 140, 248, 0.8)',
+                    'rgba(59, 130, 246, 0.8)'
+                ],
+                borderColor: borderColor.length > 0 ? borderColor : [
+                    'rgb(99, 179, 237)',
+                    'rgb(56, 178, 172)',
+                    'rgb(129, 140, 248)',
+                    'rgb(59, 130, 246)'
+                ],
+                borderWidth: 2,
+                borderRadius: 8,
+                hoverBackgroundColor: hoverBackgroundColor.length > 0 ? hoverBackgroundColor : [
+                    'rgba(99, 179, 237, 1)',
+                    'rgba(56, 178, 172, 1)',
+                    'rgba(129, 140, 248, 1)',
+                    'rgba(59, 130, 246, 1)'
+                ]
             }]
         };
 
-        console.log('✅ Bookings by type data generated successfully');
+        console.log('✅ Bookings by type data:', chartData);
         res.json(chartData);
 
     } catch (error) {
