@@ -12,6 +12,9 @@ router.get('/transactions/:id', posController.getTransaction);
 // POST create new transaction
 router.post('/transactions', posController.createTransaction);
 
+// POST create e-shop order (with delivery location)
+router.post('/eshop/order', posController.createEshopOrder);
+
 // DELETE transaction
 router.delete('/transactions/:id', posController.deleteTransaction);
 
