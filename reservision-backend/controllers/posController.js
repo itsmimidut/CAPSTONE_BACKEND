@@ -451,6 +451,41 @@ export const createEshopOrder = async (req, res) => {
 };
 
 // ============================================================
+// GET CUSTOMER ORDER HISTORY
+// ============================================================
+/**
+ * Handler: GET /api/pos/orders/customer/:customerId
+ * 
+ * Purpose: Get order history for a specific customer
+ * Params: customerId - User ID
+ * Response: Array of customer's E-Shop orders
+ */
+export const getCustomerOrders = async (req, res) => {
+    try {
+        const { customerId } = req.params;
+
+        const [orders] = await db.query(
+            `SELECT * FROM pos_transactions 
+             WHERE type = 'E-Shop' AND (customer_id = ? OR customer_id IS NULL)
+             ORDER BY transaction_date DESC, transaction_time DESC
+             LIMIT 50`,
+            [customerId]
+        );
+
+        // Parse items JSON for each order
+        const ordersWithParsedItems = orders.map(order => ({
+            ...order,
+            items: JSON.parse(order.items || '[]')
+        }));
+
+        res.json(ordersWithParsedItems);
+    } catch (error) {
+        console.error('Error fetching customer orders:', error);
+        res.status(500).json({ error: 'Failed to fetch order history' });
+    }
+};
+
+// ============================================================
 // GET ALL ITEMS/SERVICES
 // ============================================================
 /**
