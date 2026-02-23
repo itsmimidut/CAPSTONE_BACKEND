@@ -10,7 +10,7 @@
  * 
  * Database Tables:
  * - pos_transactions: Store all POS transactions
- * - pos_items: Catalog of services/items for sale
+ * - inventory_items: Catalog of services/items for sale
  * 
  * Features:
  * - Create and track transactions
@@ -279,6 +279,213 @@ export const clearAllTransactions = async (req, res) => {
 };
 
 // ============================================================
+// CREATE E-SHOP ORDER
+// ============================================================
+/**
+ * Handler: POST /api/pos/eshop/order
+ * 
+ * Purpose: Create a new e-shop order with delivery location
+ * 
+ * Request Body:
+ * {
+ *   cart: Array<{name: string, price: number, qty: number}>,
+ *   locationType: string ("Room", "Cottage", "Day Guest"),
+ *   locationNumber: string (optional for Day Guest),
+ *   deliveryNotes: string (optional),
+ *   totalAmount: number,
+ *   customerId: number (optional - if user is logged in)
+ * }
+ * 
+ * Response:
+ * {
+ *   success: true,
+ *   orderId: number,
+ *   receiptNo: string,
+ *   message: string
+ * }
+ */
+export const createEshopOrder = async (req, res) => {
+    const connection = await db.getConnection();
+    try {
+        const {
+            cart,
+            locationType,
+            locationNumber,
+            deliveryNotes,
+            totalAmount,
+            customerId
+        } = req.body;
+
+        // Validate required fields
+        if (!cart || !Array.isArray(cart) || cart.length === 0) {
+            return res.status(400).json({
+                error: 'Cart is required and must contain at least one item'
+            });
+        }
+
+        if (!locationType) {
+            return res.status(400).json({
+                error: 'Location type is required (Room, Cottage, or Day Guest)'
+            });
+        }
+
+        if (locationType !== 'Day Guest' && !locationNumber) {
+            return res.status(400).json({
+                error: `Location number is required for ${locationType}`
+            });
+        }
+
+        if (totalAmount === undefined || totalAmount <= 0) {
+            return res.status(400).json({
+                error: 'Total amount is required and must be greater than 0'
+            });
+        }
+
+        // Generate unique receipt number: ESHOP-YYYYMMDD-####
+        const now = new Date();
+        const dateStr = now.toISOString().split('T')[0].replace(/-/g, '');
+        const randomNum = Math.floor(Math.random() * 9000) + 1000;
+        const receiptNo = `ESHOP-${dateStr}-${randomNum}`;
+
+        // Start transaction for atomicity
+        await connection.beginTransaction();
+
+        // Deduct inventory for restaurant items
+        for (const item of cart) {
+            // Try to find menu item by name
+            const [menuResult] = await connection.query(
+                'SELECT menu_id FROM menu_items WHERE name = ? LIMIT 1',
+                [item.name]
+            );
+
+            const menuId = menuResult?.[0]?.menu_id;
+
+            // If we found a menu item, deduct its ingredients
+            if (menuId) {
+                const [ingredients] = await connection.query(`
+                    SELECT inventory_id, quantity_needed
+                    FROM menu_ingredients
+                    WHERE menu_id = ?
+                `, [menuId]);
+
+                const quantity = item.qty || 1;
+
+                // Deduct each ingredient
+                for (const ingredient of ingredients) {
+                    const deductAmount = ingredient.quantity_needed * quantity;
+
+                    await connection.query(`
+                        UPDATE inventory 
+                        SET quantity = quantity - ?,
+                            status = CASE
+                                WHEN (quantity - ?) <= threshold * 0.25 THEN 'critical'
+                                WHEN (quantity - ?) <= threshold THEN 'low'
+                                ELSE 'good'
+                            END,
+                            updated_at = NOW()
+                        WHERE inventory_id = ?
+                    `, [deductAmount, deductAmount, deductAmount, ingredient.inventory_id]);
+                }
+            }
+        }
+
+        // Format items for storage
+        const itemsFormatted = cart.map(item => ({
+            name: item.name,
+            price: parseFloat(item.price),
+            quantity: item.qty,
+            subtotal: parseFloat(item.price) * item.qty
+        }));
+
+        const itemsJson = JSON.stringify(itemsFormatted);
+
+        // Get current date and time
+        const transactionDate = now.toISOString().split('T')[0];
+        const transactionTime = now.toTimeString().split(' ')[0];
+
+        // Insert order into pos_transactions
+        const [result] = await connection.query(
+            `INSERT INTO pos_transactions 
+            (receipt_no, items, type, payment_method, total_amount, transaction_date, transaction_time, 
+             location_type, location_number, delivery_notes, customer_id) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                receiptNo,
+                itemsJson,
+                'E-Shop',
+                'Cash on Delivery',
+                totalAmount,
+                transactionDate,
+                transactionTime,
+                locationType,
+                locationNumber || null,
+                deliveryNotes || null,
+                customerId || null
+            ]
+        );
+
+        // Commit the transaction
+        await connection.commit();
+
+        res.status(201).json({
+            success: true,
+            orderId: result.insertId,
+            receiptNo: receiptNo,
+            message: 'Order placed successfully! Your food will be delivered in 30-45 minutes.',
+            estimatedDelivery: '30-45 minutes',
+            deliveryLocation: locationType === 'Day Guest'
+                ? 'Day Guest Area'
+                : `${locationType} ${locationNumber}`
+        });
+    } catch (error) {
+        // Rollback on error
+        await connection.rollback();
+        console.error('Error creating e-shop order:', error);
+        res.status(500).json({
+            error: 'Failed to create order',
+            details: error.message
+        });
+    } finally {
+        connection.release();
+    }
+};
+
+// ============================================================
+// GET CUSTOMER ORDER HISTORY
+// ============================================================
+/**
+ * Handler: GET /api/pos/orders/customer/:customerId
+ * 
+ * Purpose: Get order history for a specific customer
+ * Params: customerId - User ID
+ * Response: Array of customer's E-Shop orders
+ */
+export const getCustomerOrders = async (req, res) => {
+    try {
+        const { customerId } = req.params;
+
+        const [orders] = await db.query(
+            `SELECT * FROM pos_transactions 
+             WHERE type = 'E-Shop' AND (customer_id = ? OR customer_id IS NULL)
+             ORDER BY transaction_date DESC, transaction_time DESC
+             LIMIT 50`,
+            [customerId]
+        );
+
+        // Parse items JSON for each order
+        const ordersWithParsedItems = orders.map(order => ({
+            ...order,
+            items: JSON.parse(order.items || '[]')
+        }));
+
+        res.json(ordersWithParsedItems);
+    } catch (error) {
+        console.error('Error fetching customer orders:', error);
+        res.status(500).json({ error: 'Failed to fetch order history' });
+    }
+};
+
+// ============================================================
 // GET ALL ITEMS/SERVICES
 // ============================================================
 /**
@@ -347,13 +554,24 @@ export const getAllItems = async (req, res) => {
             console.error('Inventory error:', inventoryError.message);
         }
 
-        // Get event items from pos_items (or add Events table later)
+        // Get event items from inventory_items
         const [eventItems] = await db.query(
-            'SELECT * FROM pos_items WHERE category = "event" AND available = 1'
+            `SELECT name, price, category, category_type 
+             FROM inventory_items 
+             WHERE status = 'Available' AND category = 'Event'`
         );
-        console.log('🎉 Found', eventItems.length, 'event items from pos_items');
 
-        allItems.push(...eventItems);
+        const formattedEventItems = eventItems.map(item => ({
+            category: 'event',
+            name: item.name,
+            price: parseFloat(item.price),
+            description: item.category_type,
+            available: 1
+        }));
+
+        console.log('🎉 Found', formattedEventItems.length, 'event items from inventory_items');
+
+        allItems.push(...formattedEventItems);
 
         console.log('✅ Total items to return:', allItems.length);
         console.log('📋 Items by category:', {
@@ -440,12 +658,24 @@ export const getItemsByCategory = async (req, res) => {
             }
         }
 
-        // Fallback to pos_items for any category
+        // Fallback to inventory_items for any category
         const [rows] = await db.query(
-            'SELECT * FROM pos_items WHERE category = ? AND available = 1 ORDER BY name',
+            `SELECT name, price, category, category_type 
+             FROM inventory_items 
+             WHERE status = 'Available' AND category = ? 
+             ORDER BY name`,
             [category]
         );
-        res.json(rows);
+
+        const items = rows.map(item => ({
+            category: category.toLowerCase(),
+            name: item.name,
+            price: parseFloat(item.price),
+            description: item.category_type,
+            available: 1
+        }));
+
+        res.json(items);
     } catch (error) {
         console.error('Error fetching items by category:', error);
         res.status(500).json({ error: 'Failed to fetch items' });
