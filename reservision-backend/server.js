@@ -46,6 +46,7 @@ dotenv.config();
 // Import all route handlers from their respective files
 // Each route file contains CRUD endpoints for its resource
 import roomsRoutes from "./routes/rooms.js";
+import predictionRoutes from "./routes/prediction.js";
 import promosRoutes from "./routes/promos.js";
 import seasonalRoutes from "./routes/seasonalPricing.js";
 import tablesRoutes from "./routes/restaurant/tables.js";
@@ -122,6 +123,7 @@ app.use("/api/seasons", seasonalRoutes);
 // - Inventory: Track food/supplies inventory
 app.use("/api/restaurant/tables", tablesRoutes);
 app.use("/api/restaurant/orders", ordersRoutes);
+app.use("/api/restaurant/sales", (await import('./routes/restaurant/salesReport.js')).default);
 app.use("/api/restaurant/menu", menuRoutes);
 app.use("/api/restaurant", menuIngredientsRoutes);
 app.use("/api/restaurant/inventory", inventoryRoutes);
@@ -129,6 +131,9 @@ app.use("/api/rates", ratesRoutes);
 
 // Swimming Enrollment Management
 app.use("/api/swimming", swimmingRoutes);
+
+// Predictive Analytics
+app.use("/api/prediction", predictionRoutes);
 
 // POS (Point of Sale) Management
 app.use("/api/pos", posRoutes);
