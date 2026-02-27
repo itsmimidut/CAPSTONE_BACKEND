@@ -138,12 +138,12 @@ export const getRoom = async (req, res) => {
  * - Database connection error → 500 error
  */
 export const createRoom = async (req, res) => {
-  const { category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex } = req.body;
+  const { category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity } = req.body;
   const [result] = await db.query(
     `INSERT INTO inventory_items
-      (category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(images || []), primaryImageIndex || 0]
+      (category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(images || []), primaryImageIndex || 0, quantity || 1]
   );
   res.json({ success: true, id: result.insertId });
 };
@@ -182,12 +182,12 @@ export const createRoom = async (req, res) => {
  * - Frontend should verify room exists before allowing edit
  */
 export const updateRoom = async (req, res) => {
-  const { category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex } = req.body;
+  const { category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity } = req.body;
   await db.query(
     `UPDATE inventory_items SET
-       category=?, category_type=?, room_number=?, name=?, description=?, max_guests=?, price=?, status=?, promo=?, images=?, primaryImageIndex=?
+       category=?, category_type=?, room_number=?, name=?, description=?, max_guests=?, price=?, status=?, promo=?, images=?, primaryImageIndex=?, quantity=?
      WHERE item_id=?`,
-    [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(images || []), primaryImageIndex || 0, req.params.id]
+    [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(images || []), primaryImageIndex || 0, quantity || 1, req.params.id]
   );
   res.json({ success: true });
 };
