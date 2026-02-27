@@ -695,6 +695,7 @@ export const getAdminReservations = async (req, res) => {
         p.payment_reference,
         p.amount as payment_amount,
         GROUP_CONCAT(DISTINCT bi.item_name ORDER BY bi.item_name SEPARATOR ', ') as items_summary,
+        GROUP_CONCAT(DISTINCT bi.item_description SEPARATOR '|||') as items_descriptions,
         COUNT(DISTINCT bi.item_id) as item_count
       FROM bookings b
       LEFT JOIN customers c ON b.customer_id = c.customer_id
