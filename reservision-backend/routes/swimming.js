@@ -1399,6 +1399,85 @@ router.put("/admin/students/:id/status", async (req, res) => {
 });
 
 /**
+ * GET /api/swimming/admin/calendar/lessons
+ * Get all swimming lessons with dates and times for calendar view
+ * Returns lessons grouped with student and coach information
+ * 
+ * Relationships:
+ * swimming_enrollments --[booking_reference]--> bookings --[booking_id]--> booking_items
+ */
+router.get("/admin/calendar/lessons", async (req, res) => {
+    try {
+        const [lessons] = await db.query(`
+            SELECT 
+                bi.item_id,
+                b.booking_id,
+                b.booking_reference,
+                CONCAT(se.first_name, ' ', se.last_name) AS student_name,
+                bi.item_name AS lesson_type,
+                COALESCE(sc.name, se.preferred_coach) AS coach_name,
+                JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.dates')) AS dates,
+                JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.time')) AS time,
+                se.enrollment_status,
+                b.payment_status,
+                b.booking_status,
+                se.mobile_phone AS student_phone
+            FROM booking_items bi
+            INNER JOIN bookings b ON bi.booking_id = b.booking_id
+            INNER JOIN swimming_enrollments se ON se.booking_reference = b.booking_reference
+            LEFT JOIN swimming_coaches sc ON CAST(sc.coach_id AS CHAR) = se.preferred_coach
+            WHERE bi.item_type = 'Swimming'
+                AND bi.item_description IS NOT NULL
+                AND b.booking_status IN ('Confirmed', 'Pending')
+                AND se.enrollment_status = 'Approved'
+            ORDER BY JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.time')) ASC
+        `);
+
+        // Transform the response to parse dates array
+        const transformedLessons = lessons.map(lesson => {
+            let datesArray = [];
+            try {
+                if (lesson.dates) {
+                    // Remove quotes and parse the JSON array
+                    datesArray = JSON.parse(lesson.dates);
+                }
+            } catch (e) {
+                console.error('Error parsing dates for lesson:', lesson.item_id, e);
+            }
+
+            return {
+                item_id: lesson.item_id,
+                booking_id: lesson.booking_id,
+                booking_reference: lesson.booking_reference,
+                student_name: lesson.student_name,
+                lesson_type: lesson.lesson_type,
+                coach_name: lesson.coach_name,
+                dates: datesArray,
+                time: lesson.time,
+                enrollment_status: lesson.enrollment_status,
+                payment_status: lesson.payment_status,
+                booking_status: lesson.booking_status,
+                student_phone: lesson.student_phone
+            };
+        });
+
+        res.json({
+            success: true,
+            lessons: transformedLessons,
+            count: transformedLessons.length
+        });
+
+    } catch (error) {
+        console.error("Error fetching calendar lessons for admin:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to fetch calendar lessons",
+            details: error.message
+        });
+    }
+});
+
+/**
  * DELETE /api/swimming/admin/students/:id
  * Delete a student enrollment
  */
