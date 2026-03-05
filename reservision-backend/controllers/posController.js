@@ -681,3 +681,147 @@ export const getItemsByCategory = async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch items' });
     }
 };
+
+// ============================================================
+// THERMAL PRINTER ENDPOINTS
+// ============================================================
+
+/**
+ * Handler: POST /api/pos/print/booking
+ * 
+ * Purpose: Print a booking receipt directly to USB thermal printer
+ * Request Body: Receipt data (guest name, dates, total, etc.)
+ * Response: Print status
+ */
+export const printBookingReceipt = async (req, res) => {
+    try {
+        const { printBookingReceipt: printBooking } = await import('../services/printerService.js');
+        const receiptData = req.body;
+
+        // Validate required fields
+        if (!receiptData.receiptNo || !receiptData.guestName || !receiptData.total) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required receipt data'
+            });
+        }
+
+        // Send to printer
+        const result = await printBooking(receiptData);
+
+        if (result.success) {
+            res.json({
+                success: true,
+                message: 'Booking receipt printed successfully',
+                receiptNo: result.receiptNo
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                message: result.message || 'Failed to print receipt',
+                error: result.error
+            });
+        }
+
+    } catch (error) {
+        console.error('Printer service error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Printer service error',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Handler: POST /api/pos/print/regular
+ * 
+ * Purpose: Print a regular POS receipt directly to USB thermal printer
+ * Request Body: Receipt data (items, total, payment method)
+ * Response: Print status
+ */
+export const printRegularReceipt = async (req, res) => {
+    try {
+        const { printRegularReceipt: printRegular } = await import('../services/printerService.js');
+        const receiptData = req.body;
+
+        // Validate required fields
+        if (!receiptData.receiptNo || !receiptData.items || !receiptData.total) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required receipt data'
+            });
+        }
+
+        // Send to printer
+        const result = await printRegular(receiptData);
+
+        if (result.success) {
+            res.json({
+                success: true,
+                message: 'Receipt printed successfully',
+                receiptNo: result.receiptNo
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                message: result.message || 'Failed to print receipt',
+                error: result.error
+            });
+        }
+
+    } catch (error) {
+        console.error('Printer service error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Printer service error',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Handler: GET /api/pos/printer/test
+ * 
+ * Purpose: Test if thermal printer is connected and ready
+ * Response: Connection status
+ */
+export const testPrinter = async (req, res) => {
+    try {
+        const { testPrinterConnection } = await import('../services/printerService.js');
+        const result = await testPrinterConnection();
+
+        res.json(result);
+
+    } catch (error) {
+        console.error('Printer test error:', error);
+        res.status(500).json({
+            connected: false,
+            message: 'Printer test failed',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Handler: GET /api/pos/printer/queue
+ * 
+ * Purpose: Get list of pending print jobs in queue
+ * Response: Array of pending print files
+ */
+export const getPrintJobsQueue = async (req, res) => {
+    try {
+        const { getPendingPrintJobs } = await import('../services/printerService.js');
+        const result = await getPendingPrintJobs();
+
+        res.json(result);
+
+    } catch (error) {
+        console.error('Print queue error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get print queue',
+            error: error.message
+        });
+    }
+};

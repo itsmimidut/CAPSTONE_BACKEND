@@ -23,12 +23,17 @@ import {
   getBookings,
   getBooking,
   getBookingByReference,
+  getCustomerBookingHistory,
+  getBookingHistoryByEmail,
+  getBookingQRCode,
   createBooking,
   updateBooking,
   deleteBooking,
   getOccupiedDates,
   getAllOccupiedDates,
-  getAdminReservations
+  getAdminReservations,
+  validateBookingForCheckIn,
+  processCheckIn
 } from "../controllers/bookingsController.js";
 import {
   createBookingConfirmation,
@@ -41,6 +46,12 @@ const router = express.Router();
 // Admin reservations endpoint (must be before /:id routes)
 router.get("/admin/reservations", getAdminReservations);
 
+// Customer booking history by customer ID
+router.get("/customer/:customerId/history", getCustomerBookingHistory);
+
+// Customer booking history by email
+router.get("/email/:email/history", getBookingHistoryByEmail);
+
 // Get all bookings
 router.get("/", getBookings);
 
@@ -52,6 +63,9 @@ router.get("/occupied-dates/:itemId", getOccupiedDates);
 
 // Get booking by reference
 router.get("/reference/:reference", getBookingByReference);
+
+// Get QR code for booking (must be before /:id route)
+router.get("/qr/:bookingReference", getBookingQRCode);
 
 // Get booking details with customer and payment info
 router.get("/:id/details", getBookingDetails);
@@ -73,5 +87,11 @@ router.put("/:id", updateBooking);
 
 // Cancel/delete booking
 router.delete("/:id", deleteBooking);
+
+// Validate booking for check-in
+router.get("/validate/:bookingReference", validateBookingForCheckIn);
+
+// Process guest check-in
+router.post("/:bookingId/check-in", processCheckIn);
 
 export default router;

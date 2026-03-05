@@ -1,6 +1,6 @@
 import express from 'express';
 const router = express.Router();
-import { checkEmailExists, getCustomerProfile, updateCustomerProfile, customerSignup, customerLogin } from '../controllers/customerController.js';
+import { checkEmailExists, getCustomerProfile, updateCustomerProfile, customerSignup, customerLogin, getCustomerIdByUserId } from '../controllers/customerController.js';
 // Customer signup
 router.post('/signup', customerSignup);
 
@@ -22,5 +22,8 @@ router.get('/profile/:email', getCustomerProfile);
 
 // Update customer profile by email
 router.put('/profile/:email', updateCustomerProfile);
+
+// Get customer_id by user_id
+router.get('/id/by-user/:userId', getCustomerIdByUserId);
 
 export default router;

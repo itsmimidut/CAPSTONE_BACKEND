@@ -443,3 +443,46 @@ export const updateCustomerProfile = async (req, res) => {
     });
   }
 };
+
+/**
+ * Get customer_id by user_id
+ * GET /api/customers/id/by-user/:userId
+ * Helper endpoint to map user_id to customer_id
+ */
+export const getCustomerIdByUserId = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: 'User ID is required'
+      });
+    }
+
+    // Get customer_id from customers table
+    const [customers] = await db.query(
+      'SELECT customer_id FROM customers WHERE user_id = ? LIMIT 1',
+      [userId]
+    );
+
+    if (customers.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Customer mapping not found',
+        customerId: null
+      });
+    }
+
+    res.json({
+      success: true,
+      customerId: customers[0].customer_id
+    });
+  } catch (error) {
+    console.error('Get customer ID error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get customer ID'
+    });
+  }
+};

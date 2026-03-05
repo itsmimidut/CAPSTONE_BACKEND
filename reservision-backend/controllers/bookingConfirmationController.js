@@ -1,4 +1,6 @@
 import db from '../config/db.js';
+import { generateQRCode, formatBookingDataForQR } from '../services/qrCodeService.js';
+import { sendBookingConfirmationWithQR } from '../services/emailService.js';
 
 /**
  * ============================================================
@@ -7,8 +9,9 @@ import db from '../config/db.js';
  * Handles complete booking confirmation process including:
  * - Customer creation/update
  * - Booking creation with items
+ * - QR code generation
+ * - Email confirmation with QR code
  * - Payment initiation
- * - Email confirmation (future)
  */
 
 /**
@@ -242,6 +245,28 @@ export const createBookingConfirmation = async (req, res) => {
             date
           ]);
 
+          // **VALIDATION**: Check if any swimming dates are already occupied
+          const dateStrings = swimmingDates.map(d => d[2]);
+          const [conflictingDates] = await connection.query(
+            `SELECT DISTINCT occupied_date FROM occupied_dates 
+             WHERE inventory_item_id = ? AND occupied_date IN (?)`,
+            [numericItemId, dateStrings]
+          );
+
+          if (conflictingDates.length > 0) {
+            await connection.rollback();
+            const conflictDates = conflictingDates.map(d => d.occupied_date).join(', ');
+            console.error(`❌ Swimming date conflict for item ${numericItemId}: ${conflictDates}`);
+            return res.status(409).json({
+              success: false,
+              error: 'Some swimming session dates have already been booked',
+              conflict_dates: conflictingDates.map(d => d.occupied_date),
+              item_id: numericItemId,
+              item_name: itemName
+            });
+          }
+
+          // All dates available - proceed with insert
           await connection.query(
             'INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date) VALUES ?',
             [swimmingDates]
@@ -255,24 +280,48 @@ export const createBookingConfirmation = async (req, res) => {
 
       // Add occupied dates for rooms/cottages (skip for swimming - already handled above)
       if (item.perNight && checkIn && checkOut && !item.swimmingDetails) {
-        const dates = [];
-        const start = new Date(checkIn);
-        const end = new Date(checkOut);
+        const itemId = item.item_id || item.id;
 
-        for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
-          dates.push([
-            item.item_id || item.id,
-            bookingId,
-            d.toISOString().split('T')[0]
-          ]);
+        // 🔍 IMPROVED: Check availability directly from bookings table
+        // Query all confirmed/paid bookings for this item that overlap with requested dates
+        const [conflicts] = await connection.query(
+          `SELECT b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date
+           FROM bookings b
+           INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
+           WHERE bi.inventory_item_id = ? 
+           AND b.booking_status IN ('Confirmed', 'Pending')
+           AND b.payment_status IN ('Paid', 'pending')
+           AND (
+             (b.check_in_date < ? AND b.check_out_date > ?)
+             OR (b.check_in_date >= ? AND b.check_in_date < ?)
+             OR (b.check_out_date > ? AND b.check_out_date <= ?)
+           )`,
+          [itemId, checkOut, checkIn, checkIn, checkOut, checkIn, checkOut]
+        );
+
+        if (conflicts.length > 0) {
+          await connection.rollback();
+          const conflictInfo = conflicts.map(c =>
+            `${c.booking_reference} (${c.check_in_date} to ${c.check_out_date})`
+          ).join(', ');
+
+          console.error(`❌ Room booking conflict for item ${itemId}: ${conflictInfo}`);
+          return res.status(409).json({
+            success: false,
+            error: 'Room is not available for selected dates',
+            conflict_dates: conflicts.map(c => ({
+              booking_reference: c.booking_reference,
+              check_in: c.check_in_date,
+              check_out: c.check_out_date
+            })),
+            item_id: itemId,
+            item_name: itemName
+          });
         }
 
-        if (dates.length > 0) {
-          await connection.query(
-            'INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date) VALUES ?',
-            [dates]
-          );
-        }
+        // Dates are available - no need to insert into occupied_dates
+        // Source of truth is now the bookings table with check_in/check_out dates
+        console.log(`✅ Room availability verified for item ${itemId} from ${checkIn} to ${checkOut}`);
       }
     }
 
@@ -298,6 +347,36 @@ export const createBookingConfirmation = async (req, res) => {
 
     await connection.commit();
 
+    // Step 7: Generate QR Code with booking info
+    let qrCodeData = null;
+    try {
+      console.log('🔄 Generating QR code...');
+
+      // Prepare data for QR code
+      const formattedQRData = formatBookingDataForQR(
+        {
+          booking_reference: bookingReference,
+          first_name: guest.firstName,
+          last_name: guest.lastName
+        },
+        items.map(item => ({
+          item_name: item.name,
+          quantity: item.qty,
+          item_type: item.category || 'Room'
+        }))
+      );
+
+      qrCodeData = await generateQRCode(formattedQRData);
+      console.log('✅ QR code generated successfully');
+    } catch (qrError) {
+      console.warn('⚠️ QR code generation failed:', qrError.message);
+      // Continue even if QR generation fails
+    }
+
+    // Step 8: Skip email sending here - will send only after payment is completed
+    // Email with QR code will be sent in updatePaymentStatus when status = 'paid'
+    console.log('⏳ Email will be sent after payment is confirmed');
+
     // Return success response
     res.json({
       success: true,
@@ -309,7 +388,11 @@ export const createBookingConfirmation = async (req, res) => {
         paymentId: paymentResult.insertId,
         paymentReference,
         total,
-        status: 'pending'
+        status: 'pending',
+        qrCode: qrCodeData ? {
+          url: qrCodeData.url,
+          filename: qrCodeData.filename
+        } : null
       }
     });
 
@@ -364,6 +447,77 @@ export const updatePaymentStatus = async (req, res) => {
         'INSERT INTO booking_logs (booking_id, action, details) VALUES (?, ?, ?)',
         [bookingId, 'payment_completed', `Payment completed via ${paymentIntentId}`]
       );
+
+      // 🎉 Step: Send confirmation email with QR code AFTER payment is confirmed
+      try {
+        console.log('📧 Sending booking confirmation email with QR code after payment...');
+
+        // Get booking details for email
+        const [bookings] = await db.query(
+          `SELECT b.*, c.first_name, c.last_name, c.email, 
+                  b.booking_reference, b.check_in, b.check_out, b.total
+           FROM bookings b
+           LEFT JOIN customers c ON b.customer_id = c.customer_id
+           WHERE b.id = ?`,
+          [bookingId]
+        );
+
+        if (bookings.length > 0) {
+          const booking = bookings[0];
+
+          // Get booking items
+          const [items] = await db.query(
+            `SELECT bi.quantity as qty, bi.price, i.name, i.category
+             FROM booking_items bi
+             LEFT JOIN inventory_items i ON bi.item_id = i.item_id
+             WHERE bi.booking_id = ?`,
+            [bookingId]
+          );
+
+          // Generate QR code for paid booking
+          let qrCodeData = null;
+          try {
+            const formattedQRData = formatBookingDataForQR(
+              {
+                booking_reference: booking.booking_reference,
+                first_name: booking.first_name,
+                last_name: booking.last_name
+              },
+              items.map(item => ({
+                item_name: item.name,
+                quantity: item.qty,
+                item_type: item.category || 'Room'
+              }))
+            );
+            qrCodeData = await generateQRCode(formattedQRData);
+            console.log('✅ QR code generated for payment confirmation');
+          } catch (qrError) {
+            console.warn('⚠️ QR code generation failed:', qrError.message);
+          }
+
+          // Send email with QR
+          const emailData = {
+            email: booking.email,
+            firstName: booking.first_name,
+            lastName: booking.last_name,
+            bookingReference: booking.booking_reference,
+            checkIn: booking.check_in,
+            checkOut: booking.check_out,
+            items: items.map(item => ({
+              name: item.name,
+              qty: item.qty,
+              price: item.price
+            })),
+            total: booking.total
+          };
+
+          await sendBookingConfirmationWithQR(emailData, qrCodeData?.base64 || null);
+          console.log('✅ Confirmation email with QR sent successfully');
+        }
+      } catch (emailError) {
+        console.warn('⚠️ Email sending failed after payment:', emailError.message);
+        // Don't fail the payment update if email fails
+      }
     }
 
     res.json({
