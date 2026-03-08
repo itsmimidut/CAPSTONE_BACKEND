@@ -1,6 +1,7 @@
 import db from '../config/db.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import fetch from 'node-fetch';
 /**
  * Customer Signup
  * POST /api/customers/signup
@@ -8,6 +9,7 @@ import jwt from 'jsonwebtoken';
 export const customerSignup = async (req, res) => {
   try {
     const { firstName, lastName, email, password, contactNumber } = req.body;
+    const normalizedPhone = (contactNumber || '').trim();
 
     // Validate required fields
     if (!firstName || !lastName || !email || !password) {
@@ -59,7 +61,7 @@ export const customerSignup = async (req, res) => {
       const [userResult] = await connection.query(
         `INSERT INTO user (first_name, last_name, email, phone, password, role, created_at) 
          VALUES (?, ?, ?, ?, ?, 'customer', NOW())`,
-        [firstName, lastName, email, contactNumber || null, hashedPassword]
+        [firstName, lastName, email, normalizedPhone, hashedPassword]
       );
 
       const userId = userResult.insertId;
@@ -97,7 +99,7 @@ export const customerSignup = async (req, res) => {
           firstName,
           lastName,
           email,
-          phone: contactNumber,
+          phone: normalizedPhone,
           role: 'customer'
         },
         message: 'Account created successfully'
@@ -202,6 +204,155 @@ export const customerLogin = async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to login. Please try again later.'
+    });
+  }
+};
+
+/**
+ * Customer Google Login
+ * POST /api/customers/google-login
+ */
+export const customerGoogleLogin = async (req, res) => {
+  try {
+    const { credential } = req.body || {};
+
+    if (!credential) {
+      return res.status(400).json({
+        success: false,
+        error: 'Google credential is required'
+      });
+    }
+
+    // Verify Google ID token via Google tokeninfo endpoint.
+    const verifyResponse = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`
+    );
+
+    if (!verifyResponse.ok) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid Google credential'
+      });
+    }
+
+    const googleUser = await verifyResponse.json();
+    const {
+      aud,
+      email,
+      email_verified: emailVerified,
+      given_name: givenName,
+      family_name: familyName,
+      name
+    } = googleUser;
+
+    // Optional audience validation for extra security when env is configured.
+    if (process.env.GOOGLE_CLIENT_ID && aud !== process.env.GOOGLE_CLIENT_ID) {
+      return res.status(401).json({
+        success: false,
+        error: 'Google token audience mismatch'
+      });
+    }
+
+    if (!email || emailVerified !== 'true') {
+      return res.status(401).json({
+        success: false,
+        error: 'Google account email is not verified'
+      });
+    }
+
+    const [existingUsers] = await db.query(
+      `SELECT user_id, first_name, last_name, email, phone, role
+       FROM user
+       WHERE email = ?
+       LIMIT 1`,
+      [email]
+    );
+
+    let userRecord;
+
+    if (existingUsers.length > 0) {
+      userRecord = existingUsers[0];
+
+      // Allow the same roles as password login endpoint.
+      if (!['customer', 'admin', 'restaurantstaff', 'receptionist'].includes(userRecord.role)) {
+        return res.status(403).json({
+          success: false,
+          error: 'This account role is not allowed to sign in from this page.'
+        });
+      }
+    } else {
+      const firstName = (givenName || (name || '').split(' ')[0] || 'Google').trim();
+      const lastName = (familyName || (name || '').split(' ').slice(1).join(' ') || 'User').trim();
+      const placeholderPassword = await bcrypt.hash(
+        `google_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        10
+      );
+
+      const connection = await db.getConnection();
+      try {
+        await connection.beginTransaction();
+
+        const [userResult] = await connection.query(
+          `INSERT INTO user (first_name, last_name, email, phone, password, role, created_at)
+           VALUES (?, ?, ?, ?, ?, 'customer', NOW())`,
+          [firstName, lastName, email, '', placeholderPassword]
+        );
+
+        const userId = userResult.insertId;
+
+        await connection.query(
+          `INSERT INTO customers (user_id, created_at)
+           VALUES (?, NOW())`,
+          [userId]
+        );
+
+        await connection.commit();
+
+        userRecord = {
+          user_id: userId,
+          first_name: firstName,
+          last_name: lastName,
+          email,
+          phone: '',
+          role: 'customer'
+        };
+      } catch (transactionError) {
+        await connection.rollback();
+        throw transactionError;
+      } finally {
+        connection.release();
+      }
+    }
+
+    const token = jwt.sign(
+      {
+        id: userRecord.user_id,
+        email: userRecord.email,
+        role: userRecord.role,
+        name: `${userRecord.first_name} ${userRecord.last_name}`
+      },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      customer: {
+        id: userRecord.user_id,
+        firstName: userRecord.first_name,
+        lastName: userRecord.last_name,
+        email: userRecord.email,
+        phone: userRecord.phone,
+        role: userRecord.role
+      },
+      message: 'Google login successful'
+    });
+  } catch (error) {
+    console.error('❌ Google login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to login with Google. Please try again later.'
     });
   }
 };

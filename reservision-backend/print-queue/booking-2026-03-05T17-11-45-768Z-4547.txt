@@ -1,0 +1,29 @@
+               ReserVision
+
+             Booking Receipt
+
+Receipt: POS-202603055995
+03/05/2026 01:11:45
+------------------------------------------
+Guest: Admin User
+Phone: 09274886292
+Email: johnrheynedamotamares@gmail.com
+------------------------------------------
+Room: Deluxe Room
+Check-in:  2026-03-11
+Check-out: 2026-03-12
+Nights: 1
+Adults: 2   Children: 0
+------------------------------------------
+Ref: EDU30699157
+------------------------------------------
+TOTAL                          PHP 2500.00
+------------------------------------------
+Cash:                          PHP 2500.00
+
+Paid Amount:                   PHP 2500.00
+Change:                           PHP 0.00
+
+                Thank you!
+
+

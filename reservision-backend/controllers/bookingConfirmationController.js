@@ -97,38 +97,54 @@ export const createBookingConfirmation = async (req, res) => {
         console.log(`✅ Created new customer_id ${customerId} linked to user_id ${userId}`);
       }
     } else {
-      // Guest booking (not logged in): check by email
-      const [existingCustomer] = await connection.query(
-        'SELECT customer_id FROM customers WHERE email = ? LIMIT 1',
+      // Guest / walk-in booking (no userId supplied).
+      // email and name live in `user`; customer profile is linked via user_id.
+      // Try to find an existing user with this email, then their customer record.
+      const [existingUser] = await connection.query(
+        'SELECT user_id FROM user WHERE email = ? LIMIT 1',
         [guest.email]
       );
 
-      if (existingCustomer.length > 0) {
-        customerId = existingCustomer[0].customer_id;
-
-        // Update existing customer info
-        await connection.query(
-          `UPDATE customers SET 
-            first_name = ?, 
-            last_name = ?, 
-            phone = ?, 
-            address = ?, 
-            city = ?, 
-            country = ?, 
-            postal_code = ?,
-            updated_at = CURRENT_TIMESTAMP
-          WHERE customer_id = ?`,
-          [guest.firstName, guest.lastName, guest.phone, guest.address, guest.city, guest.country || 'Philippines', guest.postal, customerId]
+      if (existingUser.length > 0) {
+        const guestUserId = existingUser[0].user_id;
+        const [existingCustomer] = await connection.query(
+          'SELECT customer_id FROM customers WHERE user_id = ? LIMIT 1',
+          [guestUserId]
         );
+
+        if (existingCustomer.length > 0) {
+          customerId = existingCustomer[0].customer_id;
+          // Update address fields
+          await connection.query(
+            `UPDATE customers SET address=?, city=?, country=?, postal_code=?, updated_at=CURRENT_TIMESTAMP
+             WHERE customer_id=?`,
+            [guest.address, guest.city, guest.country || 'Philippines', guest.postal, customerId]
+          );
+        } else {
+          // User exists but no customer row yet — create one
+          const [customerResult] = await connection.query(
+            `INSERT INTO customers (user_id, address, city, country, postal_code)
+             VALUES (?, ?, ?, ?, ?)`,
+            [guestUserId, guest.address, guest.city, guest.country || 'Philippines', guest.postal]
+          );
+          customerId = customerResult.insertId;
+        }
+        console.log(`✅ Found existing user_id ${guestUserId}, customer_id ${customerId}`);
       } else {
-        // Create new guest customer (no user_id)
+        // Truly anonymous guest — create a minimal user row first, then a customer row
+        const [newUser] = await connection.query(
+          `INSERT INTO user (first_name, last_name, email, phone, password, role)
+           VALUES (?, ?, ?, ?, 'GUEST_NO_PASSWORD', 'customer')`,
+          [guest.firstName, guest.lastName, guest.email, guest.phone]
+        );
+        const newUserId = newUser.insertId;
         const [customerResult] = await connection.query(
-          `INSERT INTO customers (first_name, last_name, email, phone, address, city, country, postal_code)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [guest.firstName, guest.lastName, guest.email, guest.phone, guest.address, guest.city, guest.country || 'Philippines', guest.postal]
+          `INSERT INTO customers (user_id, address, city, country, postal_code)
+           VALUES (?, ?, ?, ?, ?)`,
+          [newUserId, guest.address, guest.city, guest.country || 'Philippines', guest.postal]
         );
         customerId = customerResult.insertId;
-        console.log(`✅ Created new guest customer_id ${customerId} (no user account)`);
+        console.log(`✅ Created guest user_id ${newUserId}, customer_id ${customerId}`);
       }
     }
 

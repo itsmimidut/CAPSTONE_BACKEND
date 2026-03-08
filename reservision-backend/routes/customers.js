@@ -1,11 +1,14 @@
 import express from 'express';
 const router = express.Router();
-import { checkEmailExists, getCustomerProfile, updateCustomerProfile, customerSignup, customerLogin, getCustomerIdByUserId } from '../controllers/customerController.js';
+import { checkEmailExists, getCustomerProfile, updateCustomerProfile, customerSignup, customerLogin, customerGoogleLogin, getCustomerIdByUserId } from '../controllers/customerController.js';
 // Customer signup
 router.post('/signup', customerSignup);
 
 // Customer login
 router.post('/login', customerLogin);
+
+// Customer Google login
+router.post('/google-login', customerGoogleLogin);
 
 /**
  * ============================================================

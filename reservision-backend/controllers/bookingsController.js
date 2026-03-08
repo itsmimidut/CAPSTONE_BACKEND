@@ -917,40 +917,42 @@ export const getCustomerBookingHistory = async (req, res) => {
 };
 
 /**
- * GET /api/bookings/email/:email/history
- * Get all bookings for a specific email address
- * Used when booking by email instead of customer_id
+ * GET /api/bookings/user/:userId/history
+ * Get all bookings for a logged-in customer by their user_id.
+ * Most reliable method — no email lookup needed.
  */
-export const getBookingHistoryByEmail = async (req, res) => {
+export const getBookingHistoryByUserId = async (req, res) => {
   try {
-    const { email } = req.params;
-    const { status, limit = 20, page = 1 } = req.query;
+    const { userId } = req.params;
+    const { status, limit = 50, page = 1 } = req.query;
 
-    if (!email) {
-      return res.status(400).json({
-        success: false,
-        error: 'Email is required'
-      });
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'User ID is required' });
     }
 
-    // Get customer info by email
-    const [customers] = await db.query(
-      'SELECT customer_id, first_name, last_name, email, phone FROM customers WHERE email = ? LIMIT 1',
-      [email]
+    // Get customer_id from customers table via user_id
+    const [customerRows] = await db.query(
+      `SELECT c.customer_id, u.first_name, u.last_name, u.email, u.phone
+       FROM user u
+       JOIN customers c ON c.user_id = u.user_id
+       WHERE u.user_id = ?
+       LIMIT 1`,
+      [userId]
     );
 
-    if (customers.length === 0) {
+    if (customerRows.length === 0) {
       return res.status(404).json({
         success: false,
-        error: 'No customer found with this email'
+        error: 'No customer profile found for this user'
       });
     }
 
-    const customerInfo = customers[0];
+    const customerInfo = customerRows[0];
+    const customerId = customerInfo.customer_id;
 
-    // Build query for bookings
+    // Build bookings query
     let query = `
-      SELECT 
+      SELECT
         b.booking_id,
         b.booking_reference,
         b.check_in_date,
@@ -968,8 +970,154 @@ export const getBookingHistoryByEmail = async (req, res) => {
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       WHERE b.customer_id = ?
     `;
+    const params = [customerId];
 
-    const params = [customerInfo.customer_id];
+    if (status && status !== 'all') {
+      query += ` AND b.booking_status = ?`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY b.created_at DESC`;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query += ` LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), offset);
+
+    const [bookings] = await db.query(query, params);
+
+    const bookingsWithDetails = await Promise.all(
+      bookings.map(async (booking) => {
+        const [items] = await db.query(
+          'SELECT * FROM booking_items WHERE booking_id = ?',
+          [booking.booking_id]
+        );
+        return {
+          ...booking,
+          items: items.map(item => ({
+            item_name: item.item_name,
+            quantity: item.quantity,
+            item_type: item.item_type,
+            unit_price: item.unit_price,
+            total_price: item.total_price
+          })),
+          qrCode: { reference: booking.booking_reference }
+        };
+      })
+    );
+
+    let countQuery = `SELECT COUNT(*) as total FROM bookings WHERE customer_id = ?`;
+    const countParams = [customerId];
+    if (status && status !== 'all') {
+      countQuery += ` AND booking_status = ?`;
+      countParams.push(status);
+    }
+    const [countResult] = await db.query(countQuery, countParams);
+    const totalCount = countResult[0].total;
+
+    res.json({
+      success: true,
+      data: {
+        customer: {
+          customer_id: customerId,
+          name: `${customerInfo.first_name} ${customerInfo.last_name}`,
+          email: customerInfo.email,
+          phone: customerInfo.phone
+        },
+        bookings: bookingsWithDetails,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(totalCount / parseInt(limit)),
+          totalCount,
+          limit: parseInt(limit)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching booking history by userId:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch booking history',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/email/:email/history
+ * Get all bookings for a specific email address
+ * Used when booking by email instead of customer_id
+ */
+export const getBookingHistoryByEmail = async (req, res) => {
+  try {
+    const { email } = req.params;
+    const { status, limit = 20, page = 1 } = req.query;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is required'
+      });
+    }
+
+    // Two kinds of customer records exist in the DB:
+    //   NEW: customer row has user_id set; name/email/phone live in `user` table
+    //   OLD: customer row has user_id=NULL; name/email/phone stored directly in `customers`
+    // We need to find customer_ids from BOTH so no bookings are missed.
+
+    // --- NEW style: email in user table, linked via user_id ---
+    const [newStyleRows] = await db.query(
+      `SELECT c.customer_id, u.first_name, u.last_name, u.email, u.phone
+       FROM user u
+       JOIN customers c ON c.user_id = u.user_id
+       WHERE u.email = ?`,
+      [email]
+    );
+
+    // --- OLD style: email stored directly in customers (user_id IS NULL) ---
+    const [oldStyleRows] = await db.query(
+      `SELECT c.customer_id, c.first_name, c.last_name, c.email, c.phone
+       FROM customers c
+       WHERE c.email = ? AND c.user_id IS NULL`,
+      [email]
+    );
+
+    const allRows = [...newStyleRows, ...oldStyleRows];
+
+    if (allRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No customer found with this email'
+      });
+    }
+
+    // Use the first row for customer info display; collect all customer_ids for booking lookup
+    const customerInfo = allRows[0];
+    const customerIds = [...new Set(allRows.map(r => r.customer_id))];
+
+    // Build IN clause — handles both old-style (email in customers) and
+    // new-style (email in user, linked via user_id) records
+    const placeholders = customerIds.map(() => '?').join(', ');
+    let query = `
+      SELECT 
+        b.booking_id,
+        b.booking_reference,
+        b.check_in_date,
+        b.check_out_date,
+        b.adults,
+        b.children,
+        b.total,
+        b.booking_status,
+        b.created_at,
+        p.payment_reference,
+        p.payment_method,
+        p.status as payment_status,
+        p.paid_at
+      FROM bookings b
+      LEFT JOIN payments p ON b.booking_id = p.booking_id
+      WHERE b.customer_id IN (${placeholders})
+    `;
+    const params = [...customerIds];
 
     // Optional status filter
     if (status && status !== 'all') {
@@ -1012,12 +1160,13 @@ export const getBookingHistoryByEmail = async (req, res) => {
     );
 
     // Get total count for pagination
+    const countPlaceholders = customerIds.map(() => '?').join(', ');
     let countQuery = `
       SELECT COUNT(*) as total 
       FROM bookings 
-      WHERE customer_id = ?
+      WHERE customer_id IN (${countPlaceholders})
     `;
-    const countParams = [customerInfo.customer_id];
+    const countParams = [...customerIds];
 
     if (status && status !== 'all') {
       countQuery += ` AND booking_status = ?`;
@@ -1253,9 +1402,9 @@ export const validateBookingForCheckIn = async (req, res) => {
       `SELECT 
         b.booking_id as id,
         b.booking_reference,
-        b.guest_name,
-        b.booking_email,
-        b.guest_phone,
+        b.first_name,
+        b.email,
+        b.phone,
         b.check_in_date,
         b.check_out_date,
         b.booking_status,
@@ -1263,7 +1412,7 @@ export const validateBookingForCheckIn = async (req, res) => {
         GROUP_CONCAT(
           JSON_OBJECT(
             'item_id', bi.inventory_item_id,
-            'item_name', ii.item_name,
+            'item_name', ii.name,
             'qty', bi.quantity
           )
         ) as items_list

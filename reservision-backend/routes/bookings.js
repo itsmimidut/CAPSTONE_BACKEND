@@ -25,6 +25,7 @@ import {
   getBookingByReference,
   getCustomerBookingHistory,
   getBookingHistoryByEmail,
+  getBookingHistoryByUserId,
   getBookingQRCode,
   createBooking,
   updateBooking,
@@ -49,7 +50,10 @@ router.get("/admin/reservations", getAdminReservations);
 // Customer booking history by customer ID
 router.get("/customer/:customerId/history", getCustomerBookingHistory);
 
-// Customer booking history by email
+// Customer booking history by user_id (most reliable — uses logged-in user's ID)
+router.get("/user/:userId/history", getBookingHistoryByUserId);
+
+// Customer booking history by email (fallback)
 router.get("/email/:email/history", getBookingHistoryByEmail);
 
 // Get all bookings
