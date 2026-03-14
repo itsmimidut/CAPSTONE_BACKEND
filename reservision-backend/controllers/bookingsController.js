@@ -259,6 +259,11 @@ export const createBooking = async (req, res) => {
 
       for (const item of items) {
         if (item.item && item.item.perNight && item.item.item_id) {
+          const requestedQty = Number(item.qty || 1)
+          if (requestedQty > 1) {
+            throw new Error(`Quantity greater than 1 is not allowed for room/cottage inventory item "${item.item.name || item.item.item_id}".`)
+          }
+
           // Query occupied_dates for any date in [checkIn, checkOut) for this inventory item
           const [rows] = await connection.query(
             `SELECT COUNT(*) as cnt FROM occupied_dates
@@ -362,7 +367,7 @@ export const createBooking = async (req, res) => {
         const end = new Date(checkOut);
 
         // Generate occupied dates for each day
-        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
           await connection.query(
             `INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date)
              VALUES (?, ?, ?)`,
@@ -1278,7 +1283,7 @@ export const getOccupiedDates = async (req, res) => {
        INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
        WHERE bi.inventory_item_id = ?
        AND b.booking_status IN ('Confirmed', 'Pending')
-       AND b.payment_status IN ('Paid', 'pending')
+      AND b.payment_status IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
        AND b.check_in_date IS NOT NULL
        AND b.check_out_date IS NOT NULL
        ORDER BY b.check_in_date ASC`,
@@ -1293,8 +1298,11 @@ export const getOccupiedDates = async (req, res) => {
 
       // Create entry for each date from check-in (exclusive of check-out)
       for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
+        const year = d.getFullYear()
+        const month = String(d.getMonth() + 1).padStart(2, '0')
+        const day = String(d.getDate()).padStart(2, '0')
         occupiedDates.push({
-          date: d.toISOString().split('T')[0],
+          date: `${year}-${month}-${day}`,
           bookingReference: booking.booking_reference,
           inventoryItemId: itemId,
           status: booking.payment_status === 'Paid' ? 'confirmed' : 'pending'
@@ -1341,7 +1349,7 @@ export const getAllOccupiedDates = async (req, res) => {
        FROM bookings b
        INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
        WHERE b.booking_status IN ('Confirmed', 'Pending')
-       AND b.payment_status IN ('Paid', 'pending')
+      AND b.payment_status IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
        AND b.check_in_date IS NOT NULL
        AND b.check_out_date IS NOT NULL
        ORDER BY b.check_in_date ASC`
@@ -1354,8 +1362,11 @@ export const getAllOccupiedDates = async (req, res) => {
       const end = new Date(booking.check_out_date);
 
       for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
+        const year = d.getFullYear()
+        const month = String(d.getMonth() + 1).padStart(2, '0')
+        const day = String(d.getDate()).padStart(2, '0')
         occupiedDates.push({
-          date: d.toISOString().split('T')[0],
+          date: `${year}-${month}-${day}`,
           bookingReference: booking.booking_reference,
           inventoryItemId: booking.inventory_item_id,
           status: booking.payment_status === 'Paid' ? 'confirmed' : 'pending'
@@ -1403,19 +1414,20 @@ export const validateBookingForCheckIn = async (req, res) => {
         b.booking_id as id,
         b.booking_reference,
         b.first_name,
+        b.last_name,
         b.email,
         b.phone,
         b.check_in_date,
         b.check_out_date,
         b.booking_status,
         b.payment_status,
-        GROUP_CONCAT(
+        CONCAT('[', GROUP_CONCAT(
           JSON_OBJECT(
             'item_id', bi.inventory_item_id,
             'item_name', ii.name,
             'qty', bi.quantity
           )
-        ) as items_list
+        ), ']') as items_list
        FROM bookings b
        LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id
        LEFT JOIN inventory_items ii ON bi.inventory_item_id = ii.item_id
@@ -1437,7 +1449,7 @@ export const validateBookingForCheckIn = async (req, res) => {
     let itemsList = [];
     if (booking.items_list) {
       try {
-        itemsList = booking.items_list.split(',').map(item => JSON.parse(item));
+        itemsList = JSON.parse(booking.items_list);
       } catch (e) {
         itemsList = [];
       }
