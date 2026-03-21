@@ -37,8 +37,13 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import path from "path";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ============================================================
 // ROUTE IMPORTS
@@ -65,6 +70,8 @@ import otpRoutes from "./routes/otp.js";
 import customersRoutes from "./routes/customers.js";
 import userManagementRoutes from "./routes/userManagement.js";
 import analyticsRoutes from "./routes/analytics.js";
+import notificationsRoutes from "./routes/notifications.js";
+import websiteConfigRoutes from "./routes/websiteConfig.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -91,7 +98,10 @@ app.use(cors());
  * - Applies to both JSON and URL-encoded data
  */
 app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Serve uploaded images as static files
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 // ============================================================
 // API ROUTES MOUNTING
@@ -160,6 +170,12 @@ app.use("/api/analytics", analyticsRoutes);
 
 // User Management (Admin)
 app.use("/api/users", userManagementRoutes);
+
+// Notification Counts
+app.use("/api/notifications", notificationsRoutes);
+
+// Website Content Configuration
+app.use('/api/website-config', websiteConfigRoutes);
 
 // ============================================================
 // ROOT ROUTE - API INFO

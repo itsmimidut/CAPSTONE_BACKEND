@@ -20,17 +20,77 @@
 
 import { db } from '../config/db.js';
 
+const parseJsonArray = (value) => {
+    if (Array.isArray(value)) return value;
+    if (value === null || value === undefined || value === '') return [];
+    if (typeof value === 'string') {
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
+};
+
+const normalizeSizeOption = (size, index) => {
+    const rawLabel = size?.label ?? size?.name ?? size?.size ?? `Option ${index + 1}`;
+    const rawDelta = size?.priceDelta ?? size?.price ?? size?.additionalPrice ?? 0;
+    return {
+        id: String(size?.id ?? rawLabel ?? `size-${index + 1}`)
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '-'),
+        label: String(rawLabel || `Option ${index + 1}`).trim(),
+        priceDelta: Number(rawDelta || 0)
+    };
+};
+
+const normalizeAddOnOption = (addon, index) => {
+    const rawName = addon?.name ?? addon?.label ?? addon?.title ?? `Add-on ${index + 1}`;
+    const rawPrice = addon?.price ?? addon?.amount ?? addon?.additionalPrice ?? 0;
+    return {
+        id: String(addon?.id ?? rawName ?? `addon-${index + 1}`)
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '-'),
+        name: String(rawName || `Add-on ${index + 1}`).trim(),
+        price: Number(rawPrice || 0)
+    };
+};
+
 const mapRestaurantItems = (rows) => rows.map(item => ({
     category: 'restaurant',
     name: item.name,
     price: parseFloat(item.price),
     description: item.description || 'Uncategorized',
+    sizes: parseJsonArray(item.sizes).map((size, index) => normalizeSizeOption(size, index)),
+    addons: parseJsonArray(item.addons).map((addon, index) => normalizeAddOnOption(addon, index)),
     available: 1
 }));
 
 const fetchRestaurantItems = async () => {
+    const [columnRows] = await db.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'menu_items'
+           AND COLUMN_NAME IN ('sizes', 'addons')`
+    );
+
+    const columnSet = new Set(columnRows.map(row => row.COLUMN_NAME));
+    const selectColumns = [
+        'name',
+        'price',
+        "COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description"
+    ];
+
+    if (columnSet.has('sizes')) selectColumns.push('sizes');
+    if (columnSet.has('addons')) selectColumns.push('addons');
+
     const [menuItems] = await db.query(
-        `SELECT name, price, COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description
+        `SELECT ${selectColumns.join(', ')}
          FROM menu_items
          WHERE available = 1
          ORDER BY name`
@@ -133,14 +193,24 @@ export const createTransaction = async (req, res) => {
             receipt_no,
             payment_method,
             total_amount,
+            cash_received,
+            cashReceived,
+            paid_amount,
+            paidAmount,
+            change_amount,
+            changeAmount,
             transaction_date,
             transaction_time
         } = req.body;
 
         const normalizedReceiptNo = receiptNo ?? receipt_no;
         const normalizedItems = items;
+        const normalizedType = type ?? 'Walk-in';
         const normalizedPayment = payment ?? payment_method;
         const normalizedTotal = total ?? total_amount;
+        const normalizedPaidAmount =
+            cash_received ?? cashReceived ?? paid_amount ?? paidAmount ?? normalizedTotal;
+        const normalizedChangeAmount = change_amount ?? changeAmount ?? 0;
         const normalizedDate = date ?? transaction_date;
         const normalizedTime = time ?? transaction_time;
 
@@ -199,19 +269,77 @@ export const createTransaction = async (req, res) => {
         // Convert items array to JSON string for storage
         const itemsJson = JSON.stringify(normalizedItems);
 
-        const [result] = await connection.query(
-            `INSERT INTO pos_transactions 
-            (receipt_no, items, payment_method, total_amount, transaction_date, transaction_time) 
-            VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-                normalizedReceiptNo,
-                itemsJson,
-                normalizedPayment,
-                normalizedTotal,
-                normalizedDate,
-                normalizedTime
-            ]
+        const [columnRows] = await connection.query(
+            `SELECT COLUMN_NAME
+             FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pos_transactions'`
         );
+        const columnSet = new Set(columnRows.map(row => row.COLUMN_NAME));
+
+        const insertColumns = [
+            'receipt_no',
+            'items',
+            'payment_method',
+            'total_amount',
+            'transaction_date',
+            'transaction_time'
+        ];
+        const insertValues = [
+            normalizedReceiptNo,
+            itemsJson,
+            normalizedPayment,
+            normalizedTotal,
+            normalizedDate,
+            normalizedTime
+        ];
+
+        if (columnSet.has('type')) {
+            insertColumns.push('type');
+            insertValues.push(normalizedType);
+        }
+        if (columnSet.has('cash_received')) {
+            insertColumns.push('cash_received');
+            insertValues.push(normalizedPaidAmount);
+        }
+        if (columnSet.has('change_amount')) {
+            insertColumns.push('change_amount');
+            insertValues.push(normalizedChangeAmount);
+        }
+
+        const placeholders = insertColumns.map(() => '?').join(', ');
+        const [result] = await connection.query(
+            `INSERT INTO pos_transactions (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+            insertValues
+        );
+
+        const [detailTableRows] = await connection.query(
+            `SELECT COUNT(*) AS total
+             FROM INFORMATION_SCHEMA.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pos_transaction_items'`
+        );
+
+        if (detailTableRows[0]?.total > 0) {
+            for (const item of normalizedItems) {
+                const quantity = Number(item.quantity ?? item.qty ?? 1);
+                const lineTotal = Number(item.price ?? 0);
+                const unitPrice = Number(item.unitPrice ?? (quantity > 0 ? lineTotal / quantity : lineTotal));
+
+                await connection.query(
+                    `INSERT INTO pos_transaction_items
+                    (transaction_id, receipt_no, item_name, quantity, unit_price, line_total, booking_reference)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        result.insertId,
+                        normalizedReceiptNo,
+                        item.name ?? null,
+                        quantity,
+                        unitPrice,
+                        lineTotal,
+                        item.bookingReference ?? null
+                    ]
+                );
+            }
+        }
 
         // Commit the transaction
         await connection.commit();

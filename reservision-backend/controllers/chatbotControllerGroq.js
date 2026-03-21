@@ -21,22 +21,15 @@ async function getResortContext() {
     const [rooms] = await db.query(
       'SELECT item_id, category, category_type, room_number, name, description, max_guests, price, status FROM inventory_items WHERE category = "Room" ORDER BY price ASC'
     );
-    
+
     const [cottages] = await db.query(
       'SELECT item_id, category, category_type, room_number, name, description, max_guests, price, status FROM inventory_items WHERE category = "Cottage" ORDER BY price ASC'
     );
-    
-    const [promos] = await db.query(
-      'SELECT code, type, value, description, startDate, endDate FROM promos WHERE endDate >= CURDATE() ORDER BY value DESC'
-    );
-    
-    const [entranceRates] = await db.query('SELECT label, value FROM rate_entries WHERE category = "entrance"');
-    const [cottageRates] = await db.query('SELECT label, value FROM rate_entries WHERE category = "cottages"');
-    const [packageRates] = await db.query('SELECT label, value FROM rate_entries WHERE category = "packages"');
+
     const [menu] = await db.query('SELECT name, price, category, available, description FROM menu_items WHERE available = TRUE ORDER BY category, name');
     const [coaches] = await db.query('SELECT name, specialization, experience_years, certification, availability FROM swimming_coaches WHERE status = "Active"');
-    
-    return { rooms, cottages, promos, rates: { entrance: entranceRates, cottages: cottageRates, packages: packageRates }, menu, coaches };
+
+    return { rooms, cottages, menu, coaches };
   } catch (error) {
     console.error('Error fetching resort context:', error);
     return null;
@@ -47,24 +40,24 @@ async function getResortContext() {
 export const chatWithGroq = async (req, res) => {
   try {
     const { message, conversationHistory = [] } = req.body;
-    
+
     if (!message || !message.trim()) {
       return res.status(400).json({ error: 'Message is required' });
     }
 
     if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'Groq API key not configured. Please add GROQ_API_KEY to your .env file',
         setup: 'Get your free API key at https://console.groq.com/keys'
       });
     }
-    
+
     const resortData = await getResortContext();
-    
+
     if (!resortData) {
       return res.status(500).json({ error: 'Failed to fetch resort data' });
     }
-    
+
     const systemPrompt = `You are Eduardo's Resort AI assistant. You MUST answer using ONLY real data provided below.
 
 🏨 AVAILABLE ROOMS:
@@ -73,19 +66,7 @@ ${JSON.stringify(resortData.rooms.filter(r => r.status === 'Available'), null, 2
 🏡 AVAILABLE COTTAGES:
 ${JSON.stringify(resortData.cottages.filter(c => c.status === 'Available'), null, 2)}
 
-🎉 ACTIVE PROMOTIONS:
-${JSON.stringify(resortData.promos, null, 2)}
-
-💰 ENTRANCE RATES:
-${JSON.stringify(resortData.rates.entrance, null, 2)}
-
-🏡 COTTAGE RATES:
-${JSON.stringify(resortData.rates.cottages, null, 2)}
-
-📦 PACKAGE RATES:
-${JSON.stringify(resortData.rates.packages, null, 2)}
-
-🍽️ RESTAURANT MENU:
+️ RESTAURANT MENU:
 ${JSON.stringify(resortData.menu, null, 2)}
 
 🏊 SWIMMING COACHES:
@@ -98,7 +79,7 @@ RESPONSE FORMATTING RULES:
 4. Structure responses with clear sections when listing multiple items
 5. Keep responses conversational in Taglish (mix of Tagalog and English)
 6. When showing multiple options, use bullet points or numbered lists
-7. Highlight important info like promo codes, discounts, room numbers
+7. Highlight important info like room numbers
 8. End with a helpful question or call-to-action when appropriate
 
 FORMATTING EXAMPLES:
@@ -116,20 +97,7 @@ For Room Queries:
 • Price: ₱2,500.00/night
 • Features: [description]
 
-May promo din kami ngayon! Use code SUMMER15 for 15% off. Interested ka ba?"
-
-For Promo Queries:
-"Yes, may active promos kami! 🎉
-
-💝 SUMMER15 - 15% discount
-Valid until: [date]
-Perfect for summer bookings!
-
-💝 STAYCATION - ₱500 off
-Valid until: [date]
-Great for overnight stays!
-
-Gusto mo bang mag-book?"
+Interested ka ba?"
 
 For Menu Queries:
 "Here's our menu! 🍽️
@@ -187,7 +155,7 @@ IMPORTANT:
 
   } catch (error) {
     console.error('Groq API Error:', error);
-    
+
     let errorMessage = 'Failed to process chat request';
     let statusCode = 500;
 
@@ -199,9 +167,9 @@ IMPORTANT:
       statusCode = 429;
     }
 
-    res.status(statusCode).json({ 
+    res.status(statusCode).json({
       error: errorMessage,
-      details: error.message 
+      details: error.message
     });
   }
 };
@@ -210,12 +178,12 @@ IMPORTANT:
 export const testGroq = async (req, res) => {
   try {
     if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'Groq API key not configured',
         setup: 'Get your free API key at https://console.groq.com/keys'
       });
     }
-const groqClient = getGroqClient();
+    const groqClient = getGroqClient();
     const completion = await groqClient.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       messages: [
@@ -233,9 +201,9 @@ const groqClient = getGroqClient();
     });
   } catch (error) {
     console.error('Groq Test Error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Groq API test failed',
-      details: error.message 
+      details: error.message
     });
   }
 };

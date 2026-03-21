@@ -25,8 +25,9 @@ const PRINT_QUEUE_DIR = path.join(__dirname, "print-queue");
 const PRINTED_DIR = path.join(__dirname, "printed");
 const FAILED_DIR = path.join(__dirname, "failed");
 const LOG_FILE = path.join(__dirname, "printer-service.log");
+const PROCESSING_SUFFIX = ".processing";
 
-const CHECK_INTERVAL_MS = 1000;
+const CHECK_INTERVAL_MS = Number(process.env.PRINT_CHECK_INTERVAL_MS || 400);
 
 // Windows printer name (Printers & scanners)
 const PRINTER_NAME = process.env.PRINTER_NAME || "POS-582";
@@ -39,8 +40,9 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1200;
 
 // File stability: how many times size must remain unchanged
-const STABLE_CHECKS = 3;
-const STABLE_INTERVAL_MS = 250;
+const STABLE_CHECKS = Number(process.env.PRINT_STABLE_CHECKS || 1);
+const STABLE_INTERVAL_MS = Number(process.env.PRINT_STABLE_INTERVAL_MS || 120);
+const STABLE_MAX_TRIES = Number(process.env.PRINT_STABLE_MAX_TRIES || 20);
 
 // ========= LOGGING =========
 function log(level, msg) {
@@ -62,8 +64,20 @@ function ensureDirs() {
 
 function isAllowedFile(filename) {
   if (!filename || filename.startsWith(".")) return false;
+  if (filename.endsWith(PROCESSING_SUFFIX)) return false;
   const ext = path.extname(filename).toLowerCase();
   return ALLOWED_EXT.has(ext);
+}
+
+function reserveJobFile(filePath) {
+  const lockedPath = `${filePath}${PROCESSING_SUFFIX}`;
+  try {
+    fs.renameSync(filePath, lockedPath);
+    return lockedPath;
+  } catch (e) {
+    if (e?.code === "ENOENT") return null;
+    throw e;
+  }
 }
 
 function safeMove(src, destDir) {
@@ -89,7 +103,7 @@ async function waitForFileStable(filePath) {
   let lastSize = -1;
   let stableCount = 0;
 
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < STABLE_MAX_TRIES; i++) {
     try {
       const st = fs.statSync(filePath);
       const size = st.size;
@@ -100,7 +114,7 @@ async function waitForFileStable(filePath) {
       lastSize = size;
 
       if (stableCount >= STABLE_CHECKS) return true;
-    } catch {}
+    } catch { }
     await new Promise((r) => setTimeout(r, STABLE_INTERVAL_MS));
   }
 
@@ -151,16 +165,16 @@ function printTextViaOutPrinter(filePath) {
  * RAW printing using Win32 WritePrinter (for .prn/.raw/.bin)
  * Sends bytes exactly as-is (ESC/POS safe).
  */
-function printRawViaWritePrinter(buffer, jobName = "RAW Job") {
+function printRawViaWritePrinter(filePath, jobName = "RAW Job") {
   return new Promise((resolve, reject) => {
-    const b64 = buffer.toString("base64");
     const psPrinter = PRINTER_NAME.replace(/"/g, '""');
     const psJob = String(jobName).replace(/"/g, '""');
+    const psFilePath = String(filePath).replace(/'/g, "''");
 
     const script = `
 $printer = "${psPrinter}"
 $jobName = "${psJob}"
-$b64 = "${b64}"
+$filePath = '${psFilePath}'
 
 Add-Type -TypeDefinition @"
 using System;
@@ -220,7 +234,7 @@ public class RawPrinterHelper {
 }
 "@
 
-$bytes = [Convert]::FromBase64String($b64)
+$bytes = [System.IO.File]::ReadAllBytes($filePath)
 $ok = [RawPrinterHelper]::SendBytesToPrinter($printer, $bytes, $jobName)
 
 if ($ok) { exit 0 } else { exit 1 }
@@ -254,20 +268,30 @@ async function processJob(filePath) {
 
   log("INFO", `Job detected: ${filename}`);
 
-  const stable = await waitForFileStable(filePath);
+  const lockedPath = reserveJobFile(filePath);
+  if (!lockedPath) {
+    log("WARN", `Job already processed by another worker: ${filename}`);
+    return false;
+  }
+
+  const stable = await waitForFileStable(lockedPath);
   if (!stable) {
     log("WARN", `File not stable/locked too long: ${filename} -> moving to failed`);
-    const moved = safeMove(filePath, FAILED_DIR);
-    log("ERROR", `Moved to failed: ${moved}`);
+    if (fs.existsSync(lockedPath)) {
+      const moved = safeMove(lockedPath, FAILED_DIR);
+      log("ERROR", `Moved to failed: ${moved}`);
+    }
     return false;
   }
 
   try {
-    const st = fs.statSync(filePath);
+    const st = fs.statSync(lockedPath);
     if (st.size <= 0) {
       log("ERROR", `Empty file: ${filename} -> moving to failed`);
-      const moved = safeMove(filePath, FAILED_DIR);
-      log("ERROR", `Moved to failed: ${moved}`);
+      if (fs.existsSync(lockedPath)) {
+        const moved = safeMove(lockedPath, FAILED_DIR);
+        log("ERROR", `Moved to failed: ${moved}`);
+      }
       return false;
     }
   } catch (e) {
@@ -280,14 +304,13 @@ async function processJob(filePath) {
       log("INFO", `Printing (${attempt}/${MAX_RETRIES}) -> ${filename} to "${PRINTER_NAME}"`);
 
       if (ext === ".txt") {
-        await printTextViaOutPrinter(filePath);
+        await printTextViaOutPrinter(lockedPath);
       } else {
         // RAW file types
-        const buffer = fs.readFileSync(filePath);
-        await printRawViaWritePrinter(buffer, filename);
+        await printRawViaWritePrinter(lockedPath, filename);
       }
 
-      const moved = safeMove(filePath, PRINTED_DIR);
+      const moved = safeMove(lockedPath, PRINTED_DIR);
       log("SUCCESS", `Printed OK: ${filename} -> ${moved}`);
       return true;
     } catch (err) {
@@ -296,8 +319,12 @@ async function processJob(filePath) {
     }
   }
 
-  const moved = safeMove(filePath, FAILED_DIR);
-  log("ERROR", `All retries failed. Moved to failed: ${moved}`);
+  if (fs.existsSync(lockedPath)) {
+    const moved = safeMove(lockedPath, FAILED_DIR);
+    log("ERROR", `All retries failed. Moved to failed: ${moved}`);
+  } else {
+    log("WARN", `All retries failed and file already missing: ${filename}`);
+  }
   return false;
 }
 

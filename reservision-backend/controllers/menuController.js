@@ -30,6 +30,36 @@
 
 import { db } from '../config/db.js';
 
+const parseJsonArray = (value) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+
+const stringifyJsonArray = (value) => JSON.stringify(Array.isArray(value) ? value : []);
+
+const hasMenuCustomizationColumns = async () => {
+    const [rows] = await db.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'menu_items'
+           AND COLUMN_NAME IN ('sizes', 'addons')`
+    );
+    const set = new Set(rows.map(r => r.COLUMN_NAME));
+    return set.has('sizes') && set.has('addons');
+};
+
+const mapMenuRow = (row) => ({
+    ...row,
+    sizes: parseJsonArray(row.sizes),
+    addons: parseJsonArray(row.addons),
+});
+
 // ============================================================
 // GET ALL MENU ITEMS
 // ============================================================
@@ -55,7 +85,7 @@ import { db } from '../config/db.js';
 export const getAllMenuItems = async (req, res) => {
     try {
         const [rows] = await db.query('SELECT * FROM menu_items ORDER BY category, name');
-        res.json(rows);
+        res.json(rows.map(mapMenuRow));
     } catch (error) {
         console.error('Error fetching menu items:', error);
         res.status(500).json({ error: 'Error fetching menu items' });
@@ -95,7 +125,7 @@ export const getMenuByCategory = async (req, res) => {
             'SELECT * FROM menu_items WHERE category = ? AND available = TRUE ORDER BY name',
             [category]
         );
-        res.json(rows);
+        res.json(rows.map(mapMenuRow));
     } catch (error) {
         console.error('Error fetching menu items by category:', error);
         res.status(500).json({ error: 'Error fetching menu items' });
@@ -133,7 +163,7 @@ export const getMenuItem = async (req, res) => {
             return res.status(404).json({ message: 'Menu item not found' });
         }
 
-        res.json(rows[0]);
+        res.json(mapMenuRow(rows[0]));
     } catch (error) {
         console.error('Error fetching menu item:', error);
         res.status(500).json({ error: 'Error fetching menu item' });
@@ -175,7 +205,7 @@ export const getMenuItem = async (req, res) => {
  */
 export const createMenuItem = async (req, res) => {
     try {
-        const { name, price, category, available = true, prep_time = 15, description = '', image_url = '' } = req.body;
+        const { name, price, category, available = true, prep_time = 15, description = '', image_url = '', sizes = [], addons = [] } = req.body;
 
         if (!name || !price || !category) {
             return res.status(400).json({ message: 'Name, price, and category are required' });
@@ -188,7 +218,7 @@ export const createMenuItem = async (req, res) => {
             WHERE TABLE_SCHEMA = DATABASE() 
             AND TABLE_NAME = 'menu_items'
         `);
-        
+
         if (tables[0] && tables[0].AUTO_INCREMENT <= 1) {
             // Get the max menu_id and reset auto_increment
             const [maxResult] = await db.query('SELECT MAX(menu_id) as max_id FROM menu_items');
@@ -196,10 +226,25 @@ export const createMenuItem = async (req, res) => {
             await db.query(`ALTER TABLE menu_items AUTO_INCREMENT = ${nextId}`);
         }
 
-        const [result] = await db.query(
-            'INSERT INTO menu_items (name, price, category, available, prep_time, description, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [name, price, category, available, prep_time, description, image_url]
-        );
+        const normalizedSizes = parseJsonArray(sizes);
+        const normalizedAddons = parseJsonArray(addons);
+        const resolvedPrice = normalizedSizes.length
+            ? Number(normalizedSizes[0].price || price || 0)
+            : Number(price || 0);
+        const supportsCustomization = await hasMenuCustomizationColumns();
+
+        let result;
+        if (supportsCustomization) {
+            [result] = await db.query(
+                'INSERT INTO menu_items (name, price, category, available, prep_time, description, image_url, sizes, addons) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [name, resolvedPrice, category, available, prep_time, description, image_url, stringifyJsonArray(normalizedSizes), stringifyJsonArray(normalizedAddons)]
+            );
+        } else {
+            [result] = await db.query(
+                'INSERT INTO menu_items (name, price, category, available, prep_time, description, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [name, resolvedPrice, category, available, prep_time, description, image_url]
+            );
+        }
 
         res.status(201).json({
             message: 'Menu item created successfully',
@@ -242,12 +287,26 @@ export const createMenuItem = async (req, res) => {
 export const updateMenuItem = async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, price, category, available, prep_time, description, image_url } = req.body;
+        const { name, price, category, available, prep_time, description, image_url, sizes = [], addons = [] } = req.body;
+        const normalizedSizes = parseJsonArray(sizes);
+        const normalizedAddons = parseJsonArray(addons);
+        const resolvedPrice = normalizedSizes.length
+            ? Number(normalizedSizes[0].price || price || 0)
+            : Number(price || 0);
+        const supportsCustomization = await hasMenuCustomizationColumns();
 
-        const [result] = await db.query(
-            'UPDATE menu_items SET name = ?, price = ?, category = ?, available = ?, prep_time = ?, description = ?, image_url = ? WHERE menu_id = ?',
-            [name, price, category, available, prep_time, description, image_url, id]
-        );
+        let result;
+        if (supportsCustomization) {
+            [result] = await db.query(
+                'UPDATE menu_items SET name = ?, price = ?, category = ?, available = ?, prep_time = ?, description = ?, image_url = ?, sizes = ?, addons = ? WHERE menu_id = ?',
+                [name, resolvedPrice, category, available, prep_time, description, image_url, stringifyJsonArray(normalizedSizes), stringifyJsonArray(normalizedAddons), id]
+            );
+        } else {
+            [result] = await db.query(
+                'UPDATE menu_items SET name = ?, price = ?, category = ?, available = ?, prep_time = ?, description = ?, image_url = ? WHERE menu_id = ?',
+                [name, resolvedPrice, category, available, prep_time, description, image_url, id]
+            );
+        }
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Menu item not found' });
