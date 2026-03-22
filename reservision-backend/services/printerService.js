@@ -141,6 +141,39 @@ function formatDate(date) {
   return p.length === 3 ? `${p[1]}/${p[2]}/${p[0]}` : d;
 }
 
+function wrapText(text, width = WIDTH) {
+  const input = String(text || "").trim();
+  if (!input) return [];
+  const words = input.split(/\s+/);
+  const lines = [];
+  let line = "";
+
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (candidate.length <= width) {
+      line = candidate;
+      continue;
+    }
+
+    if (line) lines.push(line);
+
+    if (word.length <= width) {
+      line = word;
+      continue;
+    }
+
+    let start = 0;
+    while (start < word.length) {
+      lines.push(word.slice(start, start + width));
+      start += width;
+    }
+    line = "";
+  }
+
+  if (line) lines.push(line);
+  return lines;
+}
+
 // ── Receipt builders ──────────────────────────────────────────────────────────
 function buildRegularESCPOS(receipt) {
   const r = new Receipt();
@@ -172,8 +205,33 @@ function buildRegularESCPOS(receipt) {
     const qty = Number(it.quantity || 1);
     const price = Number(it.price || 0);
     const total = Number(it.total ?? price * qty);
+    const customization = it.customization && typeof it.customization === "object"
+      ? it.customization
+      : null;
+
     r.left(String(it.name || "").slice(0, WIDTH));
     r.leftRight(`  ${qty} x ${money(price)}`, money(total));
+
+    if (customization?.sizeLabel) {
+      r.left(`  Size: ${String(customization.sizeLabel).slice(0, WIDTH - 8)}`);
+    }
+
+    const addOns = Array.isArray(customization?.addOns) ? customization.addOns : [];
+    if (addOns.length > 0) {
+      const addOnNames = addOns
+        .map(addOn => String(addOn?.name || "").trim())
+        .filter(Boolean)
+        .join(", ");
+      for (const line of wrapText(`  Add-ons: ${addOnNames}`, WIDTH)) {
+        r.left(line);
+      }
+    }
+
+    if (customization?.specialRequest) {
+      for (const line of wrapText(`  Note: ${String(customization.specialRequest)}`, WIDTH)) {
+        r.left(line);
+      }
+    }
   }
 
   if (receipt.bookingReference) {
