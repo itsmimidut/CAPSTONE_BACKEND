@@ -45,6 +45,55 @@ const generateBookingReference = async () => {
   return `BK${dateStr}${sequential}`;
 };
 
+// Simple in-memory cache for admin reservations list.
+// TTL is 60 seconds to reduce repeated DB reads while keeping data reasonably fresh.
+const RESERVATION_CACHE_TTL_MS = 60 * 1000;
+const reservationResponseCache = new Map();
+
+const buildReservationCacheKey = (query = {}) => {
+  const params = new URLSearchParams();
+
+  // Cache key includes page, limit, status, search, from, and to as required.
+  // Support both from/to and startDate/endDate to align frontend/backend param naming.
+  const from = query.from || query.startDate || '';
+  const to = query.to || query.endDate || '';
+
+  params.set('page', String(query.page ?? 1));
+  params.set('limit', String(query.limit ?? 15));
+  params.set('status', String(query.status ?? ''));
+  params.set('search', String(query.search ?? ''));
+  params.set('from', String(from));
+  params.set('to', String(to));
+
+  return `admin_reservations:${params.toString()}`;
+};
+
+const getCachedReservationResponse = (key) => {
+  const cached = reservationResponseCache.get(key);
+  if (!cached) {
+    return null; // Cache miss: no entry for this query key.
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    reservationResponseCache.delete(key); // TTL expired: remove stale entry.
+    return null;
+  }
+
+  return cached.payload; // Cache hit: return cached response payload.
+};
+
+const setCachedReservationResponse = (key, payload) => {
+  reservationResponseCache.set(key, {
+    payload,
+    expiresAt: Date.now() + RESERVATION_CACHE_TTL_MS // Cache set with 60-second TTL.
+  });
+};
+
+const invalidateReservationCache = () => {
+  // Invalidation: clear all reservation-related cache entries after any data mutation.
+  reservationResponseCache.clear();
+};
+
 /**
  * GET /api/bookings
  * Get all bookings with optional filters
@@ -137,7 +186,7 @@ export const getBooking = async (req, res) => {
         c.country,
         c.postal_code
       FROM bookings b
-      LEFT JOIN customers c ON b.customer_id = c.customer_id
+      LEFT JOIN user c ON b.customer_id = c.user_id
       WHERE b.booking_id = ?`,
       [id]
     );
@@ -399,6 +448,9 @@ export const createBooking = async (req, res) => {
 
     newBooking[0].items = bookingItems;
 
+    // Invalidate reservation cache after create so listing endpoints return fresh data.
+    invalidateReservationCache();
+
     res.status(201).json({
       success: true,
       message: 'Booking created successfully',
@@ -546,6 +598,9 @@ export const updateBooking = async (req, res) => {
       console.log('- New status:', updates.booking_status);
     }
 
+    // Invalidate reservation cache after confirm/cancel/update mutations.
+    invalidateReservationCache();
+
     res.json({
       success: true,
       message: 'Booking updated successfully',
@@ -608,6 +663,9 @@ export const deleteBooking = async (req, res) => {
 
     await connection.commit();
 
+    // Invalidate reservation cache after delete/cancel mutation.
+    invalidateReservationCache();
+
     res.json({
       success: true,
       message: 'Booking cancelled successfully'
@@ -644,6 +702,15 @@ export const getAdminReservations = async (req, res) => {
       limit = 15
     } = req.query;
 
+    const cacheKey = buildReservationCacheKey(req.query);
+    const cachedPayload = getCachedReservationResponse(cacheKey);
+
+    if (cachedPayload) {
+      // Cache hit: return cached response with unchanged structure.
+      return res.json(cachedPayload);
+    }
+    // Cache miss: continue to fetch from DB and cache the computed response.
+
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
     let query = `
@@ -660,10 +727,10 @@ export const getAdminReservations = async (req, res) => {
         b.total,
         b.created_at,
         c.customer_id,
-        c.first_name,
-        c.last_name,
-        c.email,
-        c.phone,
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) as first_name,
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) as last_name,
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) as email,
+        COALESCE(NULLIF(TRIM(c.phone), ''), NULLIF(TRIM(u.phone), ''), NULLIF(TRIM(b.phone), '')) as phone,
         p.payment_reference,
         p.amount as payment_amount,
         GROUP_CONCAT(DISTINCT bi.item_name ORDER BY bi.item_name SEPARATOR ', ') as items_summary,
@@ -671,6 +738,7 @@ export const getAdminReservations = async (req, res) => {
         COUNT(DISTINCT bi.item_id) as item_count
       FROM bookings b
       LEFT JOIN customers c ON b.customer_id = c.customer_id
+      LEFT JOIN user u ON c.user_id = u.user_id
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id
       WHERE 1=1
@@ -687,9 +755,9 @@ export const getAdminReservations = async (req, res) => {
     // Search by guest name or email
     if (search) {
       query += ` AND (
-        c.first_name LIKE ? OR 
-        c.last_name LIKE ? OR 
-        c.email LIKE ? OR
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) LIKE ? OR
         b.booking_reference LIKE ?
       )`;
       const searchPattern = `%${search}%`;
@@ -722,6 +790,7 @@ export const getAdminReservations = async (req, res) => {
       SELECT COUNT(DISTINCT b.booking_id) as total
       FROM bookings b
       LEFT JOIN customers c ON b.customer_id = c.customer_id
+      LEFT JOIN user u ON c.user_id = u.user_id
       WHERE 1=1
     `;
 
@@ -734,9 +803,9 @@ export const getAdminReservations = async (req, res) => {
 
     if (search) {
       countQuery += ` AND (
-        c.first_name LIKE ? OR 
-        c.last_name LIKE ? OR 
-        c.email LIKE ? OR
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) LIKE ? OR
         b.booking_reference LIKE ?
       )`;
       const searchPattern = `%${search}%`;
@@ -757,7 +826,7 @@ export const getAdminReservations = async (req, res) => {
     const totalCount = countResult[0].total;
     const totalPages = Math.ceil(totalCount / parseInt(limit));
 
-    res.json({
+    const responsePayload = {
       success: true,
       data: reservations,
       pagination: {
@@ -766,7 +835,12 @@ export const getAdminReservations = async (req, res) => {
         totalCount,
         limit: parseInt(limit)
       }
-    });
+    };
+
+    // Cache set: store successful response for 60 seconds.
+    setCachedReservationResponse(cacheKey, responsePayload);
+
+    res.json(responsePayload);
   } catch (error) {
     console.error('Error fetching admin reservations:', error);
     res.status(500).json({
