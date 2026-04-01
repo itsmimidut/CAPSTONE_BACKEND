@@ -57,6 +57,21 @@ const getJwtSecret = () => {
   return secret;
 };
 
+const AUTH_MIGRATION_FILE = 'ADD_AUTH_IMPROVEMENTS.sql';
+
+const isMissingAuthSchemaColumn = (error) => {
+  if (error?.code !== 'ER_BAD_FIELD_ERROR' && error?.code !== 'ER_NO_SUCH_TABLE') {
+    return false;
+  }
+  const sqlMessage = (error?.sqlMessage || '').toLowerCase();
+  return (
+    sqlMessage.includes('google_sub') ||
+    sqlMessage.includes('auth_provider') ||
+    sqlMessage.includes('last_login_at') ||
+    sqlMessage.includes("table 'eduardos.user' doesn't exist")
+  );
+};
+
 /**
  * Customer Signup
  * POST /api/customers/signup
@@ -170,6 +185,12 @@ export const customerSignup = async (req, res) => {
 
   } catch (error) {
     console.error('❌ Signup error:', error);
+    if (isMissingAuthSchemaColumn(error)) {
+      return res.status(503).json({
+        success: false,
+        error: `Database auth schema is outdated. Run ${AUTH_MIGRATION_FILE} and restart backend.`
+      });
+    }
     res.status(500).json({
       success: false,
       error: 'Failed to register customer. Please try again later.'
@@ -262,6 +283,12 @@ export const customerLogin = async (req, res) => {
 
   } catch (error) {
     console.error('❌ Login error:', error);
+    if (isMissingAuthSchemaColumn(error)) {
+      return res.status(503).json({
+        success: false,
+        error: `Database auth schema is outdated. Run ${AUTH_MIGRATION_FILE} and restart backend.`
+      });
+    }
     res.status(500).json({
       success: false,
       error: 'Failed to login. Please try again later.'
@@ -475,6 +502,12 @@ export const customerGoogleLogin = async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Google login error:', error);
+    if (isMissingAuthSchemaColumn(error)) {
+      return res.status(503).json({
+        success: false,
+        error: `Database auth schema is outdated. Run ${AUTH_MIGRATION_FILE} and restart backend.`
+      });
+    }
     res.status(500).json({
       success: false,
       error: 'Failed to login with Google. Please try again later.'

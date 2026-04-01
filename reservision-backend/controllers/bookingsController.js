@@ -1041,9 +1041,9 @@ export const getBookingHistoryByUserId = async (req, res) => {
         b.total,
         b.booking_status,
         b.created_at,
+        LOWER(COALESCE(b.payment_status, 'pending')) as payment_status,
         p.payment_reference,
         p.payment_method,
-        p.status as payment_status,
         p.paid_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
