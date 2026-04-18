@@ -70,6 +70,7 @@ export const getAllMenuWithIngredients = async (req, res) => {
             // Only add ingredient if it exists (not null from LEFT JOIN)
             if (row.inventory_id) {
                 menuMap[row.menu_id].ingredients.push({
+                    id: row.ingredient_link_id,
                     inventory_id: row.inventory_id,
                     item_name: row.item_name,
                     quantity_needed: row.quantity_needed,
@@ -155,6 +156,8 @@ export const updateMenuIngredient = async (req, res) => {
         const { id } = req.params;
         const { quantity_needed } = req.body;
 
+        console.log(`[UPDATE] ID: ${id}, Type: ${typeof id}, Quantity: ${quantity_needed}`);
+
         if (!quantity_needed) {
             return res.status(400).json({
                 success: false,
@@ -162,10 +165,16 @@ export const updateMenuIngredient = async (req, res) => {
             });
         }
 
+        // Check if record exists first
+        const [checkRow] = await db.query('SELECT id FROM menu_ingredients WHERE id = ?', [id]);
+        console.log(`[CHECK] Record exists:`, checkRow.length > 0, `Rows:`, checkRow);
+
         const [result] = await db.query(
             'UPDATE menu_ingredients SET quantity_needed = ? WHERE id = ?',
             [quantity_needed, id]
         );
+
+        console.log(`[UPDATE RESULT] Affected rows:`, result.affectedRows);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({
