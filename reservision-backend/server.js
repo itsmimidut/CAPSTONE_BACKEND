@@ -1,3 +1,4 @@
+import entranceRatesRoutes from "./routes/entranceRates.js";
 /**
  * ============================================================
  * Reservision Backend - Express Server
@@ -72,6 +73,7 @@ import userManagementRoutes from "./routes/userManagement.js";
 import analyticsRoutes from "./routes/analytics.js";
 import notificationsRoutes from "./routes/notifications.js";
 import websiteConfigRoutes from "./routes/websiteConfig.js";
+import webhooksRoutes from "./routes/webhooks.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -119,6 +121,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 // Rooms, Cottages, Events Management
 app.use("/api/rooms", roomsRoutes);
+app.use("/api/entrance-rates", entranceRatesRoutes);
 
 // Promotional Pricing Management
 app.use("/api/promos", promosRoutes);
@@ -176,6 +179,9 @@ app.use("/api/notifications", notificationsRoutes);
 
 // Website Content Configuration
 app.use('/api/website-config', websiteConfigRoutes);
+
+// PayMongo Webhooks
+app.use('/api/webhooks', webhooksRoutes);
 
 // ============================================================
 // ROOT ROUTE - API INFO

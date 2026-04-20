@@ -112,8 +112,8 @@ class Receipt {
       ._cmd(CMD.ALIGN_CENTER)
       // Select QR model 2
       ._raw([GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00])
-      // Set module size
-      ._raw([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x06])
+      // Set module size (0x08 = 8px per module - smaller for paper efficiency)
+      ._raw([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x08])
       // Set error correction level (M)
       ._raw([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31])
       // Store data in symbol storage area
@@ -248,6 +248,18 @@ function buildRegularESCPOS(receipt) {
   r.feed(1);
   r.leftRight("Paid", money(paidAmount));
   r.leftRight("Change", money(changeAmount));
+
+  // Add QR code for GCash payments
+  if (String(receipt.paymentMethod || "").toLowerCase() === "gcash" && receipt.paymentUrl) {
+    console.log(`🔳 Adding GCash QR code to POS receipt: ${receipt.paymentUrl.substring(0, 50)}...`);
+    r.feed(1);
+    r.center("Scan to pay");
+    r.qr(receipt.paymentUrl);
+    console.log(`✅ QR code added successfully`);
+  } else if (String(receipt.paymentMethod || "").toLowerCase() === "gcash") {
+    console.log(`⚠️ Payment method is GCash but no paymentUrl provided`);
+  }
+
   r.feed(1);
   r.bold(true).center("Thank you!").bold(false);
   r.feed(RECEIPT_BOTTOM_FEED_LINES);
@@ -306,11 +318,18 @@ function buildBookingESCPOS(receipt) {
   r.feed(1);
   r.leftRight("Paid", money(paidAmount));
   r.leftRight("Change", money(changeAmount));
+
+  // Add QR code for GCash payments
   if (String(receipt.paymentMethod || "").toLowerCase() === "gcash" && receipt.paymentUrl) {
+    console.log(`🔳 Adding GCash QR code to receipt: ${receipt.paymentUrl.substring(0, 50)}...`);
     r.feed(1);
     r.center("Scan to pay");
     r.qr(receipt.paymentUrl);
+    console.log(`✅ QR code added successfully`);
+  } else if (String(receipt.paymentMethod || "").toLowerCase() === "gcash") {
+    console.log(`⚠️ Payment method is GCash but no paymentUrl provided`);
   }
+
   r.feed(1);
   r.bold(true).center("Thank you!").bold(false);
   r.feed(RECEIPT_BOTTOM_FEED_LINES);

@@ -1,7 +1,17 @@
+// --- Centralized Image Management ---
+// List all images
 import express from 'express';
-import * as entranceRatesController from '../../controllers/entranceRatesController.js';
+import * as entranceRatesController from '../controllers/entranceRatesController.js';
 
 const router = express.Router();
+
+router.get('/images', entranceRatesController.getImages);
+// Upload new image
+router.post('/images', entranceRatesController.uploadImage);
+// Assign uploaded image to a rate
+router.post('/images/assign/:rateId', entranceRatesController.assignImageToRate);
+// Delete image by filename
+router.delete('/images/:filename', entranceRatesController.deleteImage);
 
 /**
  * GET /api/entrance-rates

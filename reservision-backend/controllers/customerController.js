@@ -574,10 +574,9 @@ export const getCustomerProfile = async (req, res) => {
       });
     }
 
-    // Get customer profile directly from user table
+    // Get customer profile from user table (basic info)
     const [users] = await db.query(
-      `SELECT user_id, first_name, last_name, email, phone,
-              address, city, country, postal_code, profile_image
+      `SELECT user_id, first_name, last_name, email, phone
        FROM user
        WHERE email = ?
        LIMIT 1`,
@@ -591,21 +590,46 @@ export const getCustomerProfile = async (req, res) => {
       });
     }
 
-    const customer = users[0];
+    const user = users[0];
+    console.log('👤 User found:', user.user_id, user.first_name, user.last_name);
+
+    // Try to get extended profile from customers table
+    let extendedProfile = {};
+    try {
+      const [customers] = await db.query(
+        `SELECT address, city, country, postal_code, profile_image
+         FROM user
+         WHERE user_id = ?
+         LIMIT 1`,
+        [user.user_id]
+      );
+
+      console.log('🔍 Customers query result:', customers.length, 'records found');
+      if (customers.length > 0) {
+        console.log('✅ Extended profile found:', customers[0]);
+        extendedProfile = {
+          address: customers[0].address,
+          city: customers[0].city,
+          country: customers[0].country,
+          postalCode: customers[0].postal_code,
+          profileImage: customers[0].profile_image
+        };
+      } else {
+        console.log('⚠️  No customer record found for user_id:', user.user_id);
+      }
+    } catch (e) {
+      console.warn('Could not fetch extended profile from customers table:', e.message);
+    }
 
     res.json({
       success: true,
       customer: {
-        id: customer.user_id,
-        firstName: customer.first_name,
-        lastName: customer.last_name,
-        email: customer.email,
-        phone: customer.phone,
-        address: customer.address,
-        city: customer.city,
-        country: customer.country,
-        postalCode: customer.postal_code,
-        profileImage: customer.profile_image
+        id: user.user_id,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        email: user.email,
+        phone: user.phone,
+        ...extendedProfile
       }
     });
   } catch (error) {
@@ -686,10 +710,9 @@ export const updateCustomerProfile = async (req, res) => {
       });
     }
 
-    // Get current user data (including profile fields from user table)
+    // Get current user data from user table
     const [users] = await db.query(
-      `SELECT user_id, first_name, last_name, email, phone,
-              address, city, country, postal_code, profile_image
+      `SELECT user_id, first_name, last_name, email, phone, profile_image
        FROM user
        WHERE email = ?
        LIMIT 1`,
@@ -724,37 +747,51 @@ export const updateCustomerProfile = async (req, res) => {
       firstName: firstName ?? user.first_name,
       lastName: lastName ?? user.last_name,
       phone: phone ?? user.phone,
-      address: address ?? user.address ?? null,
-      city: city ?? user.city ?? null,
-      country: country ?? user.country ?? 'Philippines',
-      postalCode: postalCode ?? user.postal_code ?? null,
+      address: address ?? null,
+      city: city ?? null,
+      country: country ?? 'Philippines',
+      postalCode: postalCode ?? null,
       profileImage: uploadedProfileImage ?? profileImage ?? user.profile_image ?? null
     };
 
-    // Update user table (authentication + profile fields)
+    // Update user table (authentication + basic profile fields)
     await db.query(
       `UPDATE user
        SET first_name = ?,
            last_name = ?,
            phone = ?,
-           address = ?,
-           city = ?,
-           country = ?,
-           postal_code = ?,
            profile_image = ?
        WHERE user_id = ?`,
       [
         updated.firstName,
         updated.lastName,
         updated.phone,
-        updated.address,
-        updated.city,
-        updated.country,
-        updated.postalCode,
         updated.profileImage,
         user.user_id
       ]
     );
+
+    // Update or insert customer profile (address, city, country, postal_code)
+    await db.query(
+      `INSERT INTO customers (user_id, address, city, country, postal_code, profile_image)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         address = VALUES(address),
+         city = VALUES(city),
+         country = VALUES(country),
+         postal_code = VALUES(postal_code),
+         profile_image = VALUES(profile_image)`,
+      [
+        user.user_id,
+        updated.address,
+        updated.city,
+        updated.country,
+        updated.postalCode,
+        updated.profileImage
+      ]
+    );
+
+    console.log('✅ Profile updated for user:', user.user_id, updated.firstName, updated.lastName);
 
     res.json({
       success: true,

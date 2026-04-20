@@ -25,14 +25,17 @@ export const createPaymentLink = async (req, res) => {
       paymentMethod
     } = req.body;
 
-    // Validate required fields
-    if (!amount || !description || !bookingId) {
+    // Validate required fields (bookingId is optional for POS transactions)
+    if (!amount || !description) {
       return res.status(400).json({
-        error: 'Missing required fields: amount, description, bookingId'
+        error: 'Missing required fields: amount, description'
       });
     }
 
-    console.log('🔑 Creating PayMongo payment link for:', bookingId);
+    // Use bookingId if provided, otherwise generate a reference for POS transactions
+    const referenceId = bookingId ? String(bookingId) : `POS-${Date.now()}`;
+
+    console.log('🔑 Creating PayMongo payment link for:', referenceId);
     console.log('💳 Selected payment method:', paymentMethod);
 
     // PayMongo uses centavos (amount * 100)
@@ -47,9 +50,8 @@ export const createPaymentLink = async (req, res) => {
     };
 
     // Get selected payment method or default to all
-    const selectedMethods = paymentMethod && paymentMethodMap[paymentMethod]
-      ? [paymentMethodMap[paymentMethod]]
-      : ['gcash', 'paymaya', 'card', 'grab_pay'];
+    // Always allow all payment methods - let customer choose on PayMongo page
+    const selectedMethods = ['gcash', 'paymaya', 'card'];
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
 
@@ -59,12 +61,12 @@ export const createPaymentLink = async (req, res) => {
         attributes: {
           amount: amountInCentavos,
           description: description,
-          remarks: bookingId,
+          remarks: referenceId,
           // Use customer's selected payment method
           payment_method_types: selectedMethods,
           // Redirect to payment verification page (will check status and auto-redirect to confirmation)
-          success_url: `${frontendUrl}/payment-return?bookingId=${bookingId}`,
-          cancel_url: `${frontendUrl}/booking-confirmation?cancelled=true&bookingId=${bookingId}`,
+          success_url: `${frontendUrl}/payment-return?bookingId=${referenceId}`,
+          cancel_url: `${frontendUrl}/booking-confirmation?cancelled=true&bookingId=${referenceId}`,
           line_items: [
             {
               name: description,
@@ -77,11 +79,13 @@ export const createPaymentLink = async (req, res) => {
       }
     };
 
+    console.log('🔐 PayMongo Secret Key Length:', PAYMONGO_SECRET_KEY?.length, 'Key starts with:', PAYMONGO_SECRET_KEY?.substring(0, 15));
+
     const response = await fetch(`${PAYMONGO_API_URL}/links`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+        'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
       },
       body: JSON.stringify(paymentLinkData)
     });
@@ -107,7 +111,7 @@ export const createPaymentLink = async (req, res) => {
       amount: amount,
       status: data.data.attributes.status,
       // Add redirect URL for frontend to use after payment
-      redirect_url: `${frontendUrl}/booking?bookingId=${bookingId}&reference=${data.data.attributes.reference_number}`
+      redirect_url: `${frontendUrl}/booking?bookingId=${referenceId}&reference=${data.data.attributes.reference_number}`
     });
 
   } catch (error) {
@@ -164,7 +168,7 @@ export const createPaymentIntent = async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+        'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
       },
       body: JSON.stringify(paymentIntentData)
     });
@@ -201,7 +205,7 @@ export const getPaymentStatus = async (req, res) => {
     const response = await fetch(`${PAYMONGO_API_URL}/links/${paymentId}`, {
       method: 'GET',
       headers: {
-        'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+        'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
       }
     });
 
@@ -353,7 +357,7 @@ export const webhookHandler = async (req, res) => {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+              'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
             },
             body: JSON.stringify(paymentPayload)
           });
