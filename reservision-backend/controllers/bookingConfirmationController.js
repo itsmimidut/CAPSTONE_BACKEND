@@ -184,11 +184,12 @@ export const createBookingConfirmation = async (req, res) => {
 
     // Step 4: Add booking items
     for (const item of items) {
+      const requestedQty = Math.max(1, Number(item.qty || 1));
       // Calculate nights only for non-swimming items with valid dates
       const nights = item.perNight && checkIn && checkOut
         ? Math.ceil((new Date(checkOut) - new Date(checkIn)) / 86400000)
         : 0;
-      const totalPrice = item.price * item.qty * (item.perNight ? nights : 1);
+      const totalPrice = item.price * requestedQty * (item.perNight ? nights : 1);
 
       // Get numeric inventory_item_id
       const itemIdValue = item.item_id || item.id;
@@ -222,6 +223,101 @@ export const createBookingConfirmation = async (req, res) => {
         ? item.swimmingDetails.participants
         : (item.guests || 0);
 
+      if (item.perNight && !item.swimmingDetails) {
+        const requestedIds = Array.isArray(item.selectedInventoryItemIds)
+          ? item.selectedInventoryItemIds.map(id => Number(id)).filter(Number.isFinite)
+          : [];
+
+        let candidateParams = [];
+        let candidateFilter = '';
+
+        if (requestedIds.length) {
+          candidateFilter = ` AND ii.item_id IN (${requestedIds.map(() => '?').join(', ')})`;
+          candidateParams = requestedIds;
+        }
+
+        const [availableUnits] = await connection.query(
+          `SELECT ii.item_id
+           FROM inventory_items ii
+           WHERE ii.name = ?
+             AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+             ${candidateFilter}
+             AND ii.item_id NOT IN (
+               SELECT bi.inventory_item_id
+               FROM booking_items bi
+               INNER JOIN bookings b ON b.booking_id = bi.booking_id
+               WHERE bi.inventory_item_id IS NOT NULL
+                 AND b.booking_status IN ('Confirmed', 'Pending')
+                 AND COALESCE(b.payment_status, 'Unpaid') IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
+                 AND (
+                   (b.check_in_date < ? AND b.check_out_date > ?)
+                   OR (b.check_in_date >= ? AND b.check_in_date < ?)
+                   OR (b.check_out_date > ? AND b.check_out_date <= ?)
+                 )
+             )
+           ORDER BY ii.item_id ASC
+           LIMIT ?`,
+          [
+            item.name || 'Item',
+            ...candidateParams,
+            checkOut,
+            checkIn,
+            checkIn,
+            checkOut,
+            checkIn,
+            checkOut,
+            requestedQty
+          ]
+        );
+
+        if (availableUnits.length < requestedQty) {
+          await connection.rollback();
+          return res.status(409).json({
+            success: false,
+            error: 'Not enough available rooms for the selected dates',
+            item_name: itemName,
+            requested_quantity: requestedQty,
+            available_quantity: availableUnits.length
+          });
+        }
+
+        const guestsPerUnit = guestCount > 0 ? Math.max(1, Math.ceil(guestCount / requestedQty)) : 0;
+
+        for (const unit of availableUnits) {
+          await connection.query(
+            `INSERT INTO booking_items (
+              booking_id,
+              inventory_item_id,
+              item_type,
+              item_name,
+              unit_price,
+              quantity,
+              guests,
+              nights,
+              total_price,
+              per_night,
+              item_description
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bookingId,
+              unit.item_id,
+              itemType,
+              itemName,
+              item.price,
+              1,
+              guestsPerUnit,
+              nights,
+              item.price * (item.perNight ? nights : 1),
+              true,
+              item.description || null
+            ]
+          );
+        }
+
+        console.log(`🏨 Reserved ${availableUnits.length} unit(s) for ${itemName}`);
+        continue;
+      }
+
       await connection.query(
         `INSERT INTO booking_items (
           booking_id, 
@@ -242,7 +338,7 @@ export const createBookingConfirmation = async (req, res) => {
           itemType,
           itemName,
           item.price,
-          item.qty,
+          requestedQty,
           guestCount,
           nights,
           totalPrice,
@@ -452,16 +548,16 @@ export const updatePaymentStatus = async (req, res) => {
       [status, paymentIntentId, checkoutUrl, status, bookingId, paymentReference]
     );
 
-    // Update booking status if payment is completed
+    // Mark payment as paid — booking status stays pending for admin approval
     if (status === 'paid') {
       await db.query(
-        'UPDATE bookings SET booking_status = ?, payment_status = ? WHERE booking_id = ?',
-        ['Confirmed', 'Paid', bookingId]
+        'UPDATE bookings SET payment_status = ? WHERE booking_id = ?',
+        ['Paid', bookingId]
       );
 
       await db.query(
-        'INSERT INTO booking_logs (booking_id, action, details) VALUES (?, ?, ?)',
-        [bookingId, 'payment_completed', `Payment completed via ${paymentIntentId}`]
+        'INSERT INTO booking_logs (booking_id, action, description, performed_by) VALUES (?, ?, ?, ?)',
+        [bookingId, 'Payment Received', `Payment completed via ${paymentIntentId}. Awaiting admin approval.`, 'System']
       );
 
       // 🎉 Step: Send confirmation email with QR code AFTER payment is confirmed
@@ -470,11 +566,12 @@ export const updatePaymentStatus = async (req, res) => {
 
         // Get booking details for email
         const [bookings] = await db.query(
-          `SELECT b.*, c.first_name, c.last_name, c.email, 
-                  b.booking_reference, b.check_in, b.check_out, b.total
+          `SELECT b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.total,
+                  u.first_name, u.last_name, u.email
            FROM bookings b
            LEFT JOIN customers c ON b.customer_id = c.customer_id
-           WHERE b.id = ?`,
+           LEFT JOIN user u ON c.user_id = u.user_id
+           WHERE b.booking_id = ?`,
           [bookingId]
         );
 
@@ -483,9 +580,8 @@ export const updatePaymentStatus = async (req, res) => {
 
           // Get booking items
           const [items] = await db.query(
-            `SELECT bi.quantity as qty, bi.price, i.name, i.category
+            `SELECT bi.quantity as qty, bi.unit_price as price, bi.item_name as name, bi.item_type as category
              FROM booking_items bi
-             LEFT JOIN inventory_items i ON bi.item_id = i.item_id
              WHERE bi.booking_id = ?`,
             [bookingId]
           );
@@ -517,8 +613,8 @@ export const updatePaymentStatus = async (req, res) => {
             firstName: booking.first_name,
             lastName: booking.last_name,
             bookingReference: booking.booking_reference,
-            checkIn: booking.check_in,
-            checkOut: booking.check_out,
+            checkIn: booking.check_in_date,
+            checkOut: booking.check_out_date,
             items: items.map(item => ({
               name: item.name,
               qty: item.qty,

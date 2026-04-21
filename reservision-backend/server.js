@@ -1,4 +1,39 @@
-
+import entranceRatesRoutes from "./routes/entranceRates.js";
+/**
+ * ============================================================
+ * Reservision Backend - Express Server
+ * ============================================================
+ * 
+ * Purpose:
+ * - Main entry point for the Reservision REST API
+ * - Initializes Express server with middleware
+ * - Mounts all API routes for rooms, restaurants, promos, etc.
+ * - Handles CORS and large payload requests (base64 images)
+ * 
+ * Dependencies:
+ * - express: Web framework for handling HTTP requests
+ * - cors: Middleware to enable Cross-Origin Resource Sharing
+ * 
+ * Features:
+ * - CORS enabled for frontend communication
+ * - 50MB payload limit for base64-encoded image uploads
+ * - RESTful API endpoints for:
+ *   - Rooms/Cottages/Events (CRUD operations)
+ *   - Promotional Pricing
+ *   - Seasonal Pricing
+ *   - Restaurant Management (tables, menu, orders, inventory)
+ * 
+ * Server Configuration:
+ * - PORT: 8000
+ * - Base URL: http://localhost:8000
+ * 
+ * Environment Setup:
+ * - Ensure database is configured in config/db.js
+ * - Node version: 14+ required
+ * 
+ * Usage:
+ * npm start
+ */
 
 import express from "express";
 import cors from "cors";
@@ -38,6 +73,7 @@ import userManagementRoutes from "./routes/userManagement.js";
 import analyticsRoutes from "./routes/analytics.js";
 import notificationsRoutes from "./routes/notifications.js";
 import websiteConfigRoutes from "./routes/websiteConfig.js";
+import webhooksRoutes from "./routes/webhooks.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -85,6 +121,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 // Rooms, Cottages, Events Management
 app.use("/api/rooms", roomsRoutes);
+app.use("/api/entrance-rates", entranceRatesRoutes);
 
 // Promotional Pricing Management
 app.use("/api/promos", promosRoutes);
@@ -142,6 +179,9 @@ app.use("/api/notifications", notificationsRoutes);
 
 // Website Content Configuration
 app.use('/api/website-config', websiteConfigRoutes);
+
+// PayMongo Webhooks
+app.use('/api/webhooks', webhooksRoutes);
 
 // ============================================================
 // ROOT ROUTE - API INFO

@@ -97,7 +97,9 @@ export const upload = multer({
  * ]
  */
 export const getRooms = async (req, res) => {
-  const [rows] = await db.query("SELECT * FROM inventory_items ORDER BY created_at DESC");
+  const [rows] = await db.query(
+    "SELECT * FROM inventory_items ORDER BY name ASC, unit_number ASC, created_at DESC"
+  );
   res.json(rows);
 };
 
@@ -170,15 +172,24 @@ export const getRoom = async (req, res) => {
  */
 export const createRoom = async (req, res) => {
   try {
-    const { category, category_type, room_number, name, description, max_guests, price, status, promo, primaryImageIndex, quantity, existingImages } = req.body;
+    const {
+      category, category_type, room_number, name, description,
+      max_guests, price, status, promo, primaryImageIndex,
+      quantity, existingImages, unit_number, unit_label
+    } = req.body;
     const newPaths = (req.files || []).map(f => `/uploads/rooms/${f.filename}`);
     const kept = existingImages ? JSON.parse(existingImages) : [];
     const allImages = [...kept, ...newPaths];
+    const unitNum = parseInt(unit_number) || 1;
+    const unitLbl = unit_label || `${name} - Unit ${unitNum}`;
+    // quantity is kept as 1 — each row IS one unit
     const [result] = await db.query(
       `INSERT INTO inventory_items
-        (category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(allImages), primaryImageIndex || 0, quantity || 1]
+        (category, category_type, room_number, name, description, max_guests, price, status,
+         promo, images, primaryImageIndex, quantity, unit_number, unit_label)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+      [category, category_type, room_number, name, description, max_guests, price, status,
+        promo, JSON.stringify(allImages), primaryImageIndex || 0, unitNum, unitLbl]
     );
     res.json({ success: true, id: result.insertId });
   } catch (error) {
@@ -222,15 +233,24 @@ export const createRoom = async (req, res) => {
  */
 export const updateRoom = async (req, res) => {
   try {
-    const { category, category_type, room_number, name, description, max_guests, price, status, promo, primaryImageIndex, quantity, existingImages } = req.body;
+    const {
+      category, category_type, room_number, name, description,
+      max_guests, price, status, promo, primaryImageIndex,
+      existingImages, unit_number, unit_label
+    } = req.body;
     const newPaths = (req.files || []).map(f => `/uploads/rooms/${f.filename}`);
     const kept = existingImages ? JSON.parse(existingImages) : [];
     const allImages = [...kept, ...newPaths];
+    const unitNum = parseInt(unit_number) || 1;
+    const unitLbl = unit_label || `${name} - Unit ${unitNum}`;
     await db.query(
       `UPDATE inventory_items SET
-         category=?, category_type=?, room_number=?, name=?, description=?, max_guests=?, price=?, status=?, promo=?, images=?, primaryImageIndex=?, quantity=?
+         category=?, category_type=?, room_number=?, name=?, description=?, max_guests=?, price=?,
+         status=?, promo=?, images=?, primaryImageIndex=?, quantity=1, unit_number=?, unit_label=?
        WHERE item_id=?`,
-      [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(allImages), primaryImageIndex || 0, quantity || 1, req.params.id]
+      [category, category_type, room_number, name, description, max_guests, price,
+        status, promo, JSON.stringify(allImages), primaryImageIndex || 0,
+        unitNum, unitLbl, req.params.id]
     );
     res.json({ success: true });
   } catch (error) {

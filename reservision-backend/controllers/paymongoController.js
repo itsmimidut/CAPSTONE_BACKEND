@@ -1,8 +1,6 @@
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import db from '../config/db.js';
-import { sendBookingConfirmationWithQR } from '../services/emailService.js';
-import { generateQRCode, formatBookingDataForQR } from '../services/qrCodeService.js';
 
 dotenv.config();
 
@@ -27,14 +25,17 @@ export const createPaymentLink = async (req, res) => {
       paymentMethod
     } = req.body;
 
-    // Validate required fields
-    if (!amount || !description || !bookingId) {
+    // Validate required fields (bookingId is optional for POS transactions)
+    if (!amount || !description) {
       return res.status(400).json({
-        error: 'Missing required fields: amount, description, bookingId'
+        error: 'Missing required fields: amount, description'
       });
     }
 
-    console.log('🔑 Creating PayMongo payment link for:', bookingId);
+    // Use bookingId if provided, otherwise generate a reference for POS transactions
+    const referenceId = bookingId ? String(bookingId) : `POS-${Date.now()}`;
+
+    console.log('🔑 Creating PayMongo payment link for:', referenceId);
     console.log('💳 Selected payment method:', paymentMethod);
 
     // PayMongo uses centavos (amount * 100)
@@ -49,9 +50,8 @@ export const createPaymentLink = async (req, res) => {
     };
 
     // Get selected payment method or default to all
-    const selectedMethods = paymentMethod && paymentMethodMap[paymentMethod]
-      ? [paymentMethodMap[paymentMethod]]
-      : ['gcash', 'paymaya', 'card', 'grab_pay'];
+    // Always allow all payment methods - let customer choose on PayMongo page
+    const selectedMethods = ['gcash', 'paymaya', 'card'];
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
 
@@ -61,12 +61,12 @@ export const createPaymentLink = async (req, res) => {
         attributes: {
           amount: amountInCentavos,
           description: description,
-          remarks: bookingId,
+          remarks: referenceId,
           // Use customer's selected payment method
           payment_method_types: selectedMethods,
           // Redirect to payment verification page (will check status and auto-redirect to confirmation)
-          success_url: `${frontendUrl}/payment-return?bookingId=${bookingId}`,
-          cancel_url: `${frontendUrl}/booking-confirmation?cancelled=true&bookingId=${bookingId}`,
+          success_url: `${frontendUrl}/payment-return?bookingId=${referenceId}`,
+          cancel_url: `${frontendUrl}/booking-confirmation?cancelled=true&bookingId=${referenceId}`,
           line_items: [
             {
               name: description,
@@ -79,11 +79,13 @@ export const createPaymentLink = async (req, res) => {
       }
     };
 
+    console.log('🔐 PayMongo Secret Key Length:', PAYMONGO_SECRET_KEY?.length, 'Key starts with:', PAYMONGO_SECRET_KEY?.substring(0, 15));
+
     const response = await fetch(`${PAYMONGO_API_URL}/links`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+        'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
       },
       body: JSON.stringify(paymentLinkData)
     });
@@ -109,7 +111,7 @@ export const createPaymentLink = async (req, res) => {
       amount: amount,
       status: data.data.attributes.status,
       // Add redirect URL for frontend to use after payment
-      redirect_url: `${frontendUrl}/booking?bookingId=${bookingId}&reference=${data.data.attributes.reference_number}`
+      redirect_url: `${frontendUrl}/booking?bookingId=${referenceId}&reference=${data.data.attributes.reference_number}`
     });
 
   } catch (error) {
@@ -166,7 +168,7 @@ export const createPaymentIntent = async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+        'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
       },
       body: JSON.stringify(paymentIntentData)
     });
@@ -203,7 +205,7 @@ export const getPaymentStatus = async (req, res) => {
     const response = await fetch(`${PAYMONGO_API_URL}/links/${paymentId}`, {
       method: 'GET',
       headers: {
-        'Authorization': `Basic ${Buffer.from(PAYMONGO_SECRET_KEY).toString('base64')}`
+        'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
       }
     });
 
@@ -291,13 +293,19 @@ export const webhookHandler = async (req, res) => {
       });
 
       try {
-        // Update booking as paid and confirmed
+        // Mark payment as paid; booking stays pending until admin approval.
         await db.query(
-          'UPDATE bookings SET payment_status = ?, payment_method = ?, booking_status = ?, updated_at = NOW() WHERE booking_id = ?',
-          ['Paid', paymentMethod, 'Confirmed', bookingId]
+          'UPDATE bookings SET payment_status = ?, payment_method = ?, updated_at = NOW() WHERE booking_id = ?',
+          ['Paid', paymentMethod, bookingId]
         );
 
-        console.log('✅ Booking confirmed as paid:', bookingId, 'with method:', paymentMethod);
+        await db.query(
+          `INSERT INTO booking_logs (booking_id, action, description, performed_by)
+           VALUES (?, 'Payment Received', ?, 'PayMongo Webhook')`,
+          [bookingId, `Payment settled via ${paymentMethod}. Awaiting admin approval.`]
+        );
+
+        console.log('✅ Booking payment marked as paid (awaiting admin approval):', bookingId, 'with method:', paymentMethod);
 
         // Log for swimming bookings
         const [swimmingItems] = await db.query(
@@ -306,67 +314,7 @@ export const webhookHandler = async (req, res) => {
         );
 
         if (swimmingItems.length > 0) {
-          console.log(`🏊 Swimming booking confirmed! Booking ID: ${bookingId}, Reference: ${referenceNumber}`);
-        }
-
-        // Send confirmation email with QR code
-        try {
-          const [bookings] = await db.query(
-            `SELECT b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.total,
-                    u.first_name, u.last_name, u.email
-             FROM bookings b
-             LEFT JOIN customers c ON b.customer_id = c.customer_id
-             LEFT JOIN user u ON c.user_id = u.user_id
-             WHERE b.booking_id = ?`,
-            [bookingId]
-          );
-
-          if (bookings.length > 0) {
-            const booking = bookings[0];
-
-            const [items] = await db.query(
-              `SELECT bi.quantity AS qty, bi.unit_price AS price, i.name, i.category
-               FROM booking_items bi
-               LEFT JOIN inventory_items i ON bi.inventory_item_id = i.item_id
-               WHERE bi.booking_id = ?`,
-              [bookingId]
-            );
-
-            let qrCodeData = null;
-            try {
-              const formattedQRData = formatBookingDataForQR(
-                {
-                  booking_reference: booking.booking_reference,
-                  first_name: booking.first_name,
-                  last_name: booking.last_name
-                },
-                items.map(item => ({
-                  item_name: item.name,
-                  quantity: item.qty,
-                  item_type: item.category || 'Room'
-                }))
-              );
-              qrCodeData = await generateQRCode(formattedQRData);
-            } catch (qrErr) {
-              console.warn('⚠️ QR generation failed:', qrErr.message);
-            }
-
-            const emailData = {
-              email: booking.email,
-              firstName: booking.first_name,
-              lastName: booking.last_name,
-              bookingReference: booking.booking_reference,
-              checkIn: booking.check_in_date,
-              checkOut: booking.check_out_date,
-              items: items.map(item => ({ name: item.name, qty: item.qty, price: item.price })),
-              total: booking.total
-            };
-
-            await sendBookingConfirmationWithQR(emailData, qrCodeData?.base64 || null);
-            console.log('✅ Confirmation email with QR sent for booking:', bookingId);
-          }
-        } catch (emailErr) {
-          console.warn('⚠️ Email sending failed after payment:', emailErr.message);
+          console.log(`🏊 Swimming booking paid and pending approval. Booking ID: ${bookingId}, Reference: ${referenceNumber}`);
         }
 
       } catch (dbError) {
@@ -379,6 +327,66 @@ export const webhookHandler = async (req, res) => {
         amount: payment.amount / 100,
         payment_id: payment.id
       });
+    } else if (eventType === 'source.chargeable') {
+      // Legacy Sources flow (kept for backwards compatibility)
+      const source = event.data.attributes.data;
+      const sourceId = source.id;
+      const amountCentavos = source.attributes.amount;
+      const metadata = source.attributes.metadata || {};
+      const bookingId = metadata.booking_id;
+
+      console.log(`💳 source.chargeable: ${sourceId} → booking ${bookingId}`);
+
+      if (!bookingId) {
+        console.log('⚠️ source.chargeable received without booking_id in metadata');
+      } else {
+        try {
+          // Create a PayMongo payment from the chargeable source
+          const paymentPayload = {
+            data: {
+              attributes: {
+                amount: amountCentavos,
+                source: { id: sourceId, type: 'source' },
+                currency: 'PHP',
+                description: `QR Ph – Booking ${bookingId}`
+              }
+            }
+          };
+
+          const payRes = await fetch(`${PAYMONGO_API_URL}/payments`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Basic ${Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString('base64')}`
+            },
+            body: JSON.stringify(paymentPayload)
+          });
+
+          const payResult = await payRes.json();
+          if (!payRes.ok) {
+            console.error('❌ Failed to create payment from QR Ph source:', payResult);
+          } else {
+            console.log('✅ Payment created from QR Ph source:', payResult.data?.id);
+          }
+
+          // Mark booking as paid regardless (source chargeable = user authorized)
+          await db.query(
+            'UPDATE bookings SET payment_status = ?, payment_method = ?, updated_at = NOW() WHERE booking_id = ?',
+            ['Paid', 'QR Ph', bookingId]
+          );
+
+          await db.query(
+            `INSERT INTO booking_logs (booking_id, action, description, performed_by)
+             VALUES (?, 'Payment Received', ?, 'PayMongo Webhook')`,
+            [bookingId, `QR Ph payment authorized. Source: ${sourceId}. Awaiting admin approval.`]
+          );
+
+          console.log(`✅ QR Ph booking ${bookingId} marked as Paid`);
+        } catch (dbError) {
+          console.error('❌ Error processing source.chargeable:', dbError);
+        }
+      }
+
     } else if (eventType === 'payment.failed') {
       console.log('❌ Payment failed');
     }
@@ -392,3 +400,5 @@ export const webhookHandler = async (req, res) => {
     res.status(200).json({ received: false, error: error.message });
   }
 };
+
+

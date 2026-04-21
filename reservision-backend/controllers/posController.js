@@ -104,15 +104,27 @@ const fetchRestaurantItems = async () => {
 // ============================================================
 /**
  * Handler: GET /api/pos/transactions
+ * Query Params: ?userId=1 (optional - filters to specific user)
  * 
- * Purpose: Retrieve all POS transaction history
- * Response: Array of all transactions sorted by newest first
+ * Purpose: Retrieve POS transaction history (filtered by user if provided)
+ * Response: Array of transactions sorted by newest first
  */
 export const getAllTransactions = async (req, res) => {
     try {
-        const [rows] = await db.query(
-            'SELECT * FROM pos_transactions ORDER BY created_at DESC'
-        );
+        const { userId } = req.query;
+
+        let query = 'SELECT * FROM pos_transactions';
+        let params = [];
+
+        // If userId provided, filter by that user
+        if (userId) {
+            query += ' WHERE user_id = ?';
+            params.push(userId);
+        }
+
+        query += ' ORDER BY created_at DESC';
+
+        const [rows] = await db.query(query, params);
 
         // Parse items JSON string back to array
         const transactions = rows.map(row => ({
@@ -200,7 +212,10 @@ export const createTransaction = async (req, res) => {
             change_amount,
             changeAmount,
             transaction_date,
-            transaction_time
+            transaction_time,
+            paymentUrl,
+            payment_url,
+            userId
         } = req.body;
 
         const normalizedReceiptNo = receiptNo ?? receipt_no;
@@ -213,6 +228,7 @@ export const createTransaction = async (req, res) => {
         const normalizedChangeAmount = change_amount ?? changeAmount ?? 0;
         const normalizedDate = date ?? transaction_date;
         const normalizedTime = time ?? transaction_time;
+        const normalizedPaymentUrl = paymentUrl ?? payment_url ?? null;
 
         // Validate required fields
         if (!normalizedReceiptNo || !normalizedItems || !normalizedPayment || normalizedTotal === undefined) {
@@ -304,6 +320,14 @@ export const createTransaction = async (req, res) => {
         if (columnSet.has('change_amount')) {
             insertColumns.push('change_amount');
             insertValues.push(normalizedChangeAmount);
+        }
+        if (columnSet.has('payment_url') && normalizedPaymentUrl) {
+            insertColumns.push('payment_url');
+            insertValues.push(normalizedPaymentUrl);
+        }
+        if (columnSet.has('user_id') && userId) {
+            insertColumns.push('user_id');
+            insertValues.push(userId);
         }
 
         const placeholders = insertColumns.map(() => '?').join(', ');
@@ -823,11 +847,24 @@ export const getItemsByCategory = async (req, res) => {
  */
 export const printBookingReceipt = async (req, res) => {
     try {
-        const { printBookingReceipt: printBooking } = await import('../services/printerService.js');
         const receiptData = req.body;
+
+        console.log(`\n📋 Print Booking Receipt Request:`);
+        console.log(`   Receipt: ${receiptData.receiptNo}`);
+        console.log(`   Guest: ${receiptData.guestName}`);
+        console.log(`   Booking Ref: ${receiptData.bookingReference}`);
+        console.log(`   Payment Method: ${receiptData.paymentMethod}`);
+        console.log(`   Payment URL: ${receiptData.paymentUrl ? '✅ SET' : '❌ MISSING'}`);
+
+        const { printBookingReceipt: printBooking } = await import('../services/printerService.js');
 
         // Validate required fields
         if (!receiptData.receiptNo || !receiptData.guestName || !receiptData.total) {
+            console.error(`❌ Missing required fields:`, {
+                receiptNo: !!receiptData.receiptNo,
+                guestName: !!receiptData.guestName,
+                total: !!receiptData.total
+            });
             return res.status(400).json({
                 success: false,
                 message: 'Missing required receipt data'
@@ -838,12 +875,14 @@ export const printBookingReceipt = async (req, res) => {
         const result = await printBooking(receiptData);
 
         if (result.success) {
+            console.log(`✅ Booking receipt sent to printer: ${result.receiptNo}`);
             res.json({
                 success: true,
                 message: 'Booking receipt printed successfully',
                 receiptNo: result.receiptNo
             });
         } else {
+            console.error(`❌ Printer service failed:`, result.message);
             res.status(500).json({
                 success: false,
                 message: result.message || 'Failed to print receipt',
@@ -852,7 +891,7 @@ export const printBookingReceipt = async (req, res) => {
         }
 
     } catch (error) {
-        console.error('Printer service error:', error);
+        console.error('❌ Printer service error:', error);
         res.status(500).json({
             success: false,
             message: 'Printer service error',

@@ -1041,9 +1041,9 @@ export const getBookingHistoryByUserId = async (req, res) => {
         b.total,
         b.booking_status,
         b.created_at,
+        LOWER(COALESCE(b.payment_status, 'pending')) as payment_status,
         p.payment_reference,
         p.payment_method,
-        p.status as payment_status,
         p.paid_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
@@ -1487,10 +1487,30 @@ export const validateBookingForCheckIn = async (req, res) => {
       `SELECT 
         b.booking_id as id,
         b.booking_reference,
-        b.first_name,
-        b.last_name,
-        b.email,
-        b.phone,
+        COALESCE(
+          NULLIF(TRIM(c.first_name), ''),
+          NULLIF(TRIM(u.first_name), ''),
+          NULLIF(TRIM(b.first_name), ''),
+          'Guest'
+        ) as first_name,
+        COALESCE(
+          NULLIF(TRIM(c.last_name), ''),
+          NULLIF(TRIM(u.last_name), ''),
+          NULLIF(TRIM(b.last_name), ''),
+          ''
+        ) as last_name,
+        COALESCE(
+          NULLIF(TRIM(c.email), ''),
+          NULLIF(TRIM(u.email), ''),
+          NULLIF(TRIM(b.email), ''),
+          ''
+        ) as email,
+        COALESCE(
+          NULLIF(TRIM(c.phone), ''),
+          NULLIF(TRIM(u.phone), ''),
+          NULLIF(TRIM(b.phone), ''),
+          ''
+        ) as phone,
         b.check_in_date,
         b.check_out_date,
         b.booking_status,
@@ -1498,11 +1518,13 @@ export const validateBookingForCheckIn = async (req, res) => {
         CONCAT('[', GROUP_CONCAT(
           JSON_OBJECT(
             'item_id', bi.inventory_item_id,
-            'item_name', ii.name,
+            'item_name', COALESCE(NULLIF(TRIM(ii.name), ''), NULLIF(TRIM(bi.item_name), ''), 'Item'),
             'qty', bi.quantity
           )
         ), ']') as items_list
        FROM bookings b
+       LEFT JOIN customers c ON b.customer_id = c.customer_id
+       LEFT JOIN user u ON c.user_id = u.user_id
        LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id
        LEFT JOIN inventory_items ii ON bi.inventory_item_id = ii.item_id
        WHERE b.booking_reference = ?
@@ -1530,7 +1552,8 @@ export const validateBookingForCheckIn = async (req, res) => {
     }
 
     // Check if already checked in
-    if (booking.booking_status === 'Checked-in') {
+    const normalizedStatus = String(booking.booking_status || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (normalizedStatus === 'checkedin') {
       return res.status(400).json({
         success: false,
         error: 'Guest has already checked in'

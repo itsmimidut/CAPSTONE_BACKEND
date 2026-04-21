@@ -11,9 +11,13 @@ CREATE TABLE IF NOT EXISTS user (
   phone VARCHAR(20) NOT NULL,
   password VARCHAR(255) NOT NULL,
   role VARCHAR(50) DEFAULT 'customer',
+  auth_provider VARCHAR(32) NULL DEFAULT NULL,
+  google_sub VARCHAR(128) NULL DEFAULT NULL,
+  last_login_at DATETIME NULL DEFAULT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_user_email (email),
-  INDEX idx_user_role (role)
+  INDEX idx_user_role (role),
+  INDEX idx_user_google_sub (google_sub)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Create customers table (customer profile data)
@@ -65,17 +69,33 @@ CREATE TABLE IF NOT EXISTS inventory_items (
 -- Create promos table
 CREATE TABLE IF NOT EXISTS promos (
   promo_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(120),
   code VARCHAR(50) NOT NULL UNIQUE,
-  type VARCHAR(20),
-  value DECIMAL(10, 2),
   description LONGTEXT,
-  startDate DATE,
-  endDate DATE,
-  usageLimit INT,
+  discount_type VARCHAR(20) NOT NULL,
+  discount_value DECIMAL(10, 2) NOT NULL,
+  applies_to_category VARCHAR(50) DEFAULT 'all',
+  min_subtotal DECIMAL(10, 2) DEFAULT 0,
+  start_date DATE,
+  end_date DATE,
+  usage_limit INT DEFAULT NULL,
+  times_used INT DEFAULT 0,
+  is_active TINYINT(1) DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_code (code),
-  INDEX idx_endDate (endDate)
+  INDEX idx_promo_dates (start_date, end_date),
+  INDEX idx_promo_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS promo_items (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  promo_id INT NOT NULL,
+  inventory_item_id INT NOT NULL,
+  UNIQUE KEY uq_promo_item (promo_id, inventory_item_id),
+  INDEX idx_promo_items_item (inventory_item_id),
+  CONSTRAINT fk_promo_items_promo FOREIGN KEY (promo_id) REFERENCES promos(promo_id) ON DELETE CASCADE,
+  CONSTRAINT fk_promo_items_inventory FOREIGN KEY (inventory_item_id) REFERENCES inventory_items(item_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Create seasonal_pricing table
@@ -131,10 +151,10 @@ INSERT INTO inventory_items (category, category_type, room_number, name, descrip
 ('Cottage', 'Mountain', 'C203', 'Mountain View Cottage', 'Cottage with panoramic mountain views, fireplace, 2 bedrooms, and kitchen', 5, 6000, 'Under Maintenance', '["https://images.unsplash.com/photo-1512918728675-ed5a9ecdebfd?w=500"]', 0);
 
 -- Insert sample promos
-INSERT INTO promos (code, type, value, description, startDate, endDate, usageLimit) VALUES
-('SUMMER20', 'percentage', 20, 'Summer special - 20% off all rooms', '2024-06-01', '2024-08-31', 100),
-('EARLY15', 'percentage', 15, 'Early bird discount - 15% off', '2024-01-01', '2024-12-31', 50),
-('FLAT500', 'fixed', 500, 'Get flat ₱500 discount on any booking', '2024-01-01', '2024-12-31', NULL);
+INSERT INTO promos (name, code, description, discount_type, discount_value, applies_to_category, min_subtotal, start_date, end_date, usage_limit, times_used, is_active) VALUES
+('Summer Special', 'SUMMER20', 'Summer special - 20% off all rooms', 'percent', 20, 'rooms', 0, '2024-06-01', '2024-08-31', 100, 0, 1),
+('Early Bird', 'EARLY15', 'Early bird discount - 15% off', 'percent', 15, 'all', 0, '2024-01-01', '2024-12-31', 50, 0, 1),
+('Flat 500', 'FLAT500', 'Get flat ₱500 discount on any booking', 'fixed', 500, 'all', 0, '2024-01-01', '2024-12-31', NULL, 0, 1);
 
 -- Insert sample seasonal pricing
 INSERT INTO seasonal_pricing (name, multiplier, startDate, endDate, applyTo) VALUES
