@@ -34,7 +34,8 @@ import {
   getAllOccupiedDates,
   getAdminReservations,
   validateBookingForCheckIn,
-  processCheckIn
+  processCheckIn,
+  createBookingWithAutoAssign
 } from "../controllers/bookingsController.js";
 import {
   createBookingConfirmation,
@@ -85,6 +86,9 @@ router.post("/update-payment", updatePaymentStatus);
 
 // Create new booking
 router.post("/", createBooking);
+
+// Create booking with auto-assigned room (grouped room selection)
+router.post("/with-auto-assign", createBookingWithAutoAssign);
 
 // Update booking
 router.put("/:id", updateBooking);

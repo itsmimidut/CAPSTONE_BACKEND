@@ -35,6 +35,7 @@ import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import { getGroupedRooms as getGroupedRoomsFromService } from "../services/roomAssignmentService.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -291,4 +292,76 @@ export const updateRoom = async (req, res) => {
 export const deleteRoom = async (req, res) => {
   await db.query("DELETE FROM inventory_items WHERE item_id=?", [req.params.id]);
   res.json({ success: true });
+};
+
+// ============================================================
+// GET GROUPED ROOMS (FOR CUSTOMER DISPLAY)
+// ============================================================
+/**
+ * Handler: GET /api/rooms/grouped
+ * 
+ * Purpose: Get grouped room types for customer-facing display
+ * 
+ * Returns one card per room type (e.g., "FAMILY ROOM") showing:
+ * - Room type name
+ * - Price per night
+ * - Max guests
+ * - Description
+ * - Available count (rooms with status = 'Available')
+ * - Total count
+ * - Sample images
+ * - List of all physical rooms
+ * 
+ * This consolidates:
+ *   "FAMILY ROOM 1" (Available)
+ *   "FAMILY ROOM 2" (Available)
+ *   "FAMILY ROOM 3" (Booked)
+ * Into a single card: "FAMILY ROOM" with available_count: 2
+ * 
+ * Response Example:
+ * {
+ *   success: true,
+ *   data: [
+ *     {
+ *       room_type: "FAMILY ROOM",
+ *       price: 4500,
+ *       max_guests: 4,
+ *       description: "Spacious family room...",
+ *       available_count: 2,
+ *       total_rooms: 3,
+ *       primary_item_id: 1,
+ *       images: ["data:image/jpeg;base64,..."],
+ *       all_rooms: [
+ *         { item_id: 1, room_number: "101", name: "FAMILY ROOM 1", status: "Available" },
+ *         ...
+ *       ]
+ *     },
+ *     ...
+ *   ]
+ * }
+ */
+export const getGroupedRooms = async (req, res) => {
+  try {
+    const result = await getGroupedRoomsFromService();
+
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to fetch grouped rooms',
+        error: result.error
+      });
+    }
+
+    res.json({
+      success: true,
+      data: result.data
+    });
+  } catch (error) {
+    console.error('Error fetching grouped rooms:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch grouped rooms',
+      error: error.message
+    });
+  }
 };
