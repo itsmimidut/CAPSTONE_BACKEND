@@ -30,4 +30,20 @@ router.get('/items', posController.getAllItems);
 // GET items by category
 router.get('/items/category/:category', posController.getItemsByCategory);
 
+// ============================================================
+// THERMAL PRINTER ROUTES
+// ============================================================
+
+// POST print booking receipt to thermal printer (no dialog)
+router.post('/print/booking', posController.printBookingReceipt);
+
+// POST print regular receipt to thermal printer (no dialog)
+router.post('/print/regular', posController.printRegularReceipt);
+
+// GET test printer connection
+router.get('/printer/test', posController.testPrinter);
+
+// GET pending print jobs in queue
+router.get('/printer/queue', posController.getPrintJobsQueue);
+
 export default router;

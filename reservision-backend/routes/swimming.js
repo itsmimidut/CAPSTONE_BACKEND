@@ -1251,27 +1251,56 @@ router.delete("/class-bookings/:id", async (req, res) => {
  */
 router.get("/admin/students", async (req, res) => {
     try {
-        const [students] = await db.query(`
-            SELECT 
-                se.enrollment_id,
-                CONCAT(se.first_name, ' ', se.last_name) as name,
-                se.first_name,
-                se.last_name,
-                se.lesson_type,
-                COALESCE(sc.name, se.preferred_coach) as coach,
-                se.email,
-                se.mobile_phone,
-                se.enrollment_status,
-                se.booking_reference,
-                se.created_at,
-                b.booking_id,
-                b.payment_status,
-                b.created_at as booking_date
-            FROM swimming_enrollments se
-            LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
-            LEFT JOIN swimming_coaches sc ON sc.coach_id = se.preferred_coach
-            ORDER BY se.created_at DESC
-        `);
+        let students;
+        try {
+            // Extended query — includes admin-assigned schedule (requires ADD_SCHEDULE_TO_SWIMMING_ENROLLMENTS.sql)
+            [students] = await db.query(`
+                SELECT
+                    se.enrollment_id,
+                    CONCAT(se.first_name, ' ', se.last_name) as name,
+                    se.first_name,
+                    se.last_name,
+                    se.lesson_type,
+                    COALESCE(se.admin_assigned_coach, sc.name, se.preferred_coach) as coach,
+                    se.email,
+                    se.mobile_phone,
+                    se.enrollment_status,
+                    se.booking_reference,
+                    se.created_at,
+                    b.booking_id,
+                    b.payment_status,
+                    b.created_at as booking_date,
+                    se.admin_lesson_dates as lesson_dates,
+                    se.admin_lesson_time  as lesson_time
+                FROM swimming_enrollments se
+                LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
+                LEFT JOIN swimming_coaches sc ON sc.coach_id = se.preferred_coach
+                ORDER BY se.created_at DESC
+            `);
+        } catch (_) {
+            // Fallback: schedule columns not yet added — run ADD_SCHEDULE_TO_SWIMMING_ENROLLMENTS.sql first
+            [students] = await db.query(`
+                SELECT
+                    se.enrollment_id,
+                    CONCAT(se.first_name, ' ', se.last_name) as name,
+                    se.first_name,
+                    se.last_name,
+                    se.lesson_type,
+                    COALESCE(sc.name, se.preferred_coach) as coach,
+                    se.email,
+                    se.mobile_phone,
+                    se.enrollment_status,
+                    se.booking_reference,
+                    se.created_at,
+                    b.booking_id,
+                    b.payment_status,
+                    b.created_at as booking_date
+                FROM swimming_enrollments se
+                LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
+                LEFT JOIN swimming_coaches sc ON sc.coach_id = se.preferred_coach
+                ORDER BY se.created_at DESC
+            `);
+        }
 
         console.log(`Found ${students.length} students in database`);
 
@@ -1393,6 +1422,42 @@ router.put("/admin/students/:id/status", async (req, res) => {
         res.status(500).json({
             success: false,
             error: "Failed to update enrollment status",
+            details: error.message
+        });
+    }
+});
+
+/**
+ * PUT /api/swimming/admin/students/:id/schedule
+ * Assign or update a student's training schedule (dates, time, coach)
+ * Requires: ADD_SCHEDULE_TO_SWIMMING_ENROLLMENTS.sql migration
+ */
+router.put("/admin/students/:id/schedule", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { lesson_dates, lesson_time, assigned_coach } = req.body;
+
+        if (!lesson_dates || !Array.isArray(lesson_dates) || lesson_dates.length === 0) {
+            return res.status(400).json({ success: false, error: "At least one lesson date is required" });
+        }
+        if (!lesson_time) {
+            return res.status(400).json({ success: false, error: "Lesson time is required" });
+        }
+
+        await db.query(
+            `UPDATE swimming_enrollments
+             SET admin_lesson_dates = ?, admin_lesson_time = ?, admin_assigned_coach = ?
+             WHERE enrollment_id = ?`,
+            [JSON.stringify(lesson_dates), lesson_time, assigned_coach || null, id]
+        );
+
+        res.json({ success: true, message: "Schedule updated successfully" });
+
+    } catch (error) {
+        console.error("Error updating student schedule:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to update schedule — ensure ADD_SCHEDULE_TO_SWIMMING_ENROLLMENTS.sql has been run",
             details: error.message
         });
     }

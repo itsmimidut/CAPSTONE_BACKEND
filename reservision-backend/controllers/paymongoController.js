@@ -1,6 +1,8 @@
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import db from '../config/db.js';
+import { sendBookingConfirmationWithQR } from '../services/emailService.js';
+import { generateQRCode, formatBookingDataForQR } from '../services/qrCodeService.js';
 
 dotenv.config();
 
@@ -289,24 +291,82 @@ export const webhookHandler = async (req, res) => {
       });
 
       try {
-        // Update booking status in database with actual payment method
-        const updateResult = await db.query(
-          'UPDATE bookings SET payment_status = ?, payment_method = ?, updated_at = NOW() WHERE booking_id = ?',
-          ['Paid', paymentMethod, bookingId]
+        // Update booking as paid and confirmed
+        await db.query(
+          'UPDATE bookings SET payment_status = ?, payment_method = ?, booking_status = ?, updated_at = NOW() WHERE booking_id = ?',
+          ['Paid', paymentMethod, 'Confirmed', bookingId]
         );
 
-        console.log('✅ Booking updated as paid:', bookingId, 'with method:', paymentMethod);
-        console.log('📊 Update result:', updateResult);
+        console.log('✅ Booking confirmed as paid:', bookingId, 'with method:', paymentMethod);
 
-        // Check if this booking has swimming items (for logging/future use)
-        const [bookingItems] = await db.query(
+        // Log for swimming bookings
+        const [swimmingItems] = await db.query(
           'SELECT * FROM booking_items WHERE booking_id = ? AND (item_type = ? OR item_type = ?)',
           [bookingId, 'Swimming', 'Swimming Lesson']
         );
 
-        if (bookingItems.length > 0) {
+        if (swimmingItems.length > 0) {
           console.log(`🏊 Swimming booking confirmed! Booking ID: ${bookingId}, Reference: ${referenceNumber}`);
-          console.log(`   Use booking reference ${referenceNumber} as the class ID for swimming management`);
+        }
+
+        // Send confirmation email with QR code
+        try {
+          const [bookings] = await db.query(
+            `SELECT b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.total,
+                    u.first_name, u.last_name, u.email
+             FROM bookings b
+             LEFT JOIN customers c ON b.customer_id = c.customer_id
+             LEFT JOIN user u ON c.user_id = u.user_id
+             WHERE b.booking_id = ?`,
+            [bookingId]
+          );
+
+          if (bookings.length > 0) {
+            const booking = bookings[0];
+
+            const [items] = await db.query(
+              `SELECT bi.quantity AS qty, bi.unit_price AS price, i.name, i.category
+               FROM booking_items bi
+               LEFT JOIN inventory_items i ON bi.inventory_item_id = i.item_id
+               WHERE bi.booking_id = ?`,
+              [bookingId]
+            );
+
+            let qrCodeData = null;
+            try {
+              const formattedQRData = formatBookingDataForQR(
+                {
+                  booking_reference: booking.booking_reference,
+                  first_name: booking.first_name,
+                  last_name: booking.last_name
+                },
+                items.map(item => ({
+                  item_name: item.name,
+                  quantity: item.qty,
+                  item_type: item.category || 'Room'
+                }))
+              );
+              qrCodeData = await generateQRCode(formattedQRData);
+            } catch (qrErr) {
+              console.warn('⚠️ QR generation failed:', qrErr.message);
+            }
+
+            const emailData = {
+              email: booking.email,
+              firstName: booking.first_name,
+              lastName: booking.last_name,
+              bookingReference: booking.booking_reference,
+              checkIn: booking.check_in_date,
+              checkOut: booking.check_out_date,
+              items: items.map(item => ({ name: item.name, qty: item.qty, price: item.price })),
+              total: booking.total
+            };
+
+            await sendBookingConfirmationWithQR(emailData, qrCodeData?.base64 || null);
+            console.log('✅ Confirmation email with QR sent for booking:', bookingId);
+          }
+        } catch (emailErr) {
+          console.warn('⚠️ Email sending failed after payment:', emailErr.message);
         }
 
       } catch (dbError) {

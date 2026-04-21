@@ -1,134 +1,155 @@
-/**
- * ============================================================
- * Reservision Backend - Express Server (FULL)
- * ============================================================
- */
+
 
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-
-console.log("✅ USING THIS server.js FILE:", import.meta.url);
+import { fileURLToPath } from "url";
+import path from "path";
 
 dotenv.config();
 
-const app = express();
-const PORT = process.env.PORT || 8000;
-
-// ============================================================
-// GLOBAL PROCESS ERROR HANDLERS (para makita kung bakit nag-eexit)
-// ============================================================
-process.on("uncaughtException", (err) => {
-  console.error("❌ uncaughtException:", err);
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error("❌ unhandledRejection:", reason);
-});
-
-// ============================================================
-// MIDDLEWARE
-// ============================================================
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ============================================================
 // ROUTE IMPORTS
 // ============================================================
+// Import all route handlers from their respective files
+// Each route file contains CRUD endpoints for its resource
 import roomsRoutes from "./routes/rooms.js";
 import predictionRoutes from "./routes/prediction.js";
 import promosRoutes from "./routes/promos.js";
 import seasonalRoutes from "./routes/seasonalPricing.js";
-
 import tablesRoutes from "./routes/restaurant/tables.js";
 import ordersRoutes from "./routes/restaurant/orders.js";
 import menuRoutes from "./routes/restaurant/menu.js";
 import menuIngredientsRoutes from "./routes/restaurant/menuIngredients.js";
 import inventoryRoutes from "./routes/restaurant/inventory.js";
-
 import ratesRoutes from "./routes/rates.js";
 import swimmingRoutes from "./routes/swimming.js";
 import posRoutes from "./routes/pos.js";
 import bookingsRoutes from "./routes/bookings.js";
-
 import xenditRoutes from "./routes/xendit.js";
 import paymongoRoutes from "./routes/paymongo.js";
-
 import chatbotRoutes from "./routes/chatbot.js";
 import otpRoutes from "./routes/otp.js";
 import customersRoutes from "./routes/customers.js";
 import userManagementRoutes from "./routes/userManagement.js";
 import analyticsRoutes from "./routes/analytics.js";
+import notificationsRoutes from "./routes/notifications.js";
+import websiteConfigRoutes from "./routes/websiteConfig.js";
+
+// ============================================================
+// EXPRESS APP INITIALIZATION
+// ============================================================
+// Create Express application instance
+const app = express();
+
+// ============================================================
+// MIDDLEWARE CONFIGURATION
+// ============================================================
+// CORS Middleware: Allows requests from frontend (different origin)
+app.use(cors());
+
+/**
+ * Body Parser Middleware with Large Payload Support
+ * 
+ * Why 50MB limit?
+ * - Base64-encoded images from frontend are very large
+ * - Example: 1MB image → ~1.3MB when base64 encoded
+ * - Default 100KB limit insufficient for image uploads
+ * 
+ * Parameters:
+ * - limit: Maximum request body size
+ * - Applies to both JSON and URL-encoded data
+ */
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Serve uploaded images as static files
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 // ============================================================
 // API ROUTES MOUNTING
 // ============================================================
+/**
+ * Route structure: /api/{resource}
+ * 
+ * Each route handles:
+ * - GET /api/{resource} - Get all items
+ * - GET /api/{resource}/:id - Get single item
+ * - POST /api/{resource} - Create new item
+ * - PUT /api/{resource}/:id - Update item
+ * - DELETE /api/{resource}/:id - Delete item
+ */
 
-// Rooms, Cottages, Events
+// Rooms, Cottages, Events Management
 app.use("/api/rooms", roomsRoutes);
 
-// Promo
+// Promotional Pricing Management
 app.use("/api/promos", promosRoutes);
 
-// Seasons
+// Seasonal Pricing Management
 app.use("/api/seasons", seasonalRoutes);
 
-// Restaurant
+// Restaurant Management Routes
+// - Tables: Manage restaurant tables/seats
+// - Menu: Manage menu items and dishes
+// - Orders: Handle customer orders
+// - Inventory: Track food/supplies inventory
 app.use("/api/restaurant/tables", tablesRoutes);
 app.use("/api/restaurant/orders", ordersRoutes);
+app.use("/api/restaurant/sales", (await import('./routes/restaurant/salesReport.js')).default);
 app.use("/api/restaurant/menu", menuRoutes);
 app.use("/api/restaurant", menuIngredientsRoutes);
 app.use("/api/restaurant/inventory", inventoryRoutes);
-
-// ✅ Sales report route (dynamic import safe)
-app.use("/api/restaurant/sales", async (req, res, next) => {
-  try {
-    const mod = await import("./routes/restaurant/salesReport.js");
-    return mod.default(req, res, next);
-  } catch (err) {
-    console.error("❌ Failed to load salesReport route:", err);
-    return res.status(500).json({ message: "Sales report route load failed", error: err.message });
-  }
-});
-
-// Rates
 app.use("/api/rates", ratesRoutes);
 
-// Swimming
+// Swimming Enrollment Management
 app.use("/api/swimming", swimmingRoutes);
 
-// ✅ Predictive Analytics
+// Predictive Analytics
 app.use("/api/prediction", predictionRoutes);
 
-// POS
+// POS (Point of Sale) Management
 app.use("/api/pos", posRoutes);
 
-// Bookings
+// Bookings/Reservations Management
 app.use("/api/bookings", bookingsRoutes);
-
-// Payments
+// Xendit Payment Gateway
 app.use("/api/xendit", xenditRoutes);
+
+// PayMongo Payment Gateway
 app.use("/api/paymongo", paymongoRoutes);
 
-// Chatbot
+// Chatbot AI Assistant
 app.use("/api/resort", chatbotRoutes);
 
-// OTP
+// OTP Email Verification
 app.use("/api/otp", otpRoutes);
 
-// Customers
+// Customer Management
 app.use("/api/customers", customersRoutes);
 
-// Analytics
+// Analytics Dashboard
 app.use("/api/analytics", analyticsRoutes);
 
-// Users
+// User Management (Admin)
 app.use("/api/users", userManagementRoutes);
 
+// Notification Counts
+app.use("/api/notifications", notificationsRoutes);
+
+// Website Content Configuration
+app.use('/api/website-config', websiteConfigRoutes);
+
 // ============================================================
-// ROOT ROUTE
+// ROOT ROUTE - API INFO
 // ============================================================
+/**
+ * Welcome/Info endpoint
+ * Provides API documentation and available endpoints
+ */
 app.get("/", (req, res) => {
   res.json({
     message: "Reservision Backend API",
@@ -142,68 +163,44 @@ app.get("/", (req, res) => {
         tables: "/api/restaurant/tables",
         menu: "/api/restaurant/menu",
         orders: "/api/restaurant/orders",
-        inventory: "/api/restaurant/inventory",
-        sales: "/api/restaurant/sales",
+        inventory: "/api/restaurant/inventory"
       },
       rates: "/api/rates",
       swimming: "/api/swimming",
-      prediction: {
-        ping: "/api/prediction/ping",
-        tomorrowBookings: "/api/prediction/tomorrow-bookings",
-        forecastDaily: "/api/prediction/forecast/daily",
-        forecastWeekly: "/api/prediction/forecast/weekly",
-        forecastMonthly: "/api/prediction/forecast/monthly",
-        forecastYearly: "/api/prediction/forecast/yearly",
-      },
       pos: {
         items: "/api/pos/items",
-        transactions: "/api/pos/transactions",
+        transactions: "/api/pos/transactions"
       },
       bookings: {
         all: "/api/bookings",
         create: "/api/bookings",
         byId: "/api/bookings/:id",
         byReference: "/api/bookings/reference/:reference",
-        occupiedDates: "/api/bookings/occupied-dates",
+        occupiedDates: "/api/bookings/occupied-dates"
       },
       resort: {
         chatGroq: "/api/resort/chat/groq",
         chat: "/api/resort/chat",
-        stats: "/api/resort/stats",
-      },
+        stats: "/api/resort/stats"
+      }
     },
-    documentation: "Visit /api/{endpoint} to access resources",
+    documentation: "Visit /api/{endpoint} to access resources"
   });
 });
 
 // ============================================================
-// 404 HANDLER (para makita agad kapag mali endpoint)
+// SERVER STARTUP
 // ============================================================
-app.use((req, res) => {
-  res.status(404).json({
-    message: "Route not found",
-    method: req.method,
-    path: req.originalUrl,
-  });
-});
+/**
+ * Start listening on port 8000
+ * 
+ * Access points:
+ * - Local: http://localhost:8000
+ * - Network: http://{your-ip}:8000 (if network exposed)
+ * 
+ * To test:
+ * curl http://localhost:8000/api/rooms
+ */
+app.listen(8000, () => console.log("Server running at http://localhost:8000"));
 
-// ============================================================
-// START SERVER
-// ============================================================
-const server = app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
-
-// ✅ Keep-alive log (optional, pero helpful)
-setInterval(() => {
-  console.log("✅ Server still running...");
-}, 15000);
-
-// ✅ Graceful shutdown
-process.on("SIGINT", () => {
-  console.log("🛑 SIGINT received. Shutting down server...");
-  server.close(() => {
-    console.log("✅ Server closed.");
-    process.exit(0);
-  });
-});
+// npm run dev:all to run all backend and frontend servers concurrently

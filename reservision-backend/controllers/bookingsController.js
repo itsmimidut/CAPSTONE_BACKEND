@@ -24,6 +24,7 @@
 
 import db from "../config/db.js";
 import { sendBookingApprovalEmail } from "../services/emailService.js";
+import { getQRCodeByReference } from "../services/qrCodeService.js";
 
 /**
  * Generate unique booking reference
@@ -42,6 +43,55 @@ const generateBookingReference = async () => {
   const sequential = String(count).padStart(3, '0');
 
   return `BK${dateStr}${sequential}`;
+};
+
+// Simple in-memory cache for admin reservations list.
+// TTL is 60 seconds to reduce repeated DB reads while keeping data reasonably fresh.
+const RESERVATION_CACHE_TTL_MS = 60 * 1000;
+const reservationResponseCache = new Map();
+
+const buildReservationCacheKey = (query = {}) => {
+  const params = new URLSearchParams();
+
+  // Cache key includes page, limit, status, search, from, and to as required.
+  // Support both from/to and startDate/endDate to align frontend/backend param naming.
+  const from = query.from || query.startDate || '';
+  const to = query.to || query.endDate || '';
+
+  params.set('page', String(query.page ?? 1));
+  params.set('limit', String(query.limit ?? 15));
+  params.set('status', String(query.status ?? ''));
+  params.set('search', String(query.search ?? ''));
+  params.set('from', String(from));
+  params.set('to', String(to));
+
+  return `admin_reservations:${params.toString()}`;
+};
+
+const getCachedReservationResponse = (key) => {
+  const cached = reservationResponseCache.get(key);
+  if (!cached) {
+    return null; // Cache miss: no entry for this query key.
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    reservationResponseCache.delete(key); // TTL expired: remove stale entry.
+    return null;
+  }
+
+  return cached.payload; // Cache hit: return cached response payload.
+};
+
+const setCachedReservationResponse = (key, payload) => {
+  reservationResponseCache.set(key, {
+    payload,
+    expiresAt: Date.now() + RESERVATION_CACHE_TTL_MS // Cache set with 60-second TTL.
+  });
+};
+
+const invalidateReservationCache = () => {
+  // Invalidation: clear all reservation-related cache entries after any data mutation.
+  reservationResponseCache.clear();
 };
 
 /**
@@ -136,7 +186,7 @@ export const getBooking = async (req, res) => {
         c.country,
         c.postal_code
       FROM bookings b
-      LEFT JOIN customers c ON b.customer_id = c.customer_id
+      LEFT JOIN user c ON b.customer_id = c.user_id
       WHERE b.booking_id = ?`,
       [id]
     );
@@ -250,6 +300,37 @@ export const createBooking = async (req, res) => {
     // Generate booking reference
     const bookingReference = await generateBookingReference();
 
+    // --- AVAILABILITY CHECK ---
+    // For each per-night item with an inventory_item_id, ensure no occupied_dates exist
+    if (checkIn && checkOut && items && items.length) {
+      const startIso = new Date(checkIn).toISOString().slice(0, 10);
+      const endIso = new Date(checkOut).toISOString().slice(0, 10);
+
+      for (const item of items) {
+        if (item.item && item.item.perNight && item.item.item_id) {
+          const requestedQty = Number(item.qty || 1)
+          if (requestedQty > 1) {
+            throw new Error(`Quantity greater than 1 is not allowed for room/cottage inventory item "${item.item.name || item.item.item_id}".`)
+          }
+
+          // Query occupied_dates for any date in [checkIn, checkOut) for this inventory item
+          const [rows] = await connection.query(
+            `SELECT COUNT(*) as cnt FROM occupied_dates
+             WHERE inventory_item_id = ?
+             AND occupied_date >= ?
+             AND occupied_date < ?`,
+            [item.item.item_id, startIso, endIso]
+          );
+
+          const occupiedCount = rows[0].cnt || 0;
+
+          if (occupiedCount > 0) {
+            throw new Error(`Item \"${item.item.name || item.item.title || item.item.room_number || item.item.item_id}\" is not available for the selected dates (${startIso} to ${endIso}).`);
+          }
+        }
+      }
+    }
+
     // Insert booking
     const [bookingResult] = await connection.query(
       `INSERT INTO bookings (
@@ -335,7 +416,7 @@ export const createBooking = async (req, res) => {
         const end = new Date(checkOut);
 
         // Generate occupied dates for each day
-        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
           await connection.query(
             `INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date)
              VALUES (?, ?, ?)`,
@@ -366,6 +447,9 @@ export const createBooking = async (req, res) => {
     );
 
     newBooking[0].items = bookingItems;
+
+    // Invalidate reservation cache after create so listing endpoints return fresh data.
+    invalidateReservationCache();
 
     res.status(201).json({
       success: true,
@@ -514,6 +598,9 @@ export const updateBooking = async (req, res) => {
       console.log('- New status:', updates.booking_status);
     }
 
+    // Invalidate reservation cache after confirm/cancel/update mutations.
+    invalidateReservationCache();
+
     res.json({
       success: true,
       message: 'Booking updated successfully',
@@ -576,6 +663,9 @@ export const deleteBooking = async (req, res) => {
 
     await connection.commit();
 
+    // Invalidate reservation cache after delete/cancel mutation.
+    invalidateReservationCache();
+
     res.json({
       success: true,
       message: 'Booking cancelled successfully'
@@ -595,72 +685,12 @@ export const deleteBooking = async (req, res) => {
 };
 
 /**
- * GET /api/bookings/occupied-dates/:itemId
- * Get all occupied dates for a specific inventory item
- */
-export const getOccupiedDates = async (req, res) => {
-  try {
-    const { itemId } = req.params;
-
-    const [dates] = await db.query(
-      `SELECT DISTINCT occupied_date 
-       FROM occupied_dates 
-       WHERE inventory_item_id = ? 
-       AND occupied_date >= CURDATE()
-       ORDER BY occupied_date ASC`,
-      [itemId]
-    );
-
-    // Return array of date strings
-    const occupiedDates = dates.map(row => row.occupied_date);
-
-    res.json({
-      success: true,
-      data: occupiedDates
-    });
-  } catch (error) {
-    console.error('Error fetching occupied dates:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch occupied dates',
-      error: error.message
-    });
-  }
-};
-
-/**
- * GET /api/bookings/occupied-dates
- * Get all occupied dates across all items
- */
-export const getAllOccupiedDates = async (req, res) => {
-  try {
-    const [dates] = await db.query(
-      `SELECT inventory_item_id, occupied_date 
-       FROM occupied_dates 
-       WHERE occupied_date >= CURDATE()
-       ORDER BY occupied_date ASC`
-    );
-
-    res.json({
-      success: true,
-      count: dates.length,
-      data: dates
-    });
-  } catch (error) {
-    console.error('Error fetching all occupied dates:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch occupied dates',
-      error: error.message
-    });
-  }
-};
-
-/**
  * GET /api/bookings/admin/reservations
  * Get all reservations for admin management page
  * Includes customer details, booking items, and payment info
  */
+
+
 export const getAdminReservations = async (req, res) => {
   try {
     const {
@@ -671,6 +701,15 @@ export const getAdminReservations = async (req, res) => {
       page = 1,
       limit = 15
     } = req.query;
+
+    const cacheKey = buildReservationCacheKey(req.query);
+    const cachedPayload = getCachedReservationResponse(cacheKey);
+
+    if (cachedPayload) {
+      // Cache hit: return cached response with unchanged structure.
+      return res.json(cachedPayload);
+    }
+    // Cache miss: continue to fetch from DB and cache the computed response.
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
@@ -688,10 +727,10 @@ export const getAdminReservations = async (req, res) => {
         b.total,
         b.created_at,
         c.customer_id,
-        c.first_name,
-        c.last_name,
-        c.email,
-        c.phone,
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) as first_name,
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) as last_name,
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) as email,
+        COALESCE(NULLIF(TRIM(c.phone), ''), NULLIF(TRIM(u.phone), ''), NULLIF(TRIM(b.phone), '')) as phone,
         p.payment_reference,
         p.amount as payment_amount,
         GROUP_CONCAT(DISTINCT bi.item_name ORDER BY bi.item_name SEPARATOR ', ') as items_summary,
@@ -699,6 +738,7 @@ export const getAdminReservations = async (req, res) => {
         COUNT(DISTINCT bi.item_id) as item_count
       FROM bookings b
       LEFT JOIN customers c ON b.customer_id = c.customer_id
+      LEFT JOIN user u ON c.user_id = u.user_id
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id
       WHERE 1=1
@@ -715,9 +755,9 @@ export const getAdminReservations = async (req, res) => {
     // Search by guest name or email
     if (search) {
       query += ` AND (
-        c.first_name LIKE ? OR 
-        c.last_name LIKE ? OR 
-        c.email LIKE ? OR
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) LIKE ? OR
         b.booking_reference LIKE ?
       )`;
       const searchPattern = `%${search}%`;
@@ -750,6 +790,7 @@ export const getAdminReservations = async (req, res) => {
       SELECT COUNT(DISTINCT b.booking_id) as total
       FROM bookings b
       LEFT JOIN customers c ON b.customer_id = c.customer_id
+      LEFT JOIN user u ON c.user_id = u.user_id
       WHERE 1=1
     `;
 
@@ -762,9 +803,9 @@ export const getAdminReservations = async (req, res) => {
 
     if (search) {
       countQuery += ` AND (
-        c.first_name LIKE ? OR 
-        c.last_name LIKE ? OR 
-        c.email LIKE ? OR
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) LIKE ? OR
         b.booking_reference LIKE ?
       )`;
       const searchPattern = `%${search}%`;
@@ -785,7 +826,7 @@ export const getAdminReservations = async (req, res) => {
     const totalCount = countResult[0].total;
     const totalPages = Math.ceil(totalCount / parseInt(limit));
 
-    res.json({
+    const responsePayload = {
       success: true,
       data: reservations,
       pagination: {
@@ -794,13 +835,789 @@ export const getAdminReservations = async (req, res) => {
         totalCount,
         limit: parseInt(limit)
       }
-    });
+    };
+
+    // Cache set: store successful response for 60 seconds.
+    setCachedReservationResponse(cacheKey, responsePayload);
+
+    res.json(responsePayload);
   } catch (error) {
     console.error('Error fetching admin reservations:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch reservations',
       error: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/customer/:customerId/history
+ * Get all bookings for a specific customer with QR code data
+ * Used on customer dashboard / My Reservations page
+ */
+export const getCustomerBookingHistory = async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { status, limit = 20, page = 1 } = req.query;
+
+    if (!customerId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Customer ID is required'
+      });
+    }
+
+    // Get customer info
+    const [customers] = await db.query(
+      'SELECT * FROM customers WHERE customer_id = ?',
+      [customerId]
+    );
+
+    if (customers.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Customer not found'
+      });
+    }
+
+    const customerInfo = customers[0];
+
+    // Build query for bookings
+    let query = `
+      SELECT 
+        b.booking_id,
+        b.booking_reference,
+        b.check_in_date,
+        b.check_out_date,
+        b.adults,
+        b.children,
+        b.total,
+        b.booking_status,
+        b.created_at,
+        p.payment_reference,
+        p.payment_method,
+        p.status as payment_status,
+        p.paid_at
+      FROM bookings b
+      LEFT JOIN payments p ON b.booking_id = p.booking_id
+      WHERE b.customer_id = ?
+    `;
+
+    const params = [customerId];
+
+    // Optional status filter
+    if (status && status !== 'all') {
+      query += ` AND b.booking_status = ?`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY b.created_at DESC`;
+
+    // Add pagination
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query += ` LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), offset);
+
+    const [bookings] = await db.query(query, params);
+
+    // For each booking, get items and prepare QR data
+    const bookingsWithDetails = await Promise.all(
+      bookings.map(async (booking) => {
+        const [items] = await db.query(
+          'SELECT * FROM booking_items WHERE booking_id = ?',
+          [booking.booking_id]
+        );
+
+        // Generate QR data reference
+        const qrReference = `${booking.booking_reference}_${booking.booking_id}`;
+
+        return {
+          ...booking,
+          items: items.map(item => ({
+            item_name: item.item_name,
+            quantity: item.quantity,
+            item_type: item.item_type,
+            unit_price: item.unit_price,
+            total_price: item.total_price
+          })),
+          qrCode: {
+            reference: qrReference,
+            url: `/api/qr/${booking.booking_reference}` // Endpoint to get QR
+          }
+        };
+      })
+    );
+
+    // Get total count for pagination
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM bookings 
+      WHERE customer_id = ?
+    `;
+    const countParams = [customerId];
+
+    if (status && status !== 'all') {
+      countQuery += ` AND booking_status = ?`;
+      countParams.push(status);
+    }
+
+    const [countResult] = await db.query(countQuery, countParams);
+    const totalCount = countResult[0].total;
+    const totalPages = Math.ceil(totalCount / parseInt(limit));
+
+    res.json({
+      success: true,
+      data: {
+        customer: {
+          customer_id: customerInfo.customer_id,
+          name: `${customerInfo.first_name} ${customerInfo.last_name}`,
+          email: customerInfo.email,
+          phone: customerInfo.phone
+        },
+        bookings: bookingsWithDetails,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages,
+          totalCount,
+          limit: parseInt(limit)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching customer booking history:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch booking history',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/user/:userId/history
+ * Get all bookings for a logged-in customer by their user_id.
+ * Most reliable method — no email lookup needed.
+ */
+export const getBookingHistoryByUserId = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { status, limit = 50, page = 1 } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'User ID is required' });
+    }
+
+    // Get customer_id from customers table via user_id
+    const [customerRows] = await db.query(
+      `SELECT c.customer_id, u.first_name, u.last_name, u.email, u.phone
+       FROM user u
+       JOIN customers c ON c.user_id = u.user_id
+       WHERE u.user_id = ?
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (customerRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No customer profile found for this user'
+      });
+    }
+
+    const customerInfo = customerRows[0];
+    const customerId = customerInfo.customer_id;
+
+    // Build bookings query
+    let query = `
+      SELECT
+        b.booking_id,
+        b.booking_reference,
+        b.check_in_date,
+        b.check_out_date,
+        b.adults,
+        b.children,
+        b.total,
+        b.booking_status,
+        b.created_at,
+        p.payment_reference,
+        p.payment_method,
+        p.status as payment_status,
+        p.paid_at
+      FROM bookings b
+      LEFT JOIN payments p ON b.booking_id = p.booking_id
+      WHERE b.customer_id = ?
+    `;
+    const params = [customerId];
+
+    if (status && status !== 'all') {
+      query += ` AND b.booking_status = ?`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY b.created_at DESC`;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query += ` LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), offset);
+
+    const [bookings] = await db.query(query, params);
+
+    const bookingsWithDetails = await Promise.all(
+      bookings.map(async (booking) => {
+        const [items] = await db.query(
+          'SELECT * FROM booking_items WHERE booking_id = ?',
+          [booking.booking_id]
+        );
+        return {
+          ...booking,
+          items: items.map(item => ({
+            item_name: item.item_name,
+            quantity: item.quantity,
+            item_type: item.item_type,
+            unit_price: item.unit_price,
+            total_price: item.total_price
+          })),
+          qrCode: { reference: booking.booking_reference }
+        };
+      })
+    );
+
+    let countQuery = `SELECT COUNT(*) as total FROM bookings WHERE customer_id = ?`;
+    const countParams = [customerId];
+    if (status && status !== 'all') {
+      countQuery += ` AND booking_status = ?`;
+      countParams.push(status);
+    }
+    const [countResult] = await db.query(countQuery, countParams);
+    const totalCount = countResult[0].total;
+
+    res.json({
+      success: true,
+      data: {
+        customer: {
+          customer_id: customerId,
+          name: `${customerInfo.first_name} ${customerInfo.last_name}`,
+          email: customerInfo.email,
+          phone: customerInfo.phone
+        },
+        bookings: bookingsWithDetails,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(totalCount / parseInt(limit)),
+          totalCount,
+          limit: parseInt(limit)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching booking history by userId:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch booking history',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/email/:email/history
+ * Get all bookings for a specific email address
+ * Used when booking by email instead of customer_id
+ */
+export const getBookingHistoryByEmail = async (req, res) => {
+  try {
+    const { email } = req.params;
+    const { status, limit = 20, page = 1 } = req.query;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is required'
+      });
+    }
+
+    // Two kinds of customer records exist in the DB:
+    //   NEW: customer row has user_id set; name/email/phone live in `user` table
+    //   OLD: customer row has user_id=NULL; name/email/phone stored directly in `customers`
+    // We need to find customer_ids from BOTH so no bookings are missed.
+
+    // --- NEW style: email in user table, linked via user_id ---
+    const [newStyleRows] = await db.query(
+      `SELECT c.customer_id, u.first_name, u.last_name, u.email, u.phone
+       FROM user u
+       JOIN customers c ON c.user_id = u.user_id
+       WHERE u.email = ?`,
+      [email]
+    );
+
+    // --- OLD style: email stored directly in customers (user_id IS NULL) ---
+    const [oldStyleRows] = await db.query(
+      `SELECT c.customer_id, c.first_name, c.last_name, c.email, c.phone
+       FROM customers c
+       WHERE c.email = ? AND c.user_id IS NULL`,
+      [email]
+    );
+
+    const allRows = [...newStyleRows, ...oldStyleRows];
+
+    if (allRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No customer found with this email'
+      });
+    }
+
+    // Use the first row for customer info display; collect all customer_ids for booking lookup
+    const customerInfo = allRows[0];
+    const customerIds = [...new Set(allRows.map(r => r.customer_id))];
+
+    // Build IN clause — handles both old-style (email in customers) and
+    // new-style (email in user, linked via user_id) records
+    const placeholders = customerIds.map(() => '?').join(', ');
+    let query = `
+      SELECT 
+        b.booking_id,
+        b.booking_reference,
+        b.check_in_date,
+        b.check_out_date,
+        b.adults,
+        b.children,
+        b.total,
+        b.booking_status,
+        b.created_at,
+        p.payment_reference,
+        p.payment_method,
+        p.status as payment_status,
+        p.paid_at
+      FROM bookings b
+      LEFT JOIN payments p ON b.booking_id = p.booking_id
+      WHERE b.customer_id IN (${placeholders})
+    `;
+    const params = [...customerIds];
+
+    // Optional status filter
+    if (status && status !== 'all') {
+      query += ` AND b.booking_status = ?`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY b.created_at DESC`;
+
+    // Add pagination
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query += ` LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), offset);
+
+    const [bookings] = await db.query(query, params);
+
+    // For each booking, get items
+    const bookingsWithDetails = await Promise.all(
+      bookings.map(async (booking) => {
+        const [items] = await db.query(
+          'SELECT * FROM booking_items WHERE booking_id = ?',
+          [booking.booking_id]
+        );
+
+        return {
+          ...booking,
+          items: items.map(item => ({
+            item_name: item.item_name,
+            quantity: item.quantity,
+            item_type: item.item_type,
+            unit_price: item.unit_price,
+            total_price: item.total_price
+          })),
+          qrCode: {
+            reference: booking.booking_reference,
+            url: `/api/qr/${booking.booking_reference}`
+          }
+        };
+      })
+    );
+
+    // Get total count for pagination
+    const countPlaceholders = customerIds.map(() => '?').join(', ');
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM bookings 
+      WHERE customer_id IN (${countPlaceholders})
+    `;
+    const countParams = [...customerIds];
+
+    if (status && status !== 'all') {
+      countQuery += ` AND booking_status = ?`;
+      countParams.push(status);
+    }
+
+    const [countResult] = await db.query(countQuery, countParams);
+    const totalCount = countResult[0].total;
+    const totalPages = Math.ceil(totalCount / parseInt(limit));
+
+    res.json({
+      success: true,
+      data: {
+        customer: {
+          customer_id: customerInfo.customer_id,
+          name: `${customerInfo.first_name} ${customerInfo.last_name}`,
+          email: customerInfo.email,
+          phone: customerInfo.phone
+        },
+        bookings: bookingsWithDetails,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages,
+          totalCount,
+          limit: parseInt(limit)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching booking history by email:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch booking history',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/qr/:bookingReference
+ * Get QR code for a booking
+ */
+export const getBookingQRCode = async (req, res) => {
+  try {
+    const { bookingReference } = req.params;
+
+    if (!bookingReference) {
+      return res.status(400).json({
+        success: false,
+        error: 'Booking reference is required'
+      });
+    }
+
+    // Get QR code
+    const qrCodeBase64 = await getQRCodeByReference(bookingReference);
+
+    if (!qrCodeBase64) {
+      return res.status(404).json({
+        success: false,
+        error: 'QR code not found for this booking'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        bookingReference,
+        qrCode: qrCodeBase64
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching QR code:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch QR code',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/occupied-dates/:itemId
+ * Get all occupied dates for a specific room/item from bookings table
+ * Now queries the bookings table directly instead of occupied_dates
+ */
+export const getOccupiedDates = async (req, res) => {
+  try {
+    const { itemId } = req.params;
+
+    if (!itemId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Item ID is required'
+      });
+    }
+
+    // 🔍 Query bookings table for all confirmed/paid bookings with this item
+    const [bookings] = await db.query(
+      `SELECT DISTINCT 
+        b.booking_id,
+        b.booking_reference,
+        b.check_in_date,
+        b.check_out_date,
+        b.booking_status,
+        b.payment_status
+       FROM bookings b
+       INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
+       WHERE bi.inventory_item_id = ?
+       AND b.booking_status IN ('Confirmed', 'Pending')
+      AND b.payment_status IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
+       AND b.check_in_date IS NOT NULL
+       AND b.check_out_date IS NOT NULL
+       ORDER BY b.check_in_date ASC`,
+      [itemId]
+    );
+
+    // Convert booking date ranges into individual dates
+    const occupiedDates = [];
+    bookings.forEach(booking => {
+      const start = new Date(booking.check_in_date);
+      const end = new Date(booking.check_out_date);
+
+      // Create entry for each date from check-in (exclusive of check-out)
+      for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
+        const year = d.getFullYear()
+        const month = String(d.getMonth() + 1).padStart(2, '0')
+        const day = String(d.getDate()).padStart(2, '0')
+        occupiedDates.push({
+          date: `${year}-${month}-${day}`,
+          bookingReference: booking.booking_reference,
+          inventoryItemId: itemId,
+          status: booking.payment_status === 'Paid' ? 'confirmed' : 'pending'
+        });
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        itemId,
+        occupiedDates,
+        totalCount: occupiedDates.length,
+        bookingsAffecting: bookings.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching occupied dates:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch occupied dates',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/occupied-dates
+ * Get all occupied dates across all items (no filter)
+ */
+export const getAllOccupiedDates = async (req, res) => {
+  try {
+    // Query all confirmed/paid bookings with complete date ranges
+    const [bookings] = await db.query(
+      `SELECT DISTINCT 
+        b.booking_id,
+        b.booking_reference,
+        b.check_in_date,
+        b.check_out_date,
+        b.booking_status,
+        b.payment_status,
+        bi.inventory_item_id
+       FROM bookings b
+       INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
+       WHERE b.booking_status IN ('Confirmed', 'Pending')
+      AND b.payment_status IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
+       AND b.check_in_date IS NOT NULL
+       AND b.check_out_date IS NOT NULL
+       ORDER BY b.check_in_date ASC`
+    );
+
+    // Convert all booking date ranges into individual date entries
+    const occupiedDates = [];
+    bookings.forEach(booking => {
+      const start = new Date(booking.check_in_date);
+      const end = new Date(booking.check_out_date);
+
+      for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
+        const year = d.getFullYear()
+        const month = String(d.getMonth() + 1).padStart(2, '0')
+        const day = String(d.getDate()).padStart(2, '0')
+        occupiedDates.push({
+          date: `${year}-${month}-${day}`,
+          bookingReference: booking.booking_reference,
+          inventoryItemId: booking.inventory_item_id,
+          status: booking.payment_status === 'Paid' ? 'confirmed' : 'pending'
+        });
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        occupiedDates,
+        totalCount: occupiedDates.length,
+        bookingsAffecting: bookings.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching all occupied dates:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch occupied dates',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * GET /api/bookings/validate/:bookingReference
+ * Validate booking and return details for check-in
+ */
+export const validateBookingForCheckIn = async (req, res) => {
+  try {
+    const { bookingReference } = req.params;
+
+    if (!bookingReference) {
+      return res.status(400).json({
+        success: false,
+        error: 'Booking reference is required'
+      });
+    }
+
+    // Query booking details
+    const [bookings] = await db.query(
+      `SELECT 
+        b.booking_id as id,
+        b.booking_reference,
+        b.first_name,
+        b.last_name,
+        b.email,
+        b.phone,
+        b.check_in_date,
+        b.check_out_date,
+        b.booking_status,
+        b.payment_status,
+        CONCAT('[', GROUP_CONCAT(
+          JSON_OBJECT(
+            'item_id', bi.inventory_item_id,
+            'item_name', ii.name,
+            'qty', bi.quantity
+          )
+        ), ']') as items_list
+       FROM bookings b
+       LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id
+       LEFT JOIN inventory_items ii ON bi.inventory_item_id = ii.item_id
+       WHERE b.booking_reference = ?
+       GROUP BY b.booking_id`,
+      [bookingReference]
+    );
+
+    if (!bookings || bookings.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    const booking = bookings[0];
+
+    // Parse items list
+    let itemsList = [];
+    if (booking.items_list) {
+      try {
+        itemsList = JSON.parse(booking.items_list);
+      } catch (e) {
+        itemsList = [];
+      }
+    }
+
+    // Check if already checked in
+    if (booking.booking_status === 'Checked-in') {
+      return res.status(400).json({
+        success: false,
+        error: 'Guest has already checked in'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...booking,
+        items_list: itemsList
+      }
+    });
+
+  } catch (error) {
+    console.error('Error validating booking:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to validate booking',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * POST /api/bookings/:bookingId/check-in
+ * Process guest check-in
+ */
+export const processCheckIn = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { checked_in_by, checked_in_time } = req.body;
+
+    if (!bookingId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Booking ID is required'
+      });
+    }
+
+    // Verify booking exists
+    const [existingBooking] = await db.query(
+      'SELECT * FROM bookings WHERE booking_id = ?',
+      [bookingId]
+    );
+
+    if (!existingBooking || existingBooking.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    // Update booking status to Checked-In
+    // Note: ENUM value must match exactly: 'Checked-In' (with hyphen)
+    const [result] = await db.query(
+      `UPDATE bookings 
+       SET 
+        booking_status = 'Checked-In'
+       WHERE booking_id = ?`,
+      [bookingId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Failed to update booking status'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Guest checked in successfully',
+      data: {
+        booking_id: bookingId,
+        status: 'Checked-In',
+        checked_in_by: checked_in_by || 'admin',
+        checked_in_time: checked_in_time || new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Error processing check-in:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process check-in',
+      details: error.message
     });
   }
 };

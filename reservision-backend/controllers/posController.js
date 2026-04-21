@@ -20,17 +20,77 @@
 
 import { db } from '../config/db.js';
 
+const parseJsonArray = (value) => {
+    if (Array.isArray(value)) return value;
+    if (value === null || value === undefined || value === '') return [];
+    if (typeof value === 'string') {
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
+};
+
+const normalizeSizeOption = (size, index) => {
+    const rawLabel = size?.label ?? size?.name ?? size?.size ?? `Option ${index + 1}`;
+    const rawDelta = size?.priceDelta ?? size?.price ?? size?.additionalPrice ?? 0;
+    return {
+        id: String(size?.id ?? rawLabel ?? `size-${index + 1}`)
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '-'),
+        label: String(rawLabel || `Option ${index + 1}`).trim(),
+        priceDelta: Number(rawDelta || 0)
+    };
+};
+
+const normalizeAddOnOption = (addon, index) => {
+    const rawName = addon?.name ?? addon?.label ?? addon?.title ?? `Add-on ${index + 1}`;
+    const rawPrice = addon?.price ?? addon?.amount ?? addon?.additionalPrice ?? 0;
+    return {
+        id: String(addon?.id ?? rawName ?? `addon-${index + 1}`)
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '-'),
+        name: String(rawName || `Add-on ${index + 1}`).trim(),
+        price: Number(rawPrice || 0)
+    };
+};
+
 const mapRestaurantItems = (rows) => rows.map(item => ({
     category: 'restaurant',
     name: item.name,
     price: parseFloat(item.price),
     description: item.description || 'Uncategorized',
+    sizes: parseJsonArray(item.sizes).map((size, index) => normalizeSizeOption(size, index)),
+    addons: parseJsonArray(item.addons).map((addon, index) => normalizeAddOnOption(addon, index)),
     available: 1
 }));
 
 const fetchRestaurantItems = async () => {
+    const [columnRows] = await db.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'menu_items'
+           AND COLUMN_NAME IN ('sizes', 'addons')`
+    );
+
+    const columnSet = new Set(columnRows.map(row => row.COLUMN_NAME));
+    const selectColumns = [
+        'name',
+        'price',
+        "COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description"
+    ];
+
+    if (columnSet.has('sizes')) selectColumns.push('sizes');
+    if (columnSet.has('addons')) selectColumns.push('addons');
+
     const [menuItems] = await db.query(
-        `SELECT name, price, COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description
+        `SELECT ${selectColumns.join(', ')}
          FROM menu_items
          WHERE available = 1
          ORDER BY name`
@@ -133,14 +193,24 @@ export const createTransaction = async (req, res) => {
             receipt_no,
             payment_method,
             total_amount,
+            cash_received,
+            cashReceived,
+            paid_amount,
+            paidAmount,
+            change_amount,
+            changeAmount,
             transaction_date,
             transaction_time
         } = req.body;
 
         const normalizedReceiptNo = receiptNo ?? receipt_no;
         const normalizedItems = items;
+        const normalizedType = type ?? 'Walk-in';
         const normalizedPayment = payment ?? payment_method;
         const normalizedTotal = total ?? total_amount;
+        const normalizedPaidAmount =
+            cash_received ?? cashReceived ?? paid_amount ?? paidAmount ?? normalizedTotal;
+        const normalizedChangeAmount = change_amount ?? changeAmount ?? 0;
         const normalizedDate = date ?? transaction_date;
         const normalizedTime = time ?? transaction_time;
 
@@ -199,19 +269,77 @@ export const createTransaction = async (req, res) => {
         // Convert items array to JSON string for storage
         const itemsJson = JSON.stringify(normalizedItems);
 
-        const [result] = await connection.query(
-            `INSERT INTO pos_transactions 
-            (receipt_no, items, payment_method, total_amount, transaction_date, transaction_time) 
-            VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-                normalizedReceiptNo,
-                itemsJson,
-                normalizedPayment,
-                normalizedTotal,
-                normalizedDate,
-                normalizedTime
-            ]
+        const [columnRows] = await connection.query(
+            `SELECT COLUMN_NAME
+             FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pos_transactions'`
         );
+        const columnSet = new Set(columnRows.map(row => row.COLUMN_NAME));
+
+        const insertColumns = [
+            'receipt_no',
+            'items',
+            'payment_method',
+            'total_amount',
+            'transaction_date',
+            'transaction_time'
+        ];
+        const insertValues = [
+            normalizedReceiptNo,
+            itemsJson,
+            normalizedPayment,
+            normalizedTotal,
+            normalizedDate,
+            normalizedTime
+        ];
+
+        if (columnSet.has('type')) {
+            insertColumns.push('type');
+            insertValues.push(normalizedType);
+        }
+        if (columnSet.has('cash_received')) {
+            insertColumns.push('cash_received');
+            insertValues.push(normalizedPaidAmount);
+        }
+        if (columnSet.has('change_amount')) {
+            insertColumns.push('change_amount');
+            insertValues.push(normalizedChangeAmount);
+        }
+
+        const placeholders = insertColumns.map(() => '?').join(', ');
+        const [result] = await connection.query(
+            `INSERT INTO pos_transactions (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+            insertValues
+        );
+
+        const [detailTableRows] = await connection.query(
+            `SELECT COUNT(*) AS total
+             FROM INFORMATION_SCHEMA.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pos_transaction_items'`
+        );
+
+        if (detailTableRows[0]?.total > 0) {
+            for (const item of normalizedItems) {
+                const quantity = Number(item.quantity ?? item.qty ?? 1);
+                const lineTotal = Number(item.price ?? 0);
+                const unitPrice = Number(item.unitPrice ?? (quantity > 0 ? lineTotal / quantity : lineTotal));
+
+                await connection.query(
+                    `INSERT INTO pos_transaction_items
+                    (transaction_id, receipt_no, item_name, quantity, unit_price, line_total, booking_reference)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        result.insertId,
+                        normalizedReceiptNo,
+                        item.name ?? null,
+                        quantity,
+                        unitPrice,
+                        lineTotal,
+                        item.bookingReference ?? null
+                    ]
+                );
+            }
+        }
 
         // Commit the transaction
         await connection.commit();
@@ -679,5 +807,149 @@ export const getItemsByCategory = async (req, res) => {
     } catch (error) {
         console.error('Error fetching items by category:', error);
         res.status(500).json({ error: 'Failed to fetch items' });
+    }
+};
+
+// ============================================================
+// THERMAL PRINTER ENDPOINTS
+// ============================================================
+
+/**
+ * Handler: POST /api/pos/print/booking
+ * 
+ * Purpose: Print a booking receipt directly to USB thermal printer
+ * Request Body: Receipt data (guest name, dates, total, etc.)
+ * Response: Print status
+ */
+export const printBookingReceipt = async (req, res) => {
+    try {
+        const { printBookingReceipt: printBooking } = await import('../services/printerService.js');
+        const receiptData = req.body;
+
+        // Validate required fields
+        if (!receiptData.receiptNo || !receiptData.guestName || !receiptData.total) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required receipt data'
+            });
+        }
+
+        // Send to printer
+        const result = await printBooking(receiptData);
+
+        if (result.success) {
+            res.json({
+                success: true,
+                message: 'Booking receipt printed successfully',
+                receiptNo: result.receiptNo
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                message: result.message || 'Failed to print receipt',
+                error: result.error
+            });
+        }
+
+    } catch (error) {
+        console.error('Printer service error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Printer service error',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Handler: POST /api/pos/print/regular
+ * 
+ * Purpose: Print a regular POS receipt directly to USB thermal printer
+ * Request Body: Receipt data (items, total, payment method)
+ * Response: Print status
+ */
+export const printRegularReceipt = async (req, res) => {
+    try {
+        const { printRegularReceipt: printRegular } = await import('../services/printerService.js');
+        const receiptData = req.body;
+
+        // Validate required fields
+        if (!receiptData.receiptNo || !receiptData.items || !receiptData.total) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required receipt data'
+            });
+        }
+
+        // Send to printer
+        const result = await printRegular(receiptData);
+
+        if (result.success) {
+            res.json({
+                success: true,
+                message: 'Receipt printed successfully',
+                receiptNo: result.receiptNo
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                message: result.message || 'Failed to print receipt',
+                error: result.error
+            });
+        }
+
+    } catch (error) {
+        console.error('Printer service error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Printer service error',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Handler: GET /api/pos/printer/test
+ * 
+ * Purpose: Test if thermal printer is connected and ready
+ * Response: Connection status
+ */
+export const testPrinter = async (req, res) => {
+    try {
+        const { testPrinterConnection } = await import('../services/printerService.js');
+        const result = await testPrinterConnection();
+
+        res.json(result);
+
+    } catch (error) {
+        console.error('Printer test error:', error);
+        res.status(500).json({
+            connected: false,
+            message: 'Printer test failed',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Handler: GET /api/pos/printer/queue
+ * 
+ * Purpose: Get list of pending print jobs in queue
+ * Response: Array of pending print files
+ */
+export const getPrintJobsQueue = async (req, res) => {
+    try {
+        const { getPendingPrintJobs } = await import('../services/printerService.js');
+        const result = await getPendingPrintJobs();
+
+        res.json(result);
+
+    } catch (error) {
+        console.error('Print queue error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get print queue',
+            error: error.message
+        });
     }
 };

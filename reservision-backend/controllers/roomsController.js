@@ -31,6 +31,37 @@
  */
 
 import { db } from "../config/db.js";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ensure uploads directory exists
+const uploadDir = path.join(__dirname, "..", "public", "uploads", "rooms");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    cb(null, unique + path.extname(file.originalname));
+  }
+});
+
+export const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error(`Invalid file type: ${file.mimetype}`));
+  }
+});
 
 // ============================================================
 // GET ALL ROOMS/COTTAGES/EVENTS
@@ -138,14 +169,22 @@ export const getRoom = async (req, res) => {
  * - Database connection error → 500 error
  */
 export const createRoom = async (req, res) => {
-  const { category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity } = req.body;
-  const [result] = await db.query(
-    `INSERT INTO inventory_items
-      (category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(images || []), primaryImageIndex || 0, quantity || 1]
-  );
-  res.json({ success: true, id: result.insertId });
+  try {
+    const { category, category_type, room_number, name, description, max_guests, price, status, promo, primaryImageIndex, quantity, existingImages } = req.body;
+    const newPaths = (req.files || []).map(f => `/uploads/rooms/${f.filename}`);
+    const kept = existingImages ? JSON.parse(existingImages) : [];
+    const allImages = [...kept, ...newPaths];
+    const [result] = await db.query(
+      `INSERT INTO inventory_items
+        (category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(allImages), primaryImageIndex || 0, quantity || 1]
+    );
+    res.json({ success: true, id: result.insertId });
+  } catch (error) {
+    console.error("Error creating room:", error);
+    res.status(500).json({ error: error.message });
+  }
 };
 
 // ============================================================
@@ -182,14 +221,22 @@ export const createRoom = async (req, res) => {
  * - Frontend should verify room exists before allowing edit
  */
 export const updateRoom = async (req, res) => {
-  const { category, category_type, room_number, name, description, max_guests, price, status, promo, images, primaryImageIndex, quantity } = req.body;
-  await db.query(
-    `UPDATE inventory_items SET
-       category=?, category_type=?, room_number=?, name=?, description=?, max_guests=?, price=?, status=?, promo=?, images=?, primaryImageIndex=?, quantity=?
-     WHERE item_id=?`,
-    [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(images || []), primaryImageIndex || 0, quantity || 1, req.params.id]
-  );
-  res.json({ success: true });
+  try {
+    const { category, category_type, room_number, name, description, max_guests, price, status, promo, primaryImageIndex, quantity, existingImages } = req.body;
+    const newPaths = (req.files || []).map(f => `/uploads/rooms/${f.filename}`);
+    const kept = existingImages ? JSON.parse(existingImages) : [];
+    const allImages = [...kept, ...newPaths];
+    await db.query(
+      `UPDATE inventory_items SET
+         category=?, category_type=?, room_number=?, name=?, description=?, max_guests=?, price=?, status=?, promo=?, images=?, primaryImageIndex=?, quantity=?
+       WHERE item_id=?`,
+      [category, category_type, room_number, name, description, max_guests, price, status, promo, JSON.stringify(allImages), primaryImageIndex || 0, quantity || 1, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error updating room:", error);
+    res.status(500).json({ error: error.message });
+  }
 };
 
 // ============================================================

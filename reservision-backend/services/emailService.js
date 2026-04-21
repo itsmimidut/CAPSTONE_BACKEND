@@ -477,8 +477,183 @@ export async function sendBookingApprovalEmail(email, bookingData) {
   }
 }
 
+/**
+ * Send Booking Confirmation Email with QR Code
+ * @param {Object} bookingData - Complete booking information
+ * @param {string} qrCodeBase64 - Base64 encoded QR code image
+ */
+export async function sendBookingConfirmationWithQR(bookingData, qrCodeBase64) {
+  const resendClient = getResendClient();
+
+  if (!resendClient) {
+    throw new Error('Resend API key not configured');
+  }
+
+  const {
+    email,
+    firstName,
+    lastName,
+    bookingReference,
+    checkIn,
+    checkOut,
+    items,
+    total
+  } = bookingData;
+
+  const formatDate = (date) => new Date(date).toLocaleDateString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  });
+
+  const itemsList = items.map(item => `
+    <tr>
+      <td style="padding: 12px; border-bottom: 1px solid #E2E8F0;">
+        <strong style="color: #2D3748;">${item.name}</strong><br>
+        <span style="color: #718096; font-size: 13px;">Qty: ${item.qty} | Guests: ${item.guests}</span>
+      </td>
+      <td style="padding: 12px; border-bottom: 1px solid #E2E8F0; text-align: right; color: #2D3748; font-weight: 600;">
+        ₱${(item.price * item.qty).toLocaleString()}
+      </td>
+    </tr>
+  `).join('');
+
+  const qrCodeSection = qrCodeBase64 ? `
+          <!-- QR Code Section -->
+          <tr>
+            <td style="padding: 0 30px 30px; text-align: center;">
+              <div style="background: linear-gradient(135deg, #F0F9FF 0%, #E0F2FE 100%); border-radius: 12px; padding: 24px; border: 2px solid #0EA5E9;">
+                <h3 style="margin: 0 0 16px; color: #0369A1; font-size: 16px; font-weight: 600;">📱 Your Booking QR Code</h3>
+                <img src="${qrCodeBase64}" alt="Booking QR Code" style="width: 220px; height: 220px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);" />
+                <p style="margin: 12px 0 0; color: #0369A1; font-size: 12px; line-height: 1.6;">
+                  <strong>📷 Save or screenshot this QR code</strong><br>
+                  Show this at check-in or scan to view your booking details
+                </p>
+              </div>
+            </td>
+          </tr>
+  ` : '';
+
+  const htmlContent = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Booking Confirmation</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f3f4f6;">
+  <table role="presentation" style="width: 100%; border-collapse: collapse;">
+    <tr>
+      <td align="center" style="padding: 40px 20px;">
+        <table role="presentation" style="width: 100%; max-width: 600px; background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+          
+          <!-- Success Badge -->
+          <tr>
+            <td style="text-align: center; padding: 30px 30px 0;">
+              <div style="width: 80px; height: 80px; margin: 0 auto; background: linear-gradient(135deg, #10B981 0%, #059669 100%); border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                <span style="font-size: 40px;">✓</span>
+              </div>
+            </td>
+          </tr>
+          
+          <!-- Header -->
+          <tr>
+            <td style="padding: 24px 30px 40px; text-align: center;">
+              <h1 style="margin: 0 0 8px; color: #1a202c; font-size: 32px; font-weight: 700;">Booking Confirmed!</h1>
+              <p style="margin: 0; color: #10B981; font-size: 16px; font-weight: 600;">Reference: ${bookingReference}</p>
+            </td>
+          </tr>
+          
+          <!-- Guest Info -->
+          <tr>
+            <td style="padding: 0 30px 30px;">
+              <div style="background: linear-gradient(135deg, #EBF4FF 0%, #E0F2FE 100%); border-radius: 12px; padding: 24px;">
+                <p style="margin: 0 0 12px; color: #4a5568; font-size: 14px;">
+                  <strong>👤 Guest Name:</strong> ${firstName} ${lastName}
+                </p>
+                <p style="margin: 0 0 12px; color: #4a5568; font-size: 14px;">
+                  <strong>📅 Check-in:</strong> ${checkIn ? formatDate(checkIn) : 'N/A'}
+                </p>
+                <p style="margin: 0; color: #4a5568; font-size: 14px;">
+                  <strong>📅 Check-out:</strong> ${checkOut ? formatDate(checkOut) : 'N/A'}
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          ${qrCodeSection}
+          
+          <!-- Booking Items -->
+          <tr>
+            <td style="padding: 0 30px 30px;">
+              <h3 style="margin: 0 0 16px; color: #1a202c; font-size: 18px;">📋 Booking Details</h3>
+              <table style="width: 100%; border-collapse: collapse; background-color: #F7FAFC; border-radius: 8px; overflow: hidden;">
+                ${itemsList}
+                <tr>
+                  <td style="padding: 16px; text-align: right; font-weight: 700; color: #2B6CB0; font-size: 18px;" colspan="2">
+                    Total: ₱${total.toLocaleString()}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          
+          <!-- Important Info -->
+          <tr>
+            <td style="padding: 0 30px 30px;">
+              <div style="background-color: #FFF7ED; border-left: 4px solid #F59E0B; padding: 16px; border-radius: 8px;">
+                <p style="margin: 0 0 8px; color: #92400E; font-weight: 600;">✨ Important Information</p>
+                <ul style="margin: 0; padding-left: 20px; color: #92400E; font-size: 14px; line-height: 1.8;">
+                  <li>Complete your payment to finalize the reservation</li>
+                  <li>Standard check-in: 2:00 PM | Check-out: 12:00 PM</li>
+                  <li>Cancellation allowed up to 24 hours before arrival</li>
+                  <li>Bring a valid ID for check-in</li>
+                </ul>
+              </div>
+            </td>
+          </tr>
+          
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #F7FAFC; padding: 30px; border-radius: 0 0 16px 16px; border-top: 1px solid #E2E8F0;">
+              <p style="margin: 0 0 12px; color: #718096; font-size: 13px; text-align: center;">
+                Questions? Contact us at <a href="mailto:support@eduardos.com" style="color: #2B6CB0; text-decoration: none;">support@eduardos.com</a>
+              </p>
+              <p style="margin: 0; color: #A0AEC0; font-size: 12px; text-align: center;">
+                © 2026 Eduardo's Resort. All rights reserved.
+              </p>
+            </td>
+          </tr>
+          
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+  `;
+
+  try {
+    const result = await resendClient.emails.send({
+      from: "Eduardo's Resort <bookings@resend.dev>",
+      to: email,
+      subject: `🎉 Booking Confirmed - ${bookingReference}`,
+      html: htmlContent
+    });
+
+    console.log(`✅ Booking confirmation email with QR sent to ${email}`);
+    return result;
+  } catch (error) {
+    console.error('Error sending booking confirmation email with QR:', error);
+    throw error;
+  }
+}
+
 export default {
   sendOTPEmail,
   sendBookingConfirmationEmail,
+  sendBookingConfirmationWithQR,
   sendBookingApprovalEmail
 };

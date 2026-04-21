@@ -1,0 +1,24 @@
+               ReserVision
+
+               POS Receipt
+
+Receipt: POS-ESHOP-20260421-4960
+
+04/20/2026 13:59:29
+------------------------------------------
+Flat White
+1 x PHP 150.00                  PHP 150.00
+
+      also the qr code to be scanned
+               if not Cash
+------------------------------------------
+TOTAL                           PHP 450.00
+------------------------------------------
+Cash on Delivery:               PHP 450.00
+
+Paid Amount:                    PHP 450.00
+Change:                           PHP 0.00
+
+                Thank you!
+
+

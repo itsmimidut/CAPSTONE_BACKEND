@@ -1,0 +1,21 @@
+               ReserVision
+
+               POS Receipt
+
+Receipt: POS-202602271885
+
+03/01/2026 20:34:02
+------------------------------------------
+Caramel Mocha Frappe
+1 x PHP 180.00                  PHP 180.00
+------------------------------------------
+TOTAL                           PHP 180.00
+------------------------------------------
+Cash:                           PHP 180.00
+
+Paid Amount:                    PHP 180.00
+Change:                           PHP 0.00
+
+                Thank you!
+
+
