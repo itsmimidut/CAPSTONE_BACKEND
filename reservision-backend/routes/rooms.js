@@ -1,5 +1,5 @@
 import express from "express";
-import { getRooms, getRoom, createRoom, updateRoom, deleteRoom, upload } from "../controllers/roomsController.js";
+import { getRooms, getRoom, createRoom, updateRoom, deleteRoom, upload, getGroupedRooms } from "../controllers/roomsController.js";
 
 const router = express.Router();
 
@@ -15,6 +15,7 @@ const handleUpload = (req, res, next) => {
 };
 
 router.get("/", getRooms);
+router.get("/grouped", getGroupedRooms);
 router.get("/:id", getRoom);
 router.post("/", handleUpload, createRoom);
 router.put("/:id", handleUpload, updateRoom);

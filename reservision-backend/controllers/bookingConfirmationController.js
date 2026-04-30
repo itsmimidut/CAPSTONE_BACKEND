@@ -54,6 +54,32 @@ export const createBookingConfirmation = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Check-in and check-out dates are required' });
     }
 
+    // Validate and normalize dates to ISO format (YYYY-MM-DD)
+    let normalizedCheckIn = checkIn;
+    let normalizedCheckOut = checkOut;
+
+    if (!isSwimmingOnly && checkIn && checkOut) {
+      try {
+        // Parse the date and ensure it's in YYYY-MM-DD format
+        const checkInDate = new Date(checkIn);
+        const checkOutDate = new Date(checkOut);
+
+        if (isNaN(checkInDate.getTime()) || isNaN(checkOutDate.getTime())) {
+          throw new Error('Invalid date format');
+        }
+
+        // Convert to YYYY-MM-DD format for MySQL
+        normalizedCheckIn = checkInDate.toISOString().split('T')[0];
+        normalizedCheckOut = checkOutDate.toISOString().split('T')[0];
+
+        console.log(`📅 Normalized dates - Check-in: ${normalizedCheckIn}, Check-out: ${normalizedCheckOut}`);
+      } catch (err) {
+        console.error(`❌ Date parsing error: ${err.message}`);
+        await connection.rollback();
+        return res.status(400).json({ success: false, error: 'Invalid date format. Please use YYYY-MM-DD format.' });
+      }
+    }
+
     if (!items || items.length === 0) {
       await connection.rollback();
       return res.status(400).json({ success: false, error: 'At least one booking item is required' });
@@ -169,8 +195,8 @@ export const createBookingConfirmation = async (req, res) => {
       [
         bookingReference,
         customerId,
-        checkIn,
-        checkOut,
+        normalizedCheckIn,
+        normalizedCheckOut,
         guest.adults || 2,
         guest.children || 0,
         guest.arrivalTime || '3 PM',
@@ -186,8 +212,8 @@ export const createBookingConfirmation = async (req, res) => {
     for (const item of items) {
       const requestedQty = Math.max(1, Number(item.qty || 1));
       // Calculate nights only for non-swimming items with valid dates
-      const nights = item.perNight && checkIn && checkOut
-        ? Math.ceil((new Date(checkOut) - new Date(checkIn)) / 86400000)
+      const nights = item.perNight && normalizedCheckIn && normalizedCheckOut
+        ? Math.ceil((new Date(normalizedCheckOut) - new Date(normalizedCheckIn)) / 86400000)
         : 0;
       const totalPrice = item.price * requestedQty * (item.perNight ? nights : 1);
 
@@ -236,7 +262,12 @@ export const createBookingConfirmation = async (req, res) => {
           candidateParams = requestedIds;
         }
 
-        const [availableUnits] = await connection.query(
+        // Log for debugging
+        console.log(`🔍 Checking availability for: "${item.name}", Category: ${itemType}, Item ID: ${numericItemId}`);
+        console.log(`📅 Date range: ${normalizedCheckIn} to ${normalizedCheckOut}`);
+
+        // First, try exact name match
+        let [availableUnits] = await connection.query(
           `SELECT ii.item_id
            FROM inventory_items ii
            WHERE ii.name = ?
@@ -260,24 +291,73 @@ export const createBookingConfirmation = async (req, res) => {
           [
             item.name || 'Item',
             ...candidateParams,
-            checkOut,
-            checkIn,
-            checkIn,
-            checkOut,
-            checkIn,
-            checkOut,
+            normalizedCheckOut,
+            normalizedCheckIn,
+            normalizedCheckIn,
+            normalizedCheckOut,
+            normalizedCheckIn,
+            normalizedCheckOut,
             requestedQty
           ]
         );
 
+        console.log(`✅ Found ${availableUnits.length} available unit(s) by name match`);
+
+        // If no exact name match, try by category (fallback)
         if (availableUnits.length < requestedQty) {
+          console.log(`⚠️ Exact name match returned 0 results, trying category fallback...`);
+          const [availableByCategory] = await connection.query(
+            `SELECT ii.item_id
+             FROM inventory_items ii
+             WHERE ii.category = ?
+               AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+               ${candidateFilter}
+               AND ii.item_id NOT IN (
+                 SELECT bi.inventory_item_id
+                 FROM booking_items bi
+                 INNER JOIN bookings b ON b.booking_id = bi.booking_id
+                 WHERE bi.inventory_item_id IS NOT NULL
+                   AND b.booking_status IN ('Confirmed', 'Pending')
+                   AND COALESCE(b.payment_status, 'Unpaid') IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
+                   AND (
+                     (b.check_in_date < ? AND b.check_out_date > ?)
+                     OR (b.check_in_date >= ? AND b.check_in_date < ?)
+                     OR (b.check_out_date > ? AND b.check_out_date <= ?)
+                   )
+               )
+             ORDER BY ii.item_id ASC
+             LIMIT ?`,
+            [
+              itemType,
+              ...candidateParams,
+              normalizedCheckOut,
+              normalizedCheckIn,
+              normalizedCheckIn,
+              normalizedCheckOut,
+              normalizedCheckIn,
+              normalizedCheckOut,
+              requestedQty
+            ]
+          );
+          availableUnits = availableByCategory;
+          console.log(`✅ Found ${availableUnits.length} available unit(s) by category match`);
+        }
+
+        if (availableUnits.length < requestedQty) {
+          console.log(`❌ Insufficient units: Requested ${requestedQty}, Available ${availableUnits.length}`);
           await connection.rollback();
           return res.status(409).json({
             success: false,
             error: 'Not enough available rooms for the selected dates',
             item_name: itemName,
             requested_quantity: requestedQty,
-            available_quantity: availableUnits.length
+            available_quantity: availableUnits.length,
+            debug_info: {
+              searched_name: item.name,
+              searched_category: itemType,
+              check_in: normalizedCheckIn,
+              check_out: normalizedCheckOut
+            }
           });
         }
 

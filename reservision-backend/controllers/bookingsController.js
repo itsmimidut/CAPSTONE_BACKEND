@@ -25,6 +25,11 @@
 import db from "../config/db.js";
 import { sendBookingApprovalEmail } from "../services/emailService.js";
 import { getQRCodeByReference } from "../services/qrCodeService.js";
+import {
+  autoAssignRoom,
+  validateBookingDates,
+  generateBookingReference as generateRef
+} from "../services/roomAssignmentService.js";
 
 /**
  * Generate unique booking reference
@@ -755,10 +760,10 @@ export const getAdminReservations = async (req, res) => {
     // Search by guest name or email
     if (search) {
       query += ` AND (
-        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) LIKE ? OR 
-        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) LIKE ? OR 
-        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) LIKE ? OR
-        b.booking_reference LIKE ?
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) COLLATE utf8mb4_unicode_ci LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) COLLATE utf8mb4_unicode_ci LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) COLLATE utf8mb4_unicode_ci LIKE ? OR
+        b.booking_reference COLLATE utf8mb4_unicode_ci LIKE ?
       )`;
       const searchPattern = `%${search}%`;
       params.push(searchPattern, searchPattern, searchPattern, searchPattern);
@@ -803,10 +808,10 @@ export const getAdminReservations = async (req, res) => {
 
     if (search) {
       countQuery += ` AND (
-        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) LIKE ? OR 
-        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) LIKE ? OR 
-        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) LIKE ? OR
-        b.booking_reference LIKE ?
+        COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) COLLATE utf8mb4_unicode_ci LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) COLLATE utf8mb4_unicode_ci LIKE ? OR 
+        COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) COLLATE utf8mb4_unicode_ci LIKE ? OR
+        b.booking_reference COLLATE utf8mb4_unicode_ci LIKE ?
       )`;
       const searchPattern = `%${search}%`;
       countParams.push(searchPattern, searchPattern, searchPattern, searchPattern);
@@ -1642,5 +1647,263 @@ export const processCheckIn = async (req, res) => {
       error: 'Failed to process check-in',
       details: error.message
     });
+  }
+};
+
+/**
+ * ============================================================
+ * CREATE BOOKING WITH AUTO-ASSIGNED ROOM
+ * ============================================================
+ * 
+ * Endpoint: POST /api/bookings/with-auto-assign
+ * 
+ * Purpose:
+ * - Create a new booking with automatic room assignment
+ * - Atomically assign first available room of requested type
+ * - Prevent double-booking with transactions and row-level locks
+ * 
+ * Request Body:
+ * {
+ *   customer: {
+ *     first_name: string,
+ *     last_name: string,
+ *     email: string,
+ *     phone: string,
+ *     address: string,
+ *     city: string,
+ *     postal_code: string
+ *   },
+ *   checkInDate: string (ISO format),
+ *   checkOutDate: string (ISO format),
+ *   roomType: string (e.g., "FAMILY ROOM"),
+ *   paymentMethod: string,
+ *   subtotal: number,
+ *   discount: number,
+ *   tax: number,
+ *   total: number,
+ *   promoCode: string (optional)
+ * }
+ * 
+ * Response (201 Success):
+ * {
+ *   success: true,
+ *   message: "Booking created successfully with auto-assigned room",
+ *   data: {
+ *     booking_id: 42,
+ *     booking_reference: "BK20260421001",
+ *     room_assigned: "FAMILY ROOM 1",
+ *     item_id: 1,
+ *     check_in_date: "2026-05-01",
+ *     check_out_date: "2026-05-03",
+ *     nights: 2,
+ *     total: 9900
+ *   }
+ * }
+ * 
+ * Error (409 Conflict - No Available Rooms):
+ * {
+ *   success: false,
+ *   message: "Room assignment failed",
+ *   error: "No available FAMILY ROOM rooms for dates 2026-05-01 to 2026-05-03"
+ * }
+ * 
+ * Error (503 Service Unavailable - Lock Timeout):
+ * {
+ *   success: false,
+ *   message: "System busy. Please try again.",
+ *   error: "Lock acquisition timeout"
+ * }
+ */
+export const createBookingWithAutoAssign = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    const {
+      customer,
+      checkInDate,
+      checkOutDate,
+      roomType,
+      paymentMethod,
+      subtotal,
+      discount,
+      tax,
+      total,
+      promoCode
+    } = req.body;
+
+    // Validate required fields
+    if (!roomType || !checkInDate || !checkOutDate) {
+      await connection.release();
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields',
+        details: 'roomType, checkInDate, checkOutDate are required'
+      });
+    }
+
+    if (!customer || !customer.first_name || !customer.last_name || !customer.email) {
+      await connection.release();
+      return res.status(400).json({
+        success: false,
+        message: 'Missing customer information',
+        details: 'first_name, last_name, email are required'
+      });
+    }
+
+    // Validate booking dates
+    const dateValidation = validateBookingDates(new Date(checkInDate), new Date(checkOutDate));
+    if (!dateValidation.valid) {
+      await connection.release();
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid booking dates',
+        error: dateValidation.error
+      });
+    }
+
+    // Set SERIALIZABLE isolation for strictest consistency
+    await connection.query('SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+    await connection.beginTransaction();
+
+    try {
+      // Step 1: Auto-assign first available room
+      const assignmentResult = await autoAssignRoom(
+        connection,
+        roomType,
+        new Date(checkInDate),
+        new Date(checkOutDate)
+      );
+
+      if (!assignmentResult.success) {
+        await connection.rollback();
+        return res.status(409).json({
+          success: false,
+          message: 'Room assignment failed',
+          error: assignmentResult.error
+        });
+      }
+
+      // Step 2: Generate booking reference
+      const bookingRef = await generateRef();
+
+      // Step 3: Create booking record
+      const [bookingResult] = await connection.query(
+        `INSERT INTO bookings (
+          booking_reference, first_name, last_name, email, phone, address, city, postal_code,
+          check_in_date, check_out_date, nights, subtotal, discount, tax, total, 
+          promo_code, payment_method, booking_status, payment_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          bookingRef,
+          customer.first_name,
+          customer.last_name,
+          customer.email,
+          customer.phone || '',
+          customer.address || '',
+          customer.city || '',
+          customer.postal_code || '',
+          checkInDate,
+          checkOutDate,
+          assignmentResult.nights,
+          subtotal || 0,
+          discount || 0,
+          tax || 0,
+          total || 0,
+          promoCode || null,
+          paymentMethod || 'Cash',
+          'Pending',
+          'Unpaid'
+        ]
+      );
+
+      const bookingId = bookingResult.insertId;
+
+      // Step 4: Create booking item entry
+      await connection.query(
+        `INSERT INTO booking_items (
+          booking_id, item_type, item_name, inventory_item_id, 
+          unit_price, quantity, nights, total_price, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          bookingId,
+          'Room',
+          assignmentResult.room_name,
+          assignmentResult.item_id,
+          assignmentResult.room_price || 0,
+          1,
+          assignmentResult.nights,
+          (assignmentResult.room_price || 0) * assignmentResult.nights
+        ]
+      );
+
+      // Step 5: Update occupied_dates with booking_id
+      await connection.query(
+        `UPDATE occupied_dates 
+         SET booking_id = ? 
+         WHERE inventory_item_id = ? AND booking_id IS NULL`,
+        [bookingId, assignmentResult.item_id]
+      );
+
+      // Commit transaction
+      await connection.commit();
+
+      // Step 6: Send booking confirmation email (non-blocking)
+      try {
+        await sendBookingApprovalEmail({
+          bookingReference: bookingRef,
+          customerEmail: customer.email,
+          customerName: `${customer.first_name} ${customer.last_name}`,
+          roomName: assignmentResult.room_name,
+          checkInDate,
+          checkOutDate,
+          nights: assignmentResult.nights,
+          total: total || 0
+        });
+      } catch (emailError) {
+        console.error('Email sending failed (non-blocking):', emailError);
+        // Don't fail booking if email fails
+      }
+
+      res.status(201).json({
+        success: true,
+        message: 'Booking created successfully with auto-assigned room',
+        data: {
+          booking_id: bookingId,
+          booking_reference: bookingRef,
+          room_assigned: assignmentResult.room_name,
+          item_id: assignmentResult.item_id,
+          check_in_date: checkInDate,
+          check_out_date: checkOutDate,
+          nights: assignmentResult.nights,
+          total: total || 0
+        }
+      });
+
+    } catch (transactionError) {
+      await connection.rollback();
+      throw transactionError;
+    }
+
+  } catch (error) {
+    console.error('Error creating booking with auto-assign:', error);
+
+    // Handle lock timeout (system busy)
+    if (error.code === 'ER_LOCK_WAIT_TIMEOUT') {
+      return res.status(503).json({
+        success: false,
+        message: 'System busy. Please try again.',
+        error: 'Lock acquisition timeout'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create booking',
+      error: error.message,
+      details: error.sqlState
+    });
+
+  } finally {
+    await connection.release();
   }
 };
