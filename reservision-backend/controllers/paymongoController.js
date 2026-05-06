@@ -293,16 +293,16 @@ export const webhookHandler = async (req, res) => {
       });
 
       try {
-        // Mark payment as paid; booking stays pending until admin approval.
+        // Mark payment as paid and confirm the booking immediately.
         await db.query(
-          'UPDATE bookings SET payment_status = ?, payment_method = ?, updated_at = NOW() WHERE booking_id = ?',
-          ['Paid', paymentMethod, bookingId]
+          'UPDATE bookings SET payment_status = ?, booking_status = ?, payment_method = ?, updated_at = NOW() WHERE booking_id = ?',
+          ['Paid', 'Confirmed', paymentMethod, bookingId]
         );
 
         await db.query(
           `INSERT INTO booking_logs (booking_id, action, description, performed_by)
            VALUES (?, 'Payment Received', ?, 'PayMongo Webhook')`,
-          [bookingId, `Payment settled via ${paymentMethod}. Awaiting admin approval.`]
+          [bookingId, `Payment settled via ${paymentMethod}. Booking confirmed.`]
         );
 
         console.log('✅ Booking payment marked as paid (awaiting admin approval):', bookingId, 'with method:', paymentMethod);

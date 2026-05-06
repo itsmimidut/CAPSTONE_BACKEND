@@ -393,19 +393,23 @@ export const createBooking = async (req, res) => {
           item_name,
           item_description,
           inventory_item_id,
+          batch_id,
+          schedule_id,
           unit_price,
           quantity,
           nights,
           total_price,
           guests,
           per_night
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
           item.item.category || 'Room',
           item.item.name,
           item.item.desc || item.item.description,
           item.item.item_id || null,
+          item.item.batch_id || null,
+          item.item.schedule_id || null,
           item.item.price,
           item.qty || 1,
           item.item.perNight ? (nights || 0) : 0,
@@ -736,9 +740,8 @@ export const getAdminReservations = async (req, res) => {
         COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) as last_name,
         COALESCE(NULLIF(TRIM(c.email), ''), NULLIF(TRIM(u.email), ''), NULLIF(TRIM(b.email), '')) as email,
         COALESCE(NULLIF(TRIM(c.phone), ''), NULLIF(TRIM(u.phone), ''), NULLIF(TRIM(b.phone), '')) as phone,
-        p.payment_reference,
-        p.amount as payment_amount,
-        GROUP_CONCAT(DISTINCT bi.item_name ORDER BY bi.item_name SEPARATOR ', ') as items_summary,
+      MAX(p.payment_reference) as payment_reference,
+      MAX(p.amount) as payment_amount,
         GROUP_CONCAT(DISTINCT bi.item_description SEPARATOR '|||') as items_descriptions,
         COUNT(DISTINCT bi.item_id) as item_count
       FROM bookings b
@@ -781,7 +784,7 @@ export const getAdminReservations = async (req, res) => {
     }
 
     query += ` 
-      GROUP BY b.booking_id, c.customer_id, p.payment_id
+      GROUP BY b.booking_id, c.customer_id
       ORDER BY b.created_at DESC
       LIMIT ? OFFSET ?
     `;
@@ -900,13 +903,14 @@ export const getCustomerBookingHistory = async (req, res) => {
         b.total,
         b.booking_status,
         b.created_at,
-        p.payment_reference,
-        p.payment_method,
-        p.status as payment_status,
-        p.paid_at
+        MAX(p.payment_reference) as payment_reference,
+        MAX(p.payment_method) as payment_method,
+        MAX(p.status) as payment_status,
+        MAX(p.paid_at) as paid_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       WHERE b.customer_id = ?
+      GROUP BY b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.adults, b.children, b.total, b.booking_status, b.created_at
     `;
 
     const params = [customerId];
@@ -1047,12 +1051,13 @@ export const getBookingHistoryByUserId = async (req, res) => {
         b.booking_status,
         b.created_at,
         LOWER(COALESCE(b.payment_status, 'pending')) as payment_status,
-        p.payment_reference,
-        p.payment_method,
-        p.paid_at
+        MAX(p.payment_reference) as payment_reference,
+        MAX(p.payment_method) as payment_method,
+        MAX(p.paid_at) as paid_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       WHERE b.customer_id = ?
+      GROUP BY b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.adults, b.children, b.total, b.booking_status, b.created_at, b.payment_status
     `;
     const params = [customerId];
 
@@ -1193,13 +1198,14 @@ export const getBookingHistoryByEmail = async (req, res) => {
         b.total,
         b.booking_status,
         b.created_at,
-        p.payment_reference,
-        p.payment_method,
-        p.status as payment_status,
-        p.paid_at
+        MAX(p.payment_reference) as payment_reference,
+        MAX(p.payment_method) as payment_method,
+        MAX(p.status) as payment_status,
+        MAX(p.paid_at) as paid_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       WHERE b.customer_id IN (${placeholders})
+      GROUP BY b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.adults, b.children, b.total, b.booking_status, b.created_at
     `;
     const params = [...customerIds];
 

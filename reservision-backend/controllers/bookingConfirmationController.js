@@ -199,7 +199,7 @@ export const createBookingConfirmation = async (req, res) => {
         normalizedCheckOut,
         guest.adults || 2,
         guest.children || 0,
-        guest.arrivalTime || '3 PM',
+        guest.arrivalTime || null,
         guest.specialRequests || '',
         total,
         total
@@ -256,60 +256,55 @@ export const createBookingConfirmation = async (req, res) => {
 
         let candidateParams = [];
         let candidateFilter = '';
+        const isDirectIdBooking = requestedIds.length > 0;
 
-        if (requestedIds.length) {
+        if (isDirectIdBooking) {
           candidateFilter = ` AND ii.item_id IN (${requestedIds.map(() => '?').join(', ')})`;
           candidateParams = requestedIds;
+        } else if (numericItemId) {
+          candidateFilter = ' AND ii.item_id = ?';
+          candidateParams = [numericItemId];
         }
 
         // Log for debugging
         console.log(`🔍 Checking availability for: "${item.name}", Category: ${itemType}, Item ID: ${numericItemId}`);
+        if (candidateFilter) {
+          console.log(`🔧 Using inventory filter: ${candidateFilter} with params`, candidateParams);
+        }
         console.log(`📅 Date range: ${normalizedCheckIn} to ${normalizedCheckOut}`);
-
-        // First, try exact name match
-        let [availableUnits] = await connection.query(
-          `SELECT ii.item_id
-           FROM inventory_items ii
-           WHERE ii.name = ?
-             AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
-             ${candidateFilter}
-             AND ii.item_id NOT IN (
-               SELECT bi.inventory_item_id
-               FROM booking_items bi
-               INNER JOIN bookings b ON b.booking_id = bi.booking_id
-               WHERE bi.inventory_item_id IS NOT NULL
-                 AND b.booking_status IN ('Confirmed', 'Pending')
-                 AND COALESCE(b.payment_status, 'Unpaid') IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
-                 AND (
-                   (b.check_in_date < ? AND b.check_out_date > ?)
-                   OR (b.check_in_date >= ? AND b.check_in_date < ?)
-                   OR (b.check_out_date > ? AND b.check_out_date <= ?)
-                 )
-             )
-           ORDER BY ii.item_id ASC
-           LIMIT ?`,
-          [
-            item.name || 'Item',
-            ...candidateParams,
-            normalizedCheckOut,
-            normalizedCheckIn,
-            normalizedCheckIn,
-            normalizedCheckOut,
-            normalizedCheckIn,
-            normalizedCheckOut,
-            requestedQty
-          ]
-        );
-
-        console.log(`✅ Found ${availableUnits.length} available unit(s) by name match`);
-
-        // If no exact name match, try by category (fallback)
-        if (availableUnits.length < requestedQty) {
-          console.log(`⚠️ Exact name match returned 0 results, trying category fallback...`);
-          const [availableByCategory] = await connection.query(
+        let availableUnits = [];
+        if (isDirectIdBooking) {
+          const [availableByIds] = await connection.query(
             `SELECT ii.item_id
              FROM inventory_items ii
-             WHERE ii.category = ?
+             WHERE LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+               ${candidateFilter}
+               AND ii.item_id NOT IN (
+                 SELECT bi.inventory_item_id
+                 FROM booking_items bi
+                 INNER JOIN bookings b ON b.booking_id = bi.booking_id
+                 WHERE bi.inventory_item_id IS NOT NULL
+                   AND b.booking_status IN ('Confirmed', 'Pending')
+                   AND COALESCE(b.payment_status, 'Unpaid') IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
+                   AND b.check_in_date < ?
+                   AND b.check_out_date > ?
+               )
+             ORDER BY ii.item_id ASC
+             LIMIT ?`,
+            [
+              ...candidateParams,
+              normalizedCheckOut,
+              normalizedCheckIn,
+              requestedQty
+            ]
+          );
+          availableUnits = availableByIds;
+          console.log(`✅ Found ${availableUnits.length} available unit(s) by direct inventory IDs`);
+        } else {
+          const [availableByName] = await connection.query(
+            `SELECT ii.item_id
+             FROM inventory_items ii
+             WHERE LOWER(TRIM(ii.name)) = LOWER(TRIM(?))
                AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
                ${candidateFilter}
                AND ii.item_id NOT IN (
@@ -319,11 +314,41 @@ export const createBookingConfirmation = async (req, res) => {
                  WHERE bi.inventory_item_id IS NOT NULL
                    AND b.booking_status IN ('Confirmed', 'Pending')
                    AND COALESCE(b.payment_status, 'Unpaid') IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
-                   AND (
-                     (b.check_in_date < ? AND b.check_out_date > ?)
-                     OR (b.check_in_date >= ? AND b.check_in_date < ?)
-                     OR (b.check_out_date > ? AND b.check_out_date <= ?)
-                   )
+                   AND b.check_in_date < ?
+                   AND b.check_out_date > ?
+               )
+             ORDER BY ii.item_id ASC
+             LIMIT ?`,
+            [
+              item.name || 'Item',
+              ...candidateParams,
+              normalizedCheckOut,
+              normalizedCheckIn,
+              requestedQty
+            ]
+          );
+          availableUnits = availableByName;
+          console.log(`✅ Found ${availableUnits.length} available unit(s) by name match`);
+        }
+
+        // If no exact name match, try by category (fallback)
+        if (availableUnits.length < requestedQty) {
+          console.log(`⚠️ Exact name match returned 0 results, trying category fallback...`);
+          const [availableByCategory] = await connection.query(
+            `SELECT ii.item_id
+             FROM inventory_items ii
+             WHERE LOWER(TRIM(ii.category)) = LOWER(TRIM(?))
+               AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+               ${candidateFilter}
+               AND ii.item_id NOT IN (
+                 SELECT bi.inventory_item_id
+                 FROM booking_items bi
+                 INNER JOIN bookings b ON b.booking_id = bi.booking_id
+                 WHERE bi.inventory_item_id IS NOT NULL
+                   AND b.booking_status IN ('Confirmed', 'Pending')
+                   AND COALESCE(b.payment_status, 'Unpaid') IN ('Paid', 'paid', 'Pending', 'pending', 'Unpaid', 'unpaid')
+                   AND b.check_in_date < ?
+                   AND b.check_out_date > ?
                )
              ORDER BY ii.item_id ASC
              LIMIT ?`,
@@ -332,10 +357,6 @@ export const createBookingConfirmation = async (req, res) => {
               ...candidateParams,
               normalizedCheckOut,
               normalizedCheckIn,
-              normalizedCheckIn,
-              normalizedCheckOut,
-              normalizedCheckIn,
-              normalizedCheckOut,
               requestedQty
             ]
           );
@@ -370,6 +391,9 @@ export const createBookingConfirmation = async (req, res) => {
               inventory_item_id,
               item_type,
               item_name,
+              batch_id,
+              schedule_id,
+              coach_id,
               unit_price,
               quantity,
               guests,
@@ -377,12 +401,15 @@ export const createBookingConfirmation = async (req, res) => {
               total_price,
               per_night,
               item_description
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               bookingId,
               unit.item_id,
               itemType,
               itemName,
+              null,
+              null,
+              null,
               item.price,
               1,
               guestsPerUnit,
@@ -404,6 +431,9 @@ export const createBookingConfirmation = async (req, res) => {
           inventory_item_id, 
           item_type,
           item_name,
+          batch_id,
+          schedule_id,
+          coach_id,
           unit_price, 
           quantity, 
           guests,
@@ -411,12 +441,15 @@ export const createBookingConfirmation = async (req, res) => {
           total_price,
           per_night,
           item_description
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
           numericItemId,
           itemType,
           itemName,
+          item.batch_id || null,
+          item.schedule_id || null,
+          item.coach_id || null,
           item.price,
           requestedQty,
           guestCount,
@@ -628,16 +661,16 @@ export const updatePaymentStatus = async (req, res) => {
       [status, paymentIntentId, checkoutUrl, status, bookingId, paymentReference]
     );
 
-    // Mark payment as paid — booking status stays pending for admin approval
+    // Mark payment as paid and confirm the booking immediately after successful payment
     if (status === 'paid') {
       await db.query(
-        'UPDATE bookings SET payment_status = ? WHERE booking_id = ?',
-        ['Paid', bookingId]
+        'UPDATE bookings SET payment_status = ?, booking_status = ? WHERE booking_id = ?',
+        ['Paid', 'Confirmed', bookingId]
       );
 
       await db.query(
         'INSERT INTO booking_logs (booking_id, action, description, performed_by) VALUES (?, ?, ?, ?)',
-        [bookingId, 'Payment Received', `Payment completed via ${paymentIntentId}. Awaiting admin approval.`, 'System']
+        [bookingId, 'Payment Received', `Payment completed via ${paymentIntentId}. Booking confirmed.`, 'System']
       );
 
       // 🎉 Step: Send confirmation email with QR code AFTER payment is confirmed
