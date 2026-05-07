@@ -1493,7 +1493,7 @@ export const validateBookingForCheckIn = async (req, res) => {
       });
     }
 
-    // Query booking details
+    // Query booking details including actual check-in/out times
     const [bookings] = await db.query(
       `SELECT 
         b.booking_id as id,
@@ -1526,6 +1526,8 @@ export const validateBookingForCheckIn = async (req, res) => {
         b.check_out_date,
         b.booking_status,
         b.payment_status,
+        b.actual_check_in_time,
+        b.actual_check_out_time,
         CONCAT('[', GROUP_CONCAT(
           JSON_OBJECT(
             'item_id', bi.inventory_item_id,
@@ -1562,15 +1564,6 @@ export const validateBookingForCheckIn = async (req, res) => {
       }
     }
 
-    // Check if already checked in
-    const normalizedStatus = String(booking.booking_status || '').toLowerCase().replace(/[^a-z]/g, '');
-    if (normalizedStatus === 'checkedin') {
-      return res.status(400).json({
-        success: false,
-        error: 'Guest has already checked in'
-      });
-    }
-
     res.json({
       success: true,
       data: {
@@ -1596,7 +1589,7 @@ export const validateBookingForCheckIn = async (req, res) => {
 export const processCheckIn = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { checked_in_by, checked_in_time } = req.body;
+    const { checked_in_by } = req.body;
 
     if (!bookingId) {
       return res.status(400).json({
@@ -1605,9 +1598,9 @@ export const processCheckIn = async (req, res) => {
       });
     }
 
-    // Verify booking exists
+    // Verify booking exists and get current status
     const [existingBooking] = await db.query(
-      'SELECT * FROM bookings WHERE booking_id = ?',
+      'SELECT booking_id, booking_status FROM bookings WHERE booking_id = ?',
       [bookingId]
     );
 
@@ -1618,12 +1611,22 @@ export const processCheckIn = async (req, res) => {
       });
     }
 
-    // Update booking status to Checked-In
-    // Note: ENUM value must match exactly: 'Checked-In' (with hyphen)
+    const currentStatus = String(existingBooking[0].booking_status || '').toLowerCase().replace(/[^a-z]/g, '');
+    
+    // Only allow check-in from Confirmed or Paid status
+    if (!['confirmed', 'paid'].includes(currentStatus)) {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot check in booking with status: ${existingBooking[0].booking_status}. Guest must be Confirmed or Paid.`
+      });
+    }
+
+    // Update booking status to Checked-In with actual check-in time
     const [result] = await db.query(
       `UPDATE bookings 
        SET 
-        booking_status = 'Checked-In'
+        booking_status = 'Checked-In',
+        actual_check_in_time = NOW()
        WHERE booking_id = ?`,
       [bookingId]
     );
@@ -1642,7 +1645,7 @@ export const processCheckIn = async (req, res) => {
         booking_id: bookingId,
         status: 'Checked-In',
         checked_in_by: checked_in_by || 'admin',
-        checked_in_time: checked_in_time || new Date().toISOString()
+        checked_in_time: new Date().toISOString()
       }
     });
 
@@ -1651,6 +1654,83 @@ export const processCheckIn = async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to process check-in',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * POST /api/bookings/:bookingId/check-out
+ * Process guest check-out
+ */
+export const processCheckOut = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { checked_out_by } = req.body;
+
+    if (!bookingId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Booking ID is required'
+      });
+    }
+
+    // Verify booking exists and get current status
+    const [existingBooking] = await db.query(
+      'SELECT booking_id, booking_status FROM bookings WHERE booking_id = ?',
+      [bookingId]
+    );
+
+    if (!existingBooking || existingBooking.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      });
+    }
+
+    const currentStatus = String(existingBooking[0].booking_status || '').toLowerCase().replace(/[^a-z]/g, '');
+    
+    // Only allow check-out from Checked-In status
+    if (currentStatus !== 'checkedin') {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot check out booking with status: ${existingBooking[0].booking_status}. Guest must be Checked-In.`
+      });
+    }
+
+    // Update booking status to Checked-Out with actual check-out time
+    const [result] = await db.query(
+      `UPDATE bookings 
+       SET 
+        booking_status = 'Checked-Out',
+        actual_check_out_time = NOW()
+       WHERE booking_id = ?`,
+      [bookingId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Failed to update booking status'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Guest checked out successfully',
+      data: {
+        booking_id: bookingId,
+        status: 'Checked-Out',
+        checked_out_by: checked_out_by || 'admin',
+        checked_out_time: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Error processing check-out:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process check-out',
       details: error.message
     });
   }

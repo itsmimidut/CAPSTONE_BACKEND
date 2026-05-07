@@ -35,6 +35,7 @@ import {
   getAdminReservations,
   validateBookingForCheckIn,
   processCheckIn,
+  processCheckOut,
   createBookingWithAutoAssign
 } from "../controllers/bookingsController.js";
 import {
@@ -96,10 +97,13 @@ router.put("/:id", updateBooking);
 // Cancel/delete booking
 router.delete("/:id", deleteBooking);
 
-// Validate booking for check-in
+// Validate booking for check-in/check-out
 router.get("/validate/:bookingReference", validateBookingForCheckIn);
 
 // Process guest check-in
 router.post("/:bookingId/check-in", processCheckIn);
+
+// Process guest check-out
+router.post("/:bookingId/check-out", processCheckOut);
 
 export default router;
