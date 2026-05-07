@@ -7,6 +7,7 @@
 -- - customer
 -- - restaurantstaff
 -- - receptionist
+-- - swimming_instructor
 --
 -- Run this with: mysql -u root -p eduardos < ADD_ROLE_CONSTRAINT.sql
 -- Or: Get-Content "ADD_ROLE_CONSTRAINT.sql" | mysql -u root -p eduardos
@@ -21,7 +22,7 @@ SELECT
     COUNT(*) as count
 FROM user
 GROUP BY role
-HAVING role NOT IN ('admin', 'customer', 'restaurantstaff', 'receptionist');
+HAVING role NOT IN ('admin', 'customer', 'restaurantstaff', 'receptionist', 'swimming_instructor');
 
 -- If the above query returns any rows, run UPDATE_USER_ROLES.sql first!
 
@@ -29,7 +30,7 @@ HAVING role NOT IN ('admin', 'customer', 'restaurantstaff', 'receptionist');
 -- Note: MySQL enforces CHECK constraints starting from version 8.0.16
 ALTER TABLE user
 ADD CONSTRAINT chk_user_role 
-CHECK (role IN ('admin', 'customer', 'restaurantstaff', 'receptionist'));
+CHECK (role IN ('admin', 'customer', 'restaurantstaff', 'receptionist', 'swimming_instructor'));
 
 -- Verify constraint was added
 SELECT 

@@ -101,6 +101,447 @@ const findCoachScheduleConflict = async (coachId, batchId, startTime, endTime, e
     return rows.length > 0;
 };
 
+/**
+ * GET /api/swimming/instructor/dashboard/:coachId
+ * Instructor dashboard summary for the coach.
+ */
+router.get('/instructor/dashboard/:coachId', async (req, res) => {
+    try {
+        const { coachId } = req.params;
+        if (!coachId) {
+            return res.status(400).json({ success: false, error: 'Coach ID is required' });
+        }
+
+        const [coachRows] = await db.query(
+            `SELECT coach_id, name
+             FROM swimming_coaches
+             WHERE coach_id = ?
+             LIMIT 1`,
+            [coachId]
+        );
+
+        if (!coachRows.length) {
+            return res.status(404).json({ success: false, error: 'Coach not found' });
+        }
+
+        const coach = coachRows[0];
+
+        const [[scheduleStats]] = await db.query(
+            `SELECT
+                COUNT(*) AS todayClasses
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             WHERE s.coach_id = ?
+               AND DATE(NOW()) BETWEEN b.start_date AND b.end_date`,
+            [coachId]
+        );
+
+        const [[generalStats]] = await db.query(
+            `SELECT
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN se.enrollment_id
+                END) AS assignedStudents,
+                COUNT(DISTINCT CASE
+                    WHEN LOWER(b.status) IN ('active', 'open', 'filling')
+                    THEN b.batch_id
+                END) AS activeBatches,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status = 'Pending'
+                    THEN se.enrollment_id
+                END) AS pendingAttendance,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status = 'Completed'
+                    THEN se.enrollment_id
+                END) AS completedLessons
+             FROM swimming_enrollments se
+             LEFT JOIN swimming_batch_schedules s ON se.schedule_id = s.schedule_id
+             LEFT JOIN swimming_batches b ON se.batch_id = b.batch_id
+             WHERE se.coach_id = ?
+                OR s.coach_id = ?`,
+            [coachId, coachId]
+        );
+
+        const [todaySchedules] = await db.query(
+            `SELECT
+                s.schedule_id,
+                s.batch_id,
+                b.batch_name,
+                b.lesson_type,
+                b.capacity,
+                b.status AS batch_status,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.days,
+                s.max_slots,
+                s.status AS schedule_status,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN se.enrollment_id
+                END) AS students_count
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             LEFT JOIN swimming_enrollments se ON se.schedule_id = s.schedule_id
+             WHERE s.coach_id = ?
+               AND DATE(NOW()) BETWEEN b.start_date AND b.end_date
+             GROUP BY s.schedule_id
+             ORDER BY s.start_time ASC
+             LIMIT 10`,
+            [coachId]
+        );
+
+        const [assignedBatches] = await db.query(
+            `SELECT
+                b.batch_id,
+                s.schedule_id,
+                b.batch_name,
+                b.lesson_type,
+                b.days,
+                b.time_slot,
+                b.capacity,
+                b.status,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status AS schedule_status,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN se.enrollment_id
+                END) AS students
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             LEFT JOIN swimming_enrollments se
+               ON se.schedule_id = s.schedule_id
+               AND se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+             WHERE s.coach_id = ?
+             GROUP BY s.schedule_id, b.batch_id
+             ORDER BY b.start_date DESC, s.start_time ASC
+             LIMIT 12`,
+            [coachId]
+        );
+
+        const [myStudents] = await db.query(
+            `SELECT
+                se.enrollment_id,
+                se.first_name,
+                se.last_name,
+                se.email,
+                se.lesson_type,
+                se.batch_id,
+                se.schedule_id,
+                se.coach_id,
+                b.batch_name,
+                b.time_slot,
+                b.days,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                se.enrollment_status
+             FROM swimming_enrollments se
+             LEFT JOIN swimming_batch_schedules s ON se.schedule_id = s.schedule_id
+             LEFT JOIN swimming_batches b ON se.batch_id = b.batch_id
+             WHERE se.coach_id = ?
+                OR s.coach_id = ?
+             ORDER BY se.created_at DESC
+             LIMIT 20`,
+            [coachId, coachId]
+        );
+
+        const [calendarEvents] = await db.query(
+            `SELECT
+                s.schedule_id AS id,
+                b.batch_name,
+                b.lesson_type,
+                s.start_time,
+                s.end_time,
+                b.status AS batch_status,
+                DATE(NOW()) AS date
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             WHERE s.coach_id = ?
+               AND DATE(NOW()) BETWEEN b.start_date AND b.end_date
+             ORDER BY s.start_time ASC
+             LIMIT 20`,
+            [coachId]
+        );
+
+        res.json({
+            success: true,
+            coach,
+            stats: {
+                todayClasses: Number(scheduleStats?.todayClasses || 0),
+                today_classes: Number(scheduleStats?.todayClasses || 0),
+                assignedStudents: Number(generalStats?.assignedStudents || 0),
+                assigned_students: Number(generalStats?.assignedStudents || 0),
+                activeBatches: Number(generalStats?.activeBatches || 0),
+                active_batches: Number(generalStats?.activeBatches || 0),
+                pendingAttendance: Number(generalStats?.pendingAttendance || 0),
+                pending_attendance: Number(generalStats?.pendingAttendance || 0),
+                completedLessons: Number(generalStats?.completedLessons || 0),
+                completed_lessons: Number(generalStats?.completedLessons || 0)
+            },
+            todaySchedules,
+            assignedBatches,
+            myStudents,
+            calendarEvents
+        });
+    } catch (error) {
+        console.error('Error fetching instructor dashboard:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch instructor dashboard',
+            details: error.message
+        });
+    }
+});
+
+/**
+ * GET /api/swimming/instructor/dashboard-data/:coachId
+ * Instructor dashboard summary using admin-style data filtered by coach.
+ */
+router.get('/instructor/dashboard-data/:coachId', async (req, res) => {
+    try {
+        const { coachId } = req.params;
+        if (!coachId) {
+            return res.status(400).json({ success: false, error: 'Coach ID is required' });
+        }
+
+        const [coachRows] = await db.query(
+            `SELECT
+                coach_id,
+                user_id,
+                name,
+                specialization,
+                status
+             FROM swimming_coaches
+             WHERE coach_id = ?
+             LIMIT 1`,
+            [coachId]
+        );
+
+        if (!coachRows.length) {
+            return res.status(404).json({ success: false, error: 'Coach not found' });
+        }
+
+        const coach = coachRows[0];
+        const today = new Date().toISOString().slice(0, 10);
+
+        const [students] = await db.query(`
+            SELECT
+                e.enrollment_id,
+                CONCAT(e.first_name, ' ', e.last_name) AS name,
+                e.first_name,
+                e.last_name,
+                e.email,
+                e.mobile_phone,
+                e.booking_reference,
+                e.lesson_type,
+                e.payment_status,
+                e.enrollment_status,
+                e.batch_id,
+                e.schedule_id,
+                e.coach_id,
+                b.batch_name,
+                b.start_date,
+                b.end_date,
+                b.status AS batch_status,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status AS schedule_status,
+                sc.name AS schedule_coach_name
+            FROM swimming_enrollments e
+            LEFT JOIN swimming_batch_schedules s
+                ON s.schedule_id = e.schedule_id
+            LEFT JOIN swimming_batches b
+                ON b.batch_id = e.batch_id
+            LEFT JOIN swimming_coaches sc
+                ON sc.coach_id = COALESCE(e.coach_id, s.coach_id)
+            WHERE e.coach_id = ?
+               OR s.coach_id = ?
+            ORDER BY e.created_at DESC
+        `, [coachId, coachId]);
+
+        const [batchSchedules] = await db.query(`
+            SELECT
+                s.schedule_id,
+                s.batch_id,
+                s.coach_id,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status,
+                b.batch_name,
+                b.lesson_type,
+                b.start_date,
+                b.end_date,
+                b.status AS batch_status,
+                c.name AS coach_name,
+                COUNT(DISTINCT CASE
+                    WHEN e.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN e.enrollment_id
+                END) AS used_slots
+            FROM swimming_batch_schedules s
+            INNER JOIN swimming_batches b
+                ON b.batch_id = s.batch_id
+            LEFT JOIN swimming_coaches c
+                ON c.coach_id = s.coach_id
+            LEFT JOIN swimming_enrollments e
+                ON e.schedule_id = s.schedule_id
+            WHERE s.coach_id = ?
+            GROUP BY s.schedule_id
+            ORDER BY b.start_date ASC, s.start_time ASC
+        `, [coachId]);
+
+        const [batches] = await db.query(`
+            SELECT
+                b.batch_id,
+                b.batch_name,
+                b.lesson_type,
+                b.start_date,
+                b.end_date,
+                b.status,
+                COUNT(DISTINCT s.schedule_id) AS schedule_count,
+                COALESCE(SUM(s.max_slots), 0) AS schedule_capacity,
+                COUNT(DISTINCT CASE
+                    WHEN e.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN e.enrollment_id
+                END) AS enrolled_count
+            FROM swimming_batches b
+            INNER JOIN swimming_batch_schedules s
+                ON s.batch_id = b.batch_id
+               AND s.coach_id = ?
+            LEFT JOIN swimming_enrollments e
+                ON e.schedule_id = s.schedule_id
+            GROUP BY b.batch_id
+            ORDER BY b.start_date DESC
+        `, [coachId]);
+
+        const [todaySchedules] = await db.query(`
+            SELECT
+                s.schedule_id,
+                s.batch_id,
+                s.coach_id,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status,
+                b.batch_name,
+                b.lesson_type,
+                c.name AS coach_name,
+                COUNT(DISTINCT CASE
+                    WHEN e.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN e.enrollment_id
+                END) AS used_slots
+            FROM swimming_batch_schedules s
+            INNER JOIN swimming_batches b
+                ON b.batch_id = s.batch_id
+            LEFT JOIN swimming_coaches c
+                ON c.coach_id = s.coach_id
+            LEFT JOIN swimming_enrollments e
+                ON e.schedule_id = s.schedule_id
+            WHERE s.coach_id = ?
+              AND ? BETWEEN b.start_date AND b.end_date
+            GROUP BY s.schedule_id
+            ORDER BY s.start_time ASC
+        `, [coachId, today]);
+
+        const approvedStudents = students.filter((student) =>
+            ['approved', 'enrolled', 'completed'].includes(String(student.enrollment_status || '').toLowerCase())
+        );
+
+        const activeBatches = batches.filter((batch) =>
+            ['open', 'active', 'filling'].includes(String(batch.status || '').toLowerCase())
+        );
+
+        const pendingAttendance = todaySchedules.length;
+        const stats = {
+            todayClasses: todaySchedules.length,
+            today_classes: todaySchedules.length,
+            assignedStudents: approvedStudents.length,
+            assigned_students: approvedStudents.length,
+            activeBatches: activeBatches.length,
+            active_batches: activeBatches.length,
+            pendingAttendance,
+            pending_attendance: pendingAttendance,
+            completedLessons: 0,
+            completed_lessons: 0
+        };
+
+        const calendarEvents = batchSchedules.map((row) => ({
+            id: row.schedule_id,
+            schedule_id: row.schedule_id,
+            date: row.start_date,
+            batch: row.batch_name,
+            batch_name: row.batch_name,
+            lesson_type: row.lesson_type,
+            time: `${row.start_time || 'TBD'} - ${row.end_time || 'TBD'}`,
+            start_time: row.start_time,
+            end_time: row.end_time,
+            status: row.status || row.batch_status || 'Open'
+        }));
+
+        res.json({
+            success: true,
+            coach,
+            stats,
+            students,
+            batches,
+            batchSchedules,
+            todaySchedules,
+            calendarEvents
+        });
+    } catch (error) {
+        console.error('Error fetching instructor dashboard data:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch instructor dashboard data',
+            details: error.message
+        });
+    }
+});
+
+router.get('/instructor/coach-by-user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!userId) {
+            return res.status(400).json({ success: false, message: 'User ID is required' });
+        }
+
+        const [rows] = await db.query(
+            `SELECT coach_id, name
+             FROM swimming_coaches
+             WHERE user_id = ?
+             LIMIT 1`,
+            [userId]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({
+                success: false,
+                message: 'Coach profile not linked to this account.'
+            });
+        }
+
+        res.json({
+            success: true,
+            coach: rows[0]
+        });
+    } catch (error) {
+        console.error('Error fetching coach by user:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch coach profile',
+            error: error.message
+        });
+    }
+});
+
 // ============================================================
 // ENROLLMENT ENDPOINTS
 // ============================================================

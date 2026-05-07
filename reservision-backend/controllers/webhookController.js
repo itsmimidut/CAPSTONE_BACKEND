@@ -92,11 +92,16 @@ async function handlePaymentSuccess(data, event) {
 
             // Send confirmation email
             try {
-                await sendBookingConfirmationEmail(
-                    booking.email,
-                    booking.booking_reference,
-                    booking.total_amount
-                );
+                await sendBookingConfirmationEmail({
+                    email: booking.email,
+                    firstName: booking.first_name || '',
+                    lastName: booking.last_name || '',
+                    bookingReference: booking.booking_reference,
+                    checkIn: booking.check_in_date,
+                    checkOut: booking.check_out_date,
+                    items: [],
+                    total: booking.total_amount || booking.total || 0
+                });
                 console.log('📧 Confirmation email sent to:', booking.email);
             } catch (emailError) {
                 console.warn('⚠️  Failed to send confirmation email:', emailError.message);

@@ -6,6 +6,7 @@
 -- - customer
 -- - restaurantstaff
 -- - receptionist
+-- - swimming_instructor
 --
 -- Run this with: mysql -u root -p eduardos < UPDATE_USER_ROLES.sql
 -- Or: Get-Content "UPDATE_USER_ROLES.sql" | mysql -u root -p eduardos
@@ -50,7 +51,7 @@ GROUP BY role;
 -- (Optional - will fail if any invalid roles still exist)
 -- ALTER TABLE user 
 -- ADD CONSTRAINT chk_user_role 
--- CHECK (role IN ('admin', 'customer', 'restaurantstaff', 'receptionist'));
+-- CHECK (role IN ('admin', 'customer', 'restaurantstaff', 'receptionist', 'swimming_instructor'));
 
 -- Show summary
 SELECT 
@@ -60,5 +61,6 @@ SELECT
     SUM(CASE WHEN role = 'customer' THEN 1 ELSE 0 END) as customers,
     SUM(CASE WHEN role = 'restaurantstaff' THEN 1 ELSE 0 END) as restaurant_staff,
     SUM(CASE WHEN role = 'receptionist' THEN 1 ELSE 0 END) as receptionists,
-    SUM(CASE WHEN role NOT IN ('admin', 'customer', 'restaurantstaff', 'receptionist') THEN 1 ELSE 0 END) as invalid_roles
+    SUM(CASE WHEN role = 'swimming_instructor' THEN 1 ELSE 0 END) as swimming_instructors,
+    SUM(CASE WHEN role NOT IN ('admin', 'customer', 'restaurantstaff', 'receptionist', 'swimming_instructor') THEN 1 ELSE 0 END) as invalid_roles
 FROM user;

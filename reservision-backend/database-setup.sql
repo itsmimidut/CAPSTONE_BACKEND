@@ -2333,7 +2333,7 @@ CREATE TABLE `user` (
   `email` varchar(255) NOT NULL,
   `phone` varchar(20) NOT NULL,
   `password` varchar(255) NOT NULL,
-  `role` enum('admin','customer','receptionist','restaurantstaff') DEFAULT 'customer',
+  `role` enum('admin','customer','receptionist','restaurantstaff','swimming_instructor') DEFAULT 'customer',
   `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
   `last_login_at` timestamp NOT NULL DEFAULT current_timestamp(),
   `address` varchar(255) DEFAULT NULL,
