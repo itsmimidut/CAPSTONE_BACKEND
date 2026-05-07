@@ -163,7 +163,24 @@ export const getMenuItem = async (req, res) => {
             return res.status(404).json({ message: 'Menu item not found' });
         }
 
-        res.json(mapMenuRow(rows[0]));
+        const [ingredients] = await db.query(`
+            SELECT mi.id, mi.inventory_id, mi.quantity_needed, i.item_name, i.unit
+            FROM menu_ingredients mi
+            JOIN inventory i ON mi.inventory_id = i.inventory_id
+            WHERE mi.menu_id = ?
+            ORDER BY i.item_name
+        `, [id]);
+
+        const item = mapMenuRow(rows[0]);
+        item.ingredients = ingredients.map((ing) => ({
+            id: ing.id,
+            inventory_id: ing.inventory_id,
+            quantity_needed: ing.quantity_needed,
+            item_name: ing.item_name,
+            unit: ing.unit
+        }));
+
+        res.json(item);
     } catch (error) {
         console.error('Error fetching menu item:', error);
         res.status(500).json({ error: 'Error fetching menu item' });
@@ -205,7 +222,18 @@ export const getMenuItem = async (req, res) => {
  */
 export const createMenuItem = async (req, res) => {
     try {
-        const { name, price, category, available = true, prep_time = 15, description = '', image_url = '', sizes = [], addons = [] } = req.body;
+        const {
+            name,
+            price,
+            category,
+            available = true,
+            prep_time = 15,
+            description = '',
+            image_url = '',
+            sizes = [],
+            addons = [],
+            ingredients = []
+        } = req.body;
 
         if (!name || !price || !category) {
             return res.status(400).json({ message: 'Name, price, and category are required' });
@@ -246,9 +274,21 @@ export const createMenuItem = async (req, res) => {
             );
         }
 
+        const menuId = result.insertId;
+        const validIngredients = Array.isArray(ingredients)
+            ? ingredients.filter((ing) => Number(ing?.inventory_id) > 0 && Number(ing?.quantity_needed) > 0)
+            : [];
+
+        for (const ingredient of validIngredients) {
+            await db.query(
+                'INSERT INTO menu_ingredients (menu_id, inventory_id, quantity_needed) VALUES (?, ?, ?)',
+                [menuId, Number(ingredient.inventory_id), Number(ingredient.quantity_needed)]
+            );
+        }
+
         res.status(201).json({
             message: 'Menu item created successfully',
-            menu_id: result.insertId
+            menu_id: menuId
         });
     } catch (error) {
         console.error('Error creating menu item:', error);
@@ -287,7 +327,7 @@ export const createMenuItem = async (req, res) => {
 export const updateMenuItem = async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, price, category, available, prep_time, description, image_url, sizes = [], addons = [] } = req.body;
+        const { name, price, category, available, prep_time, description, image_url, sizes = [], addons = [], ingredients = [] } = req.body;
         const normalizedSizes = parseJsonArray(sizes);
         const normalizedAddons = parseJsonArray(addons);
         const resolvedPrice = normalizedSizes.length
@@ -310,6 +350,46 @@ export const updateMenuItem = async (req, res) => {
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Menu item not found' });
+        }
+
+        if (Array.isArray(ingredients)) {
+            const [existingRows] = await db.query('SELECT id, inventory_id, quantity_needed FROM menu_ingredients WHERE menu_id = ?', [id]);
+            const existingByInventory = new Map(existingRows.map(row => [String(row.inventory_id), row]));
+            const ingredientIdsToKeep = new Set();
+
+            for (const ingredient of ingredients) {
+                const inventoryId = Number(ingredient.inventory_id);
+                const quantityNeeded = Number(ingredient.quantity_needed);
+                if (!inventoryId || !quantityNeeded || quantityNeeded <= 0) continue;
+
+                const existing = existingByInventory.get(String(inventoryId));
+                if (existing) {
+                    ingredientIdsToKeep.add(String(inventoryId));
+                    if (existing.quantity_needed !== quantityNeeded) {
+                        await db.query(
+                            'UPDATE menu_ingredients SET quantity_needed = ? WHERE id = ?',
+                            [quantityNeeded, existing.id]
+                        );
+                    }
+                } else {
+                    await db.query(
+                        'INSERT INTO menu_ingredients (menu_id, inventory_id, quantity_needed) VALUES (?, ?, ?)',
+                        [id, inventoryId, quantityNeeded]
+                    );
+                    ingredientIdsToKeep.add(String(inventoryId));
+                }
+            }
+
+            const toDelete = existingRows
+                .filter(row => !ingredientIdsToKeep.has(String(row.inventory_id)))
+                .map(row => row.id);
+
+            if (toDelete.length > 0) {
+                await db.query(
+                    `DELETE FROM menu_ingredients WHERE id IN (${toDelete.map(() => '?').join(',')})`,
+                    toDelete
+                );
+            }
         }
 
         res.json({ message: 'Menu item updated successfully' });

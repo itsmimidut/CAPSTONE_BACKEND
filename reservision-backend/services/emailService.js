@@ -132,38 +132,39 @@ export async function sendOTPEmail(email, otpCode, firstName = 'Guest') {
  * @param {Object} bookingData - Complete booking information
  */
 export async function sendBookingConfirmationEmail(bookingData) {
+  const useBrevo = Boolean(process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL);
   const resendClient = getResendClient();
 
-  if (!resendClient) {
-    throw new Error('Resend API key not configured');
+  if (!useBrevo && !resendClient) {
+    throw new Error('No email service configured. Set RESEND_API_KEY or BREVO_API_KEY with BREVO_FROM_EMAIL');
   }
 
   const {
     email,
-    firstName,
-    lastName,
-    bookingReference,
-    checkIn,
-    checkOut,
-    items,
-    total
-  } = bookingData;
+    firstName = '',
+    lastName = '',
+    bookingReference = '',
+    checkIn = '',
+    checkOut = '',
+    items = [],
+    total = 0
+  } = bookingData || {};
 
-  const formatDate = (date) => new Date(date).toLocaleDateString('en-US', {
+  const formatDate = (date) => date ? new Date(date).toLocaleDateString('en-US', {
     weekday: 'long',
     year: 'numeric',
     month: 'long',
     day: 'numeric'
-  });
+  }) : '';
 
   const itemsList = items.map(item => `
     <tr>
       <td style="padding: 12px; border-bottom: 1px solid #E2E8F0;">
         <strong style="color: #2D3748;">${item.name}</strong><br>
-        <span style="color: #718096; font-size: 13px;">Qty: ${item.qty} | Guests: ${item.guests}</span>
+        <span style="color: #718096; font-size: 13px;">Qty: ${item.qty} | Guests: ${item.guests || 0}</span>
       </td>
       <td style="padding: 12px; border-bottom: 1px solid #E2E8F0; text-align: right; color: #2D3748; font-weight: 600;">
-        ₱${(item.price * item.qty).toLocaleString()}
+        ₱${(Number(item.price || 0) * Number(item.qty || 0)).toLocaleString()}
       </td>
     </tr>
   `).join('');
@@ -224,7 +225,7 @@ export async function sendBookingConfirmationEmail(bookingData) {
                 ${itemsList}
                 <tr>
                   <td style="padding: 16px; text-align: right; font-weight: 700; color: #2B6CB0; font-size: 18px;" colspan="2">
-                    Total: ₱${total.toLocaleString()}
+                    Total: ₱${Number(total || 0).toLocaleString()}
                   </td>
                 </tr>
               </table>
@@ -266,8 +267,29 @@ export async function sendBookingConfirmationEmail(bookingData) {
   `;
 
   try {
+    if (useBrevo) {
+      console.log('📤 Sending booking confirmation via Brevo to:', email);
+      const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+      apiInstance.setApiKey(SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey, process.env.BREVO_API_KEY);
+
+      const result = await apiInstance.sendTransacEmail({
+        sender: { email: process.env.BREVO_FROM_EMAIL, name: process.env.BREVO_FROM_NAME || "Eduardo's Resort" },
+        to: [{ email }],
+        subject: `Booking Confirmed - ${bookingReference}`,
+        htmlContent
+      });
+
+      console.log('✅ Booking confirmation sent via Brevo:', result.messageId || result.id || 'unknown');
+      return result;
+    }
+
+    if (!resendClient) {
+      throw new Error('No email service configured. Set RESEND_API_KEY or BREVO_API_KEY with BREVO_FROM_EMAIL');
+    }
+
+    console.log('📤 Sending booking confirmation via Resend to:', email);
     const result = await resendClient.emails.send({
-      from: "Eduardo's Resort <bookings@resend.dev>",
+      from: `Eduardo's Resort <${process.env.RESEND_FROM_EMAIL || 'bookings@resend.dev'}>`,
       to: email,
       subject: `Booking Confirmed - ${bookingReference}`,
       html: htmlContent

@@ -189,11 +189,11 @@ export const createUser = async (req, res) => {
         }
 
         // Validate role
-        const validRoles = ['customer', 'admin', 'restaurantstaff', 'receptionist'];
+        const validRoles = ['customer', 'admin', 'restaurantstaff', 'receptionist', 'swimming_instructor'];
         if (!validRoles.includes(role)) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid role. Must be: customer, admin, restaurantstaff, or receptionist'
+                error: 'Invalid role. Must be: customer, admin, restaurantstaff, receptionist, or swimming_instructor'
             });
         }
 
@@ -510,11 +510,11 @@ export const changeUserRole = async (req, res) => {
         }
 
         // Validate role
-        const validRoles = ['customer', 'admin', 'restaurantstaff', 'receptionist'];
+        const validRoles = ['customer', 'admin', 'restaurantstaff', 'receptionist', 'swimming_instructor'];
         if (!validRoles.includes(role)) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid role. Must be: customer, admin, restaurantstaff, or receptionist'
+                error: 'Invalid role. Must be: customer, admin, restaurantstaff, receptionist, or swimming_instructor'
             });
         }
 

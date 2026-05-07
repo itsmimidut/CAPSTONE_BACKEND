@@ -220,7 +220,7 @@ export const customerLogin = async (req, res) => {
     const [users] = await db.query(
       `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone, u.password, u.role
          FROM user u
-         WHERE u.email = ? AND u.role IN ('customer', 'admin', 'restaurantstaff', 'receptionist')
+         WHERE u.email = ? AND u.role IN ('customer', 'admin', 'restaurantstaff', 'receptionist', 'swimming_instructor')
          LIMIT 1`,
       [normalizedEmail]
     );
@@ -276,7 +276,8 @@ export const customerLogin = async (req, res) => {
         lastName: customer.last_name,
         email: customer.email,
         phone: customer.phone,
-        role: customer.role
+        role: customer.role,
+        coach_id: customer.coach_id || null
       },
       message: 'Login successful'
     });

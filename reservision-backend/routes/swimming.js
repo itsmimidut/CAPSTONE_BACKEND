@@ -37,6 +37,511 @@ const generateSwimmingBookingReference = () => {
     return `SWM${stamp}`;
 };
 
+const countApprovedEnrollmentsForSchedule = async (scheduleId) => {
+    const [[{ count }]] = await db.query(
+        `SELECT COUNT(*) AS count
+         FROM swimming_enrollments
+         WHERE schedule_id = ? AND enrollment_status = 'Approved'`,
+        [scheduleId]
+    );
+    return Number(count || 0);
+};
+
+const updateBatchScheduleStatus = async (scheduleId) => {
+    const [[scheduleRow]] = await db.query(
+        `SELECT schedule_id, max_slots, status
+         FROM swimming_batch_schedules
+         WHERE schedule_id = ?`,
+        [scheduleId]
+    );
+
+    if (!scheduleRow || scheduleRow.status === 'Closed') return;
+
+    const approvedCount = await countApprovedEnrollmentsForSchedule(scheduleId);
+    const nextStatus = approvedCount >= Number(scheduleRow.max_slots) ? 'Full' : 'Open';
+
+    if (nextStatus !== scheduleRow.status) {
+        await db.query(
+            `UPDATE swimming_batch_schedules
+             SET status = ?
+             WHERE schedule_id = ?`,
+            [nextStatus, scheduleId]
+        );
+    }
+};
+
+const findCoachScheduleConflict = async (coachId, batchId, startTime, endTime, excludeScheduleId = null) => {
+    if (!coachId) return false;
+
+    const [batchRows] = await db.query(
+        `SELECT start_date, end_date
+         FROM swimming_batches
+         WHERE batch_id = ?`,
+        [batchId]
+    );
+    if (!batchRows.length) return false;
+
+    const { start_date, end_date } = batchRows[0];
+
+    let sql = `
+        SELECT s.schedule_id
+        FROM swimming_batch_schedules s
+        INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+        WHERE s.coach_id = ?
+          AND NOT (b.end_date < ? OR b.start_date > ?)
+          AND NOT (s.end_time <= ? OR s.start_time >= ?)`;
+    const params = [coachId, start_date, end_date, startTime, endTime];
+
+    if (excludeScheduleId) {
+        sql += ` AND s.schedule_id != ?`;
+        params.push(excludeScheduleId);
+    }
+
+    const [rows] = await db.query(sql, params);
+    return rows.length > 0;
+};
+
+/**
+ * GET /api/swimming/instructor/dashboard/:coachId
+ * Instructor dashboard summary for the coach.
+ */
+router.get('/instructor/dashboard/:coachId', async (req, res) => {
+    try {
+        const { coachId } = req.params;
+        if (!coachId) {
+            return res.status(400).json({ success: false, error: 'Coach ID is required' });
+        }
+
+        const [coachRows] = await db.query(
+            `SELECT coach_id, name
+             FROM swimming_coaches
+             WHERE coach_id = ?
+             LIMIT 1`,
+            [coachId]
+        );
+
+        if (!coachRows.length) {
+            return res.status(404).json({ success: false, error: 'Coach not found' });
+        }
+
+        const coach = coachRows[0];
+
+        const [[scheduleStats]] = await db.query(
+            `SELECT
+                COUNT(*) AS todayClasses
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             WHERE s.coach_id = ?
+               AND DATE(NOW()) BETWEEN b.start_date AND b.end_date`,
+            [coachId]
+        );
+
+        const [[generalStats]] = await db.query(
+            `SELECT
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN se.enrollment_id
+                END) AS assignedStudents,
+                COUNT(DISTINCT CASE
+                    WHEN LOWER(b.status) IN ('active', 'open', 'filling')
+                    THEN b.batch_id
+                END) AS activeBatches,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status = 'Pending'
+                    THEN se.enrollment_id
+                END) AS pendingAttendance,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status = 'Completed'
+                    THEN se.enrollment_id
+                END) AS completedLessons
+             FROM swimming_enrollments se
+             LEFT JOIN swimming_batch_schedules s ON se.schedule_id = s.schedule_id
+             LEFT JOIN swimming_batches b ON se.batch_id = b.batch_id
+             WHERE se.coach_id = ?
+                OR s.coach_id = ?`,
+            [coachId, coachId]
+        );
+
+        const [todaySchedules] = await db.query(
+            `SELECT
+                s.schedule_id,
+                s.batch_id,
+                b.batch_name,
+                b.lesson_type,
+                b.capacity,
+                b.status AS batch_status,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.days,
+                s.max_slots,
+                s.status AS schedule_status,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN se.enrollment_id
+                END) AS students_count
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             LEFT JOIN swimming_enrollments se ON se.schedule_id = s.schedule_id
+             WHERE s.coach_id = ?
+               AND DATE(NOW()) BETWEEN b.start_date AND b.end_date
+             GROUP BY s.schedule_id
+             ORDER BY s.start_time ASC
+             LIMIT 10`,
+            [coachId]
+        );
+
+        const [assignedBatches] = await db.query(
+            `SELECT
+                b.batch_id,
+                s.schedule_id,
+                b.batch_name,
+                b.lesson_type,
+                b.days,
+                b.time_slot,
+                b.capacity,
+                b.status,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status AS schedule_status,
+                COUNT(DISTINCT CASE
+                    WHEN se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN se.enrollment_id
+                END) AS students
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             LEFT JOIN swimming_enrollments se
+               ON se.schedule_id = s.schedule_id
+               AND se.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+             WHERE s.coach_id = ?
+             GROUP BY s.schedule_id, b.batch_id
+             ORDER BY b.start_date DESC, s.start_time ASC
+             LIMIT 12`,
+            [coachId]
+        );
+
+        const [myStudents] = await db.query(
+            `SELECT
+                se.enrollment_id,
+                se.first_name,
+                se.last_name,
+                se.email,
+                se.lesson_type,
+                se.batch_id,
+                se.schedule_id,
+                se.coach_id,
+                b.batch_name,
+                b.time_slot,
+                b.days,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                se.enrollment_status
+             FROM swimming_enrollments se
+             LEFT JOIN swimming_batch_schedules s ON se.schedule_id = s.schedule_id
+             LEFT JOIN swimming_batches b ON se.batch_id = b.batch_id
+             WHERE se.coach_id = ?
+                OR s.coach_id = ?
+             ORDER BY se.created_at DESC
+             LIMIT 20`,
+            [coachId, coachId]
+        );
+
+        const [calendarEvents] = await db.query(
+            `SELECT
+                s.schedule_id AS id,
+                b.batch_name,
+                b.lesson_type,
+                s.start_time,
+                s.end_time,
+                b.status AS batch_status,
+                DATE(NOW()) AS date
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             WHERE s.coach_id = ?
+               AND DATE(NOW()) BETWEEN b.start_date AND b.end_date
+             ORDER BY s.start_time ASC
+             LIMIT 20`,
+            [coachId]
+        );
+
+        res.json({
+            success: true,
+            coach,
+            stats: {
+                todayClasses: Number(scheduleStats?.todayClasses || 0),
+                today_classes: Number(scheduleStats?.todayClasses || 0),
+                assignedStudents: Number(generalStats?.assignedStudents || 0),
+                assigned_students: Number(generalStats?.assignedStudents || 0),
+                activeBatches: Number(generalStats?.activeBatches || 0),
+                active_batches: Number(generalStats?.activeBatches || 0),
+                pendingAttendance: Number(generalStats?.pendingAttendance || 0),
+                pending_attendance: Number(generalStats?.pendingAttendance || 0),
+                completedLessons: Number(generalStats?.completedLessons || 0),
+                completed_lessons: Number(generalStats?.completedLessons || 0)
+            },
+            todaySchedules,
+            assignedBatches,
+            myStudents,
+            calendarEvents
+        });
+    } catch (error) {
+        console.error('Error fetching instructor dashboard:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch instructor dashboard',
+            details: error.message
+        });
+    }
+});
+
+/**
+ * GET /api/swimming/instructor/dashboard-data/:coachId
+ * Instructor dashboard summary using admin-style data filtered by coach.
+ */
+router.get('/instructor/dashboard-data/:coachId', async (req, res) => {
+    try {
+        const { coachId } = req.params;
+        if (!coachId) {
+            return res.status(400).json({ success: false, error: 'Coach ID is required' });
+        }
+
+        const [coachRows] = await db.query(
+            `SELECT
+                coach_id,
+                user_id,
+                name,
+                specialization,
+                status
+             FROM swimming_coaches
+             WHERE coach_id = ?
+             LIMIT 1`,
+            [coachId]
+        );
+
+        if (!coachRows.length) {
+            return res.status(404).json({ success: false, error: 'Coach not found' });
+        }
+
+        const coach = coachRows[0];
+        const today = new Date().toISOString().slice(0, 10);
+
+        const [students] = await db.query(`
+            SELECT
+                e.enrollment_id,
+                CONCAT(e.first_name, ' ', e.last_name) AS name,
+                e.first_name,
+                e.last_name,
+                e.email,
+                e.mobile_phone,
+                e.booking_reference,
+                e.lesson_type,
+                e.payment_status,
+                e.enrollment_status,
+                e.batch_id,
+                e.schedule_id,
+                e.coach_id,
+                b.batch_name,
+                b.start_date,
+                b.end_date,
+                b.status AS batch_status,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status AS schedule_status,
+                sc.name AS schedule_coach_name
+            FROM swimming_enrollments e
+            LEFT JOIN swimming_batch_schedules s
+                ON s.schedule_id = e.schedule_id
+            LEFT JOIN swimming_batches b
+                ON b.batch_id = e.batch_id
+            LEFT JOIN swimming_coaches sc
+                ON sc.coach_id = COALESCE(e.coach_id, s.coach_id)
+            WHERE e.coach_id = ?
+               OR s.coach_id = ?
+            ORDER BY e.created_at DESC
+        `, [coachId, coachId]);
+
+        const [batchSchedules] = await db.query(`
+            SELECT
+                s.schedule_id,
+                s.batch_id,
+                s.coach_id,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status,
+                b.batch_name,
+                b.lesson_type,
+                b.start_date,
+                b.end_date,
+                b.status AS batch_status,
+                c.name AS coach_name,
+                COUNT(DISTINCT CASE
+                    WHEN e.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN e.enrollment_id
+                END) AS used_slots
+            FROM swimming_batch_schedules s
+            INNER JOIN swimming_batches b
+                ON b.batch_id = s.batch_id
+            LEFT JOIN swimming_coaches c
+                ON c.coach_id = s.coach_id
+            LEFT JOIN swimming_enrollments e
+                ON e.schedule_id = s.schedule_id
+            WHERE s.coach_id = ?
+            GROUP BY s.schedule_id
+            ORDER BY b.start_date ASC, s.start_time ASC
+        `, [coachId]);
+
+        const [batches] = await db.query(`
+            SELECT
+                b.batch_id,
+                b.batch_name,
+                b.lesson_type,
+                b.start_date,
+                b.end_date,
+                b.status,
+                COUNT(DISTINCT s.schedule_id) AS schedule_count,
+                COALESCE(SUM(s.max_slots), 0) AS schedule_capacity,
+                COUNT(DISTINCT CASE
+                    WHEN e.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN e.enrollment_id
+                END) AS enrolled_count
+            FROM swimming_batches b
+            INNER JOIN swimming_batch_schedules s
+                ON s.batch_id = b.batch_id
+               AND s.coach_id = ?
+            LEFT JOIN swimming_enrollments e
+                ON e.schedule_id = s.schedule_id
+            GROUP BY b.batch_id
+            ORDER BY b.start_date DESC
+        `, [coachId]);
+
+        const [todaySchedules] = await db.query(`
+            SELECT
+                s.schedule_id,
+                s.batch_id,
+                s.coach_id,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status,
+                b.batch_name,
+                b.lesson_type,
+                c.name AS coach_name,
+                COUNT(DISTINCT CASE
+                    WHEN e.enrollment_status IN ('Approved', 'Enrolled', 'Completed')
+                    THEN e.enrollment_id
+                END) AS used_slots
+            FROM swimming_batch_schedules s
+            INNER JOIN swimming_batches b
+                ON b.batch_id = s.batch_id
+            LEFT JOIN swimming_coaches c
+                ON c.coach_id = s.coach_id
+            LEFT JOIN swimming_enrollments e
+                ON e.schedule_id = s.schedule_id
+            WHERE s.coach_id = ?
+              AND ? BETWEEN b.start_date AND b.end_date
+            GROUP BY s.schedule_id
+            ORDER BY s.start_time ASC
+        `, [coachId, today]);
+
+        const approvedStudents = students.filter((student) =>
+            ['approved', 'enrolled', 'completed'].includes(String(student.enrollment_status || '').toLowerCase())
+        );
+
+        const activeBatches = batches.filter((batch) =>
+            ['open', 'active', 'filling'].includes(String(batch.status || '').toLowerCase())
+        );
+
+        const pendingAttendance = todaySchedules.length;
+        const stats = {
+            todayClasses: todaySchedules.length,
+            today_classes: todaySchedules.length,
+            assignedStudents: approvedStudents.length,
+            assigned_students: approvedStudents.length,
+            activeBatches: activeBatches.length,
+            active_batches: activeBatches.length,
+            pendingAttendance,
+            pending_attendance: pendingAttendance,
+            completedLessons: 0,
+            completed_lessons: 0
+        };
+
+        const calendarEvents = batchSchedules.map((row) => ({
+            id: row.schedule_id,
+            schedule_id: row.schedule_id,
+            date: row.start_date,
+            batch: row.batch_name,
+            batch_name: row.batch_name,
+            lesson_type: row.lesson_type,
+            time: `${row.start_time || 'TBD'} - ${row.end_time || 'TBD'}`,
+            start_time: row.start_time,
+            end_time: row.end_time,
+            status: row.status || row.batch_status || 'Open'
+        }));
+
+        res.json({
+            success: true,
+            coach,
+            stats,
+            students,
+            batches,
+            batchSchedules,
+            todaySchedules,
+            calendarEvents
+        });
+    } catch (error) {
+        console.error('Error fetching instructor dashboard data:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch instructor dashboard data',
+            details: error.message
+        });
+    }
+});
+
+router.get('/instructor/coach-by-user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!userId) {
+            return res.status(400).json({ success: false, message: 'User ID is required' });
+        }
+
+        const [rows] = await db.query(
+            `SELECT coach_id, name
+             FROM swimming_coaches
+             WHERE user_id = ?
+             LIMIT 1`,
+            [userId]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({
+                success: false,
+                message: 'Coach profile not linked to this account.'
+            });
+        }
+
+        res.json({
+            success: true,
+            coach: rows[0]
+        });
+    } catch (error) {
+        console.error('Error fetching coach by user:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch coach profile',
+            error: error.message
+        });
+    }
+});
+
 // ============================================================
 // ENROLLMENT ENDPOINTS
 // ============================================================
@@ -60,12 +565,12 @@ router.post("/enrollments", async (req, res) => {
             middleName,
             lastName,
             dateOfBirth,
+            bookingReference,
 
             // Personal Details
             sex,
             weight,
             height,
-            preferredCoach,
             address,
             mobilePhone,
             email,
@@ -78,19 +583,19 @@ router.post("/enrollments", async (req, res) => {
             physicianPhone,
 
             // Swimming Details
-            lessonType,
             skillLevel,
 
             // Agreement
             agreedToTerms,
+            agreedToWaiver,
             agriedToWaiver
         } = req.body;
 
         // Validate required fields
-        if (!firstName || !lastName || !dateOfBirth || !email || !preferredCoach || !address || !lessonType) {
+        if (!bookingReference || !firstName || !lastName || !dateOfBirth || !email || !address) {
             return res.status(400).json({
                 error: "Missing required fields",
-                required: ["firstName", "lastName", "dateOfBirth", "email", "preferredCoach", "address", "lessonType"]
+                required: ["bookingReference", "firstName", "lastName", "dateOfBirth", "email", "address"]
             });
         }
 
@@ -100,26 +605,74 @@ router.post("/enrollments", async (req, res) => {
             return res.status(400).json({ error: "Invalid email format" });
         }
 
+        // Fetch booking details from booking_items
+        const [bookingResult] = await db.query(
+            `SELECT 
+                bi.item_name as lesson_type,
+                bi.unit_price as rate_amount,
+                bi.batch_id,
+                bi.schedule_id,
+                bi.coach_id,
+                b.payment_status
+            FROM bookings b
+            JOIN booking_items bi ON b.booking_id = bi.booking_id
+            WHERE b.booking_reference = ?
+                AND bi.item_type = 'Swimming'
+                AND b.payment_status = 'Paid'`,
+            [bookingReference]
+        );
+
+        if (bookingResult.length === 0) {
+            return res.status(404).json({
+                error: "Booking reference not found or not a valid swimming booking"
+            });
+        }
+
+        const bookingData = bookingResult[0];
+
+        // Check if batch_id and schedule_id are present
+        if (!bookingData.batch_id || !bookingData.schedule_id) {
+            return res.status(400).json({
+                error: "This swimming booking is missing batch schedule details. Please create a new batch-based swimming booking."
+            });
+        }
+
+        // If coach_id is missing from booking_items, get from swimming_batch_schedules
+        let coachId = bookingData.coach_id;
+        if (!coachId) {
+            const [scheduleResult] = await db.query(
+                `SELECT coach_id FROM swimming_batch_schedules WHERE schedule_id = ?`,
+                [bookingData.schedule_id]
+            );
+            if (scheduleResult.length > 0) {
+                coachId = scheduleResult[0].coach_id;
+            }
+        }
+
         const sql = `
       INSERT INTO swimming_enrollments (
+        booking_reference,
         first_name, middle_name, last_name, date_of_birth,
         sex, weight, height, preferred_coach, address, mobile_phone, email,
         father_name, mother_name,
         emergency_contact_name, emergency_contact_phone,
         physician_phone,
         lesson_type, skill_level,
+        batch_id, schedule_id, coach_id, rate_amount, payment_status, enrollment_status,
         agreed_to_terms, agreed_to_waiver
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
         const values = [
+            bookingReference,
             firstName, middleName, lastName, dateOfBirth,
-            sex || 'Male', weight, height, preferredCoach, address, mobilePhone, email,
+            sex || 'Male', weight, height, '', address, mobilePhone, email,
             fatherName || null, motherName || null,
             emergencyContactName || null, emergencyContactPhone || null,
             physicianPhone || null,
-            lessonType, skillLevel || 'Beginner',
-            agreedToTerms ? 1 : 0, agriedToWaiver ? 1 : 0
+            bookingData.lesson_type, skillLevel || 'Beginner',
+            bookingData.batch_id, bookingData.schedule_id, coachId, bookingData.rate_amount, bookingData.payment_status, 'Pending',
+            agreedToTerms ? 1 : 0, (agreedToWaiver ?? agriedToWaiver) ? 1 : 0
         ];
 
         const [result] = await db.query(sql, values);
@@ -166,7 +719,7 @@ router.post("/validate-booking", async (req, res) => {
             });
         }
 
-        // Query booking details (no enrollment counting - using simplified approach)
+        // Query booking details with batch and schedule info
         const [result] = await db.query(
             `SELECT 
                 b.booking_id,
@@ -177,11 +730,24 @@ router.post("/validate-booking", async (req, res) => {
                 c.email as booker_email,
                 c.phone as booker_phone,
                 bi.guests as paid_slots,
-                bi.item_name as package_name,
-                bi.item_description
+                bi.item_name,
+                bi.unit_price,
+                bi.batch_id,
+                bi.schedule_id,
+                bi.coach_id,
+                sb.batch_name,
+                sb.start_date,
+                sb.end_date,
+                sbs.class_period,
+                sbs.start_time,
+                sbs.end_time,
+                co.name as coach_name
             FROM bookings b
             JOIN booking_items bi ON b.booking_id = bi.booking_id
             JOIN customers c ON b.customer_id = c.customer_id
+            LEFT JOIN swimming_batches sb ON bi.batch_id = sb.batch_id
+            LEFT JOIN swimming_batch_schedules sbs ON bi.schedule_id = sbs.schedule_id
+            LEFT JOIN swimming_coaches co ON bi.coach_id = co.coach_id OR sbs.coach_id = co.coach_id
             WHERE b.booking_reference = ?
                 AND bi.item_type = 'Swimming'
                 AND b.payment_status = 'Paid'`,
@@ -205,11 +771,22 @@ router.post("/validate-booking", async (req, res) => {
             [bookingReference]
         );
 
+        const [existingEnrollments] = await db.query(
+            `SELECT *
+             FROM swimming_enrollments
+             WHERE booking_reference = ?
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [bookingReference]
+        );
+
+        const existingEnrollment = existingEnrollments[0] || null;
         const enrolledCount = enrollmentCount[0].enrolled_count;
         const availableSlots = booking.paid_slots - enrolledCount;
+        const bookingIsFull = availableSlots <= 0;
 
-        // Check if booking is full
-        if (availableSlots <= 0) {
+        // If the booking is full and no existing enrollment exists, block new enrollments.
+        if (bookingIsFull && !existingEnrollment) {
             return res.status(400).json({
                 success: false,
                 canEnroll: false,
@@ -234,14 +811,30 @@ router.post("/validate-booking", async (req, res) => {
 
         res.json({
             success: true,
-            canEnroll: true,
+            canEnroll: !bookingIsFull,
+            existingEnrollment: existingEnrollment,
             booking: {
-                ...booking,
+                booking_reference: booking.booking_reference,
+                item_name: booking.item_name,
+                unit_price: booking.unit_price,
+                payment_status: booking.payment_status,
+                batch_id: booking.batch_id,
+                schedule_id: booking.schedule_id,
+                coach_id: booking.coach_id,
+                batch_name: booking.batch_name,
+                start_date: booking.start_date,
+                end_date: booking.end_date,
+                class_period: booking.class_period,
+                start_time: booking.start_time,
+                end_time: booking.end_time,
+                coach_name: booking.coach_name,
                 swimmingDetails: swimmingDetails,
                 enrolled_count: enrolledCount,
-                available_slots: availableSlots
+                available_slots: Math.max(0, availableSlots)
             },
-            message: `Booking validated successfully. ${availableSlots} slot(s) available. Class ID: ${booking.booking_reference}`
+            message: bookingIsFull
+                ? `Booking is full, but an existing enrollment was found. You may update your registration.`
+                : `Booking validated successfully. ${availableSlots} slot(s) available. Class ID: ${booking.booking_reference}`
         });
 
     } catch (error) {
@@ -310,7 +903,9 @@ router.post("/enroll", async (req, res) => {
                 b.booking_reference,
                 bi.guests as paid_slots,
                 bi.item_name as lesson_type,
-                bi.item_description
+                bi.item_description,
+                bi.batch_id,
+                bi.schedule_id
             FROM bookings b
             JOIN booking_items bi ON b.booking_id = bi.booking_id
             WHERE b.booking_reference = ?
@@ -339,6 +934,34 @@ router.post("/enroll", async (req, res) => {
             }
         }
 
+        // Extract batch_id and schedule_id from booking item
+        let batchId = booking.batch_id;
+        let scheduleId = booking.schedule_id;
+
+        // Fallback: try to parse from swimmingDetails if batch/schedule not in booking_items
+        if (!batchId && swimmingDetails && swimmingDetails.batch_id) {
+            batchId = swimmingDetails.batch_id;
+        }
+        if (!scheduleId && swimmingDetails && swimmingDetails.schedule_id) {
+            scheduleId = swimmingDetails.schedule_id;
+        }
+
+        // Get coach_id from swimming_batch_schedules if schedule_id is available
+        let coachId = null;
+        if (scheduleId) {
+            try {
+                const [scheduleData] = await connection.query(
+                    `SELECT coach_id FROM swimming_batch_schedules WHERE schedule_id = ?`,
+                    [scheduleId]
+                );
+                if (scheduleData.length > 0) {
+                    coachId = scheduleData[0].coach_id;
+                }
+            } catch (e) {
+                console.error("Error fetching coach_id:", e);
+            }
+        }
+
         // Step 2: Check how many enrollments already exist for this booking reference
         const [enrollmentCount] = await connection.query(
             `SELECT COUNT(*) as enrolled_count
@@ -362,6 +985,9 @@ router.post("/enroll", async (req, res) => {
         const [enrollmentResult] = await connection.query(
             `INSERT INTO swimming_enrollments (
                 booking_reference,
+                batch_id,
+                schedule_id,
+                coach_id,
                 first_name,
                 middle_name,
                 last_name,
@@ -381,9 +1007,12 @@ router.post("/enroll", async (req, res) => {
                 skill_level,
                 enrollment_status,
                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Confirmed', NOW())`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Confirmed', NOW())`,
             [
                 bookingReference,
+                batchId || null,
+                scheduleId || null,
+                coachId || null,
                 firstName,
                 middleName || null,
                 lastName,
@@ -418,6 +1047,9 @@ router.post("/enroll", async (req, res) => {
             message: `Successfully enrolled ${firstName} ${lastName}`,
             bookingReference: bookingReference,
             classId: bookingReference,
+            batchId: batchId,
+            scheduleId: scheduleId,
+            coachId: coachId,
             totalSlots: booking.paid_slots,
             slotsUsed: finalEnrollments,
             allSlotsFilled: allSlotsFilled,
@@ -426,7 +1058,10 @@ router.post("/enroll", async (req, res) => {
                 name: `${firstName} ${lastName}`,
                 email: email,
                 lessonType: lessonType || booking.lesson_type,
-                skillLevel: skillLevel || 'Beginner'
+                skillLevel: skillLevel || 'Beginner',
+                batchId: batchId,
+                scheduleId: scheduleId,
+                coachId: coachId
             }
         });
 
@@ -558,10 +1193,10 @@ router.put("/enrollments/:id", async (req, res) => {
             values.push(paymentStatus);
         }
 
-        // Add other fields that can be updated
+        // Add other fields that can be updated (exclude fields derived from booking)
         const allowedFields = [
             'first_name', 'middle_name', 'last_name', 'email', 'mobile_phone',
-            'address', 'preferred_coach', 'lesson_type', 'skill_level',
+            'address', 'skill_level',
             'sex', 'weight', 'height', 'father_name', 'mother_name',
             'emergency_contact_name', 'emergency_contact_phone', 'physician_phone'
         ];
@@ -629,6 +1264,121 @@ router.delete("/enrollments/:id", async (req, res) => {
             error: "Failed to delete enrollment",
             details: error.message
         });
+    }
+});
+
+/**
+ * GET /api/swimming/page-data
+ * Serve swimming landing page metadata for the website
+ */
+router.get("/page-data", async (req, res) => {
+    try {
+        res.json({
+            features: [
+                { icon: 'fas fa-user-tie', title: 'Certified Instructors', description: 'Learn from experienced, certified swimming coaches with years of teaching experience' },
+                { icon: 'fas fa-shield-alt', title: 'Safety First', description: 'State-of-the-art facilities with lifeguards on duty and safety equipment available' },
+                { icon: 'fas fa-users', title: 'All Skill Levels', description: 'From beginners to advanced swimmers, we have programs tailored to your needs' }
+            ],
+            lessonTypes: [
+                {
+                    type: '7 Years Old & Above', subtitle: 'Teen & Adult Program', icon: 'fas fa-star',
+                    price: 3000, duration: 'package', image: '/images/child.jpeg',
+                    features: ['10 sessions program', '1 hour per session', 'Expert instruction', 'Progressive skill building', 'Flexible scheduling']
+                },
+                {
+                    type: '6 Years Old & Below', subtitle: 'Kids Swimming Program', icon: 'fas fa-swimmer',
+                    price: 4000, duration: 'package', image: '/images/teen.jpg',
+                    features: ['10 sessions program', '1 hour per session', 'Fun & safe learning', 'Age-appropriate methods', 'Parental involvement welcome']
+                }
+            ],
+            schedule: [
+                { time: '6:00 AM - 7:00 AM', weekday: 'Advanced Training', weekend: 'Private Sessions' },
+                { time: '8:00 AM - 9:00 AM', weekday: 'Beginner Group', weekend: 'Family Sessions' },
+                { time: '10:00 AM - 11:00 AM', weekday: 'Intermediate Group', weekend: 'Kids Group' },
+                { time: '2:00 PM - 3:00 PM', weekday: 'Kids Group', weekend: 'Beginner Group' },
+                { time: '4:00 PM - 5:00 PM', weekday: 'Private Sessions', weekend: 'Advanced Group' }
+            ],
+            galleryImages: [
+                { url: '/images/child.jpeg', caption: '7 Years Old & Above' },
+                { url: '/images/teen.jpg', caption: '6 Years Old & Below' }
+            ]
+        });
+    } catch (error) {
+        console.error('Error fetching page data:', error);
+        res.status(500).json({ error: 'Failed to fetch swimming page data', details: error.message });
+    }
+});
+
+/**
+ * GET /api/swimming/batches
+ * Return visible swimming batches for customer booking
+ */
+router.get('/batches', async (req, res) => {
+    try {
+        const [batches] = await db.query(
+            `SELECT batch_id, batch_name, start_date, end_date, status
+             FROM swimming_batches
+             WHERE status IN ('Open', 'Ongoing')
+             ORDER BY start_date ASC`
+        );
+
+        res.json({ success: true, batches });
+    } catch (error) {
+        console.error('Error fetching swimming batches:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch swimming batches', details: error.message });
+    }
+});
+
+/**
+ * GET /api/swimming/batch-schedules
+ * Return batch schedules for customer booking
+ */
+router.get('/batch-schedules', async (req, res) => {
+    try {
+        const { batchId } = req.query;
+        const params = [];
+        let whereClause = `b.status IN ('Open', 'Ongoing')`;
+
+        if (batchId) {
+            whereClause += ' AND s.batch_id = ?';
+            params.push(batchId);
+        }
+
+        const [rows] = await db.query(
+            `SELECT
+                s.schedule_id,
+                s.batch_id,
+                s.coach_id,
+                s.class_period,
+                s.start_time,
+                s.end_time,
+                s.max_slots,
+                s.status,
+                c.name AS coach_name,
+                b.batch_name,
+                b.start_date,
+                b.end_date
+             FROM swimming_batch_schedules s
+             INNER JOIN swimming_batches b ON s.batch_id = b.batch_id
+             LEFT JOIN swimming_coaches c ON s.coach_id = c.coach_id
+             WHERE ${whereClause}
+             ORDER BY b.start_date ASC, s.start_time ASC`,
+            params
+        );
+
+        const schedules = await Promise.all(rows.map(async row => {
+            const used_slots = await countApprovedEnrollmentsForSchedule(row.schedule_id);
+            return {
+                ...row,
+                used_slots,
+                slots_left: Math.max(0, Number(row.max_slots || 0) - used_slots)
+            };
+        }));
+
+        res.json({ success: true, schedules });
+    } catch (error) {
+        console.error('Error fetching batch schedules:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch batch schedules', details: error.message });
     }
 });
 
@@ -702,27 +1452,43 @@ router.post("/coaches", async (req, res) => {
             name,
             specialization,
             experienceYears,
+            experience_years,
             certification,
             bio,
             profileImage,
+            profile_image,
             availability,
-            maxStudents
+            maxStudents,
+            max_students,
+            status
         } = req.body;
 
         if (!name) {
             return res.status(400).json({ error: "Coach name is required" });
         }
 
+        const experienceYearsValue = experienceYears ?? experience_years ?? null;
+        const maxStudentsValue = maxStudents ?? max_students ?? 10;
+        const profileImageValue = profileImage ?? profile_image ?? null;
+        const statusValue = status || 'Active';
+
         const sql = `
       INSERT INTO swimming_coaches (
         name, specialization, experience_years, certification,
-        bio, profile_image, availability, max_students
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        bio, profile_image, availability, max_students, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
         const [result] = await db.query(sql, [
-            name, specialization, experienceYears, certification,
-            bio, profileImage, availability, maxStudents || 10
+            name,
+            specialization,
+            experienceYearsValue,
+            certification,
+            bio,
+            profileImageValue,
+            availability,
+            maxStudentsValue,
+            statusValue
         ]);
 
         const [coach] = await db.query(
@@ -731,6 +1497,7 @@ router.post("/coaches", async (req, res) => {
         );
 
         res.status(201).json({
+            success: true,
             message: "Coach created successfully",
             coach: coach[0]
         });
@@ -738,6 +1505,7 @@ router.post("/coaches", async (req, res) => {
     } catch (error) {
         console.error("Error creating coach:", error);
         res.status(500).json({
+            success: false,
             error: "Failed to create coach",
             details: error.message
         });
@@ -784,6 +1552,7 @@ router.put("/coaches/:id", async (req, res) => {
         );
 
         res.json({
+            success: true,
             message: "Coach updated successfully",
             coach: coach[0]
         });
@@ -1251,62 +2020,52 @@ router.delete("/class-bookings/:id", async (req, res) => {
  */
 router.get("/admin/students", async (req, res) => {
     try {
-        let students;
-        try {
-            // Extended query — includes admin-assigned schedule (requires ADD_SCHEDULE_TO_SWIMMING_ENROLLMENTS.sql)
-            [students] = await db.query(`
-                SELECT
-                    se.enrollment_id,
-                    CONCAT(se.first_name, ' ', se.last_name) as name,
-                    se.first_name,
-                    se.last_name,
-                    se.lesson_type,
-                    COALESCE(se.admin_assigned_coach, sc.name, se.preferred_coach) as coach,
-                    se.email,
-                    se.mobile_phone,
-                    se.enrollment_status,
-                    se.booking_reference,
-                    se.created_at,
-                    b.booking_id,
-                    b.payment_status,
-                    b.created_at as booking_date,
-                    se.admin_lesson_dates as lesson_dates,
-                    se.admin_lesson_time  as lesson_time
-                FROM swimming_enrollments se
-                LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
-                LEFT JOIN swimming_coaches sc ON sc.coach_id = se.preferred_coach
-                ORDER BY se.created_at DESC
-            `);
-        } catch (_) {
-            // Fallback: schedule columns not yet added — run ADD_SCHEDULE_TO_SWIMMING_ENROLLMENTS.sql first
-            [students] = await db.query(`
-                SELECT
-                    se.enrollment_id,
-                    CONCAT(se.first_name, ' ', se.last_name) as name,
-                    se.first_name,
-                    se.last_name,
-                    se.lesson_type,
-                    COALESCE(sc.name, se.preferred_coach) as coach,
-                    se.email,
-                    se.mobile_phone,
-                    se.enrollment_status,
-                    se.booking_reference,
-                    se.created_at,
-                    b.booking_id,
-                    b.payment_status,
-                    b.created_at as booking_date
-                FROM swimming_enrollments se
-                LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
-                LEFT JOIN swimming_coaches sc ON sc.coach_id = se.preferred_coach
-                ORDER BY se.created_at DESC
-            `);
-        }
-
-        console.log(`Found ${students.length} students in database`);
+        const [students] = await db.query(`
+            SELECT
+                se.enrollment_id,
+                CONCAT(se.first_name, ' ', se.last_name) AS name,
+                se.first_name,
+                se.last_name,
+                COALESCE(NULLIF(se.lesson_type, ''), bi.item_name) AS lesson_type,
+                COALESCE(sc.name, se.admin_assigned_coach, se.preferred_coach) AS coach,
+                se.email,
+                se.mobile_phone,
+                se.enrollment_status,
+                se.admin_lesson_dates,
+                se.admin_lesson_time,
+                se.admin_assigned_coach,
+                se.booking_reference,
+                se.created_at,
+                b.booking_id,
+                b.payment_status,
+                b.created_at AS booking_date,
+COALESCE(se.batch_id, bi.batch_id) AS batch_id,
+            COALESCE(se.schedule_id, bi.schedule_id) AS schedule_id,
+            se.rate_amount,
+            se.age_group,
+            se.rejection_reason,
+            sb.batch_name,
+            s.class_period,
+            s.start_time,
+            s.end_time,
+            s.status AS schedule_status,
+            s.max_slots,
+            COALESCE(sc2.name, 'Unassigned') AS schedule_coach_name,
+            JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.dates')) AS item_lesson_dates,
+            JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.time')) AS item_lesson_time
+            FROM swimming_enrollments se
+            LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
+            LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id AND bi.item_type = 'Swimming'
+            LEFT JOIN swimming_coaches sc ON sc.coach_id = se.coach_id
+            LEFT JOIN swimming_batch_schedules s ON COALESCE(se.schedule_id, bi.schedule_id) = s.schedule_id
+            LEFT JOIN swimming_batches sb ON COALESCE(se.batch_id, bi.batch_id) = sb.batch_id
+            LEFT JOIN swimming_coaches sc2 ON sc2.coach_id = s.coach_id
+            ORDER BY se.created_at DESC
+        `);
 
         res.json({
             success: true,
-            students: students,
+            students,
             count: students.length
         });
 
@@ -1321,8 +2080,389 @@ router.get("/admin/students", async (req, res) => {
 });
 
 /**
+ * GET /api/swimming/admin/batches
+ * List swimming batches with schedule counts
+ */
+router.get("/admin/batches", async (req, res) => {
+    try {
+        const [batches] = await db.query(`
+            SELECT
+                b.batch_id,
+                b.batch_id,
+                b.batch_name,
+                b.lesson_type,
+                b.coach_id,
+                b.days,
+                b.time_slot,
+                b.capacity AS batch_capacity,
+                b.notes,
+                b.start_date,
+                b.end_date,
+                b.status,
+                COUNT(DISTINCT bs.schedule_id) AS schedule_count,
+                COALESCE(SUM(bs.max_slots), 0) AS schedule_capacity,
+                COUNT(DISTINCT se.enrollment_id) AS enrolled_count,
+                SUM(CASE WHEN bs.status = 'Full' THEN 1 ELSE 0 END) AS full_schedule_count
+            FROM swimming_batches b
+            LEFT JOIN swimming_batch_schedules bs ON bs.batch_id = b.batch_id
+            LEFT JOIN swimming_enrollments se ON se.schedule_id = bs.schedule_id AND se.enrollment_status = 'Approved'
+            GROUP BY b.batch_id
+            ORDER BY b.start_date ASC
+        `);
+
+        res.json({ success: true, batches, count: batches.length });
+    } catch (error) {
+        console.error("Error fetching batches:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch batches", details: error.message });
+    }
+});
+
+/**
+ * POST /api/swimming/admin/batches
+ * Create a new batch
+ */
+router.post("/admin/batches", async (req, res) => {
+    try {
+        const { batchName, lessonType = null, coachId = null, days = null, timeSlot = null, capacity = 0, notes = null, startDate, endDate, status = 'Open' } = req.body;
+
+        if (!batchName || !startDate || !endDate) {
+            return res.status(400).json({ success: false, error: "batchName, startDate, and endDate are required" });
+        }
+
+        const [result] = await db.query(
+            `INSERT INTO swimming_batches (batch_name, lesson_type, coach_id, days, time_slot, capacity, notes, start_date, end_date, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [batchName, lessonType, coachId || null, JSON.stringify(days || []), timeSlot, Number(capacity) || 0, notes || null, startDate, endDate, status]
+        );
+
+        const [batchRows] = await db.query("SELECT * FROM swimming_batches WHERE batch_id = ?", [result.insertId]);
+        res.status(201).json({ success: true, batch: batchRows[0] });
+    } catch (error) {
+        console.error("Error creating batch:", error);
+        res.status(500).json({ success: false, error: "Failed to create batch", details: error.message });
+    }
+});
+
+/**
+ * PUT /api/swimming/admin/batches/:id
+ * Update batch details or status
+ */
+router.put("/admin/batches/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { batchName, lessonType, coachId, days, timeSlot, capacity, notes, startDate, endDate, status } = req.body;
+
+        const updates = [];
+        const values = [];
+
+        if (batchName) {
+            updates.push("batch_name = ?");
+            values.push(batchName);
+        }
+        if (lessonType !== undefined) {
+            updates.push("lesson_type = ?");
+            values.push(lessonType || null);
+        }
+        if (coachId !== undefined) {
+            updates.push("coach_id = ?");
+            values.push(coachId || null);
+        }
+        if (days !== undefined) {
+            updates.push("days = ?");
+            values.push(JSON.stringify(days || []));
+        }
+        if (timeSlot !== undefined) {
+            updates.push("time_slot = ?");
+            values.push(timeSlot || null);
+        }
+        if (capacity !== undefined) {
+            updates.push("capacity = ?");
+            values.push(Number(capacity) || 0);
+        }
+        if (notes !== undefined) {
+            updates.push("notes = ?");
+            values.push(notes || null);
+        }
+        if (startDate) {
+            updates.push("start_date = ?");
+            values.push(startDate);
+        }
+        if (endDate) {
+            updates.push("end_date = ?");
+            values.push(endDate);
+        }
+        if (status) {
+            updates.push("status = ?");
+            values.push(status);
+        }
+
+        if (!updates.length) {
+            return res.status(400).json({ success: false, error: "No batch fields provided for update" });
+        }
+
+        values.push(id);
+        await db.query(`UPDATE swimming_batches SET ${updates.join(", ")} WHERE batch_id = ?`, values);
+
+        const [batchRows] = await db.query("SELECT * FROM swimming_batches WHERE batch_id = ?", [id]);
+        return res.json({ success: true, batch: batchRows[0] });
+    } catch (error) {
+        console.error("Error updating batch:", error);
+        res.status(500).json({ success: false, error: "Failed to update batch", details: error.message });
+    }
+});
+
+/**
+ * DELETE /api/swimming/admin/batches/:id
+ * Close or delete batch depending on existing schedules
+ */
+router.delete("/admin/batches/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [[{ schedule_count }]] = await db.query(
+            `SELECT COUNT(*) AS schedule_count FROM swimming_batch_schedules WHERE batch_id = ?`,
+            [id]
+        );
+
+        if (schedule_count > 0) {
+            await db.query(`UPDATE swimming_batches SET status = 'Closed' WHERE batch_id = ?`, [id]);
+            return res.json({ success: true, message: "Batch closed because it has existing schedules" });
+        }
+
+        const [result] = await db.query(`DELETE FROM swimming_batches WHERE batch_id = ?`, [id]);
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, error: "Batch not found" });
+        }
+
+        res.json({ success: true, message: "Batch deleted successfully" });
+    } catch (error) {
+        console.error("Error deleting batch:", error);
+        res.status(500).json({ success: false, error: "Failed to delete batch", details: error.message });
+    }
+});
+
+/**
+ * GET /api/swimming/admin/batch-schedules
+ * List batch schedules with batch and coach details
+ */
+router.get("/admin/batch-schedules", async (req, res) => {
+    try {
+        const [schedules] = await db.query(`
+            SELECT
+                bs.schedule_id,
+                bs.batch_id,
+                sb.batch_name,
+                bs.class_period,
+                bs.start_time,
+                bs.end_time,
+                bs.max_slots,
+                bs.status,
+                bs.coach_id,
+                COALESCE(sc.name, 'Unassigned') AS coach_name,
+                COUNT(se.enrollment_id) AS used_slots
+            FROM swimming_batch_schedules bs
+            INNER JOIN swimming_batches sb ON bs.batch_id = sb.batch_id
+            LEFT JOIN swimming_coaches sc ON bs.coach_id = sc.coach_id
+            LEFT JOIN swimming_enrollments se ON se.schedule_id = bs.schedule_id AND se.enrollment_status = 'Approved'
+            GROUP BY bs.schedule_id
+            ORDER BY sb.start_date ASC, bs.start_time ASC
+        `);
+
+        res.json({ success: true, schedules, count: schedules.length });
+    } catch (error) {
+        console.error("Error fetching batch schedules:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch batch schedules", details: error.message });
+    }
+});
+
+/**
+ * POST /api/swimming/admin/batch-schedules
+ * Create a new schedule slot under a batch
+ */
+router.post("/admin/batch-schedules", async (req, res) => {
+    try {
+        const { batchId, coachId, classPeriod, startTime, endTime, maxSlots = 10, status = 'Open' } = req.body;
+
+        if (!batchId || !classPeriod || !startTime || !endTime) {
+            return res.status(400).json({ success: false, error: "batchId, classPeriod, startTime, and endTime are required" });
+        }
+
+        if (classPeriod !== 'AM' && classPeriod !== 'PM') {
+            return res.status(400).json({ success: false, error: "classPeriod must be 'AM' or 'PM'" });
+        }
+
+        if (endTime <= startTime) {
+            return res.status(400).json({ success: false, error: "endTime must be later than startTime" });
+        }
+
+        if (await findCoachScheduleConflict(coachId, batchId, startTime, endTime)) {
+            return res.status(400).json({ success: false, error: "This coach already has a class schedule during this time." });
+        }
+
+        const [result] = await db.query(
+            `INSERT INTO swimming_batch_schedules (
+                batch_id, coach_id, class_period, start_time, end_time, max_slots, status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [batchId, coachId || null, classPeriod, startTime, endTime, maxSlots, status]
+        );
+
+        const [scheduleRows] = await db.query("SELECT * FROM swimming_batch_schedules WHERE schedule_id = ?", [result.insertId]);
+        res.status(201).json({ success: true, schedule: scheduleRows[0] });
+    } catch (error) {
+        console.error("Error creating batch schedule:", error);
+        res.status(500).json({ success: false, error: "Failed to create batch schedule", details: error.message });
+    }
+});
+
+/**
+ * PUT /api/swimming/admin/batch-schedules/:id
+ * Update a batch schedule
+ */
+router.put("/admin/batch-schedules/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { batchId, coachId, classPeriod, startTime, endTime, maxSlots, status } = req.body;
+
+        const [existingRows] = await db.query("SELECT * FROM swimming_batch_schedules WHERE schedule_id = ?", [id]);
+        if (!existingRows.length) {
+            return res.status(404).json({ success: false, error: "Schedule not found" });
+        }
+
+        const existing = existingRows[0];
+        const updates = [];
+        const values = [];
+
+        if (batchId) {
+            updates.push("batch_id = ?");
+            values.push(batchId);
+        }
+        if (coachId !== undefined) {
+            updates.push("coach_id = ?");
+            values.push(coachId || null);
+        }
+        if (classPeriod) {
+            if (classPeriod !== 'AM' && classPeriod !== 'PM') {
+                return res.status(400).json({ success: false, error: "classPeriod must be 'AM' or 'PM'" });
+            }
+            updates.push("class_period = ?");
+            values.push(classPeriod);
+        }
+        if (startTime) {
+            updates.push("start_time = ?");
+            values.push(startTime);
+        }
+        if (endTime) {
+            updates.push("end_time = ?");
+            values.push(endTime);
+        }
+        if (maxSlots !== undefined) {
+            updates.push("max_slots = ?");
+            values.push(maxSlots);
+        }
+        if (status) {
+            updates.push("status = ?");
+            values.push(status);
+        }
+
+        if (!updates.length) {
+            return res.status(400).json({ success: false, error: "No batch schedule fields provided for update" });
+        }
+
+        const targetBatchId = batchId || existing.batch_id;
+        const targetStartTime = startTime || existing.start_time;
+        const targetEndTime = endTime || existing.end_time;
+        const targetCoachId = coachId !== undefined ? coachId : existing.coach_id;
+
+        if (targetStartTime && targetEndTime && targetEndTime <= targetStartTime) {
+            return res.status(400).json({ success: false, error: "endTime must be later than startTime" });
+        }
+
+        if (await findCoachScheduleConflict(targetCoachId, targetBatchId, targetStartTime, targetEndTime, Number(id))) {
+            return res.status(400).json({ success: false, error: "This coach already has a class schedule during this time." });
+        }
+
+        values.push(id);
+        await db.query(`UPDATE swimming_batch_schedules SET ${updates.join(", ")} WHERE schedule_id = ?`, values);
+
+        const [scheduleRows] = await db.query("SELECT * FROM swimming_batch_schedules WHERE schedule_id = ?", [id]);
+        res.json({ success: true, schedule: scheduleRows[0] });
+    } catch (error) {
+        console.error("Error updating batch schedule:", error);
+        res.status(500).json({ success: false, error: "Failed to update batch schedule", details: error.message });
+    }
+});
+
+/**
+ * DELETE /api/swimming/admin/batch-schedules/:id
+ * Delete a schedule only if no enrollments exist under it
+ */
+router.delete("/admin/batch-schedules/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [[{ total }]] = await db.query(
+            `SELECT COUNT(*) AS total FROM swimming_enrollments WHERE schedule_id = ?`,
+            [id]
+        );
+
+        if (total > 0) {
+            return res.status(400).json({ success: false, error: "Cannot delete schedule with existing enrollments" });
+        }
+
+        const [result] = await db.query(`DELETE FROM swimming_batch_schedules WHERE schedule_id = ?`, [id]);
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, error: "Schedule not found" });
+        }
+
+        res.json({ success: true, message: "Schedule deleted successfully" });
+    } catch (error) {
+        console.error("Error deleting batch schedule:", error);
+        res.status(500).json({ success: false, error: "Failed to delete batch schedule", details: error.message });
+    }
+});
+
+/**
+ * PUT /api/swimming/admin/students/:id
+ * Update enrollment details, payment, or assignment fields
+ */
+router.put("/admin/students/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const allowed = [
+            'batch_id', 'schedule_id', 'coach_id', 'rate_amount', 'age_group',
+            'payment_status', 'enrollment_status', 'rejection_reason'
+        ];
+
+        const updates = [];
+        const values = [];
+
+        Object.keys(req.body).forEach((field) => {
+            if (allowed.includes(field)) {
+                updates.push(`${field} = ?`);
+                values.push(req.body[field]);
+            }
+        });
+
+        if (!updates.length) {
+            return res.status(400).json({ success: false, error: "No valid fields provided for update" });
+        }
+
+        values.push(id);
+        await db.query(`UPDATE swimming_enrollments SET ${updates.join(', ')} WHERE enrollment_id = ?`, values);
+
+        if (req.body.schedule_id) {
+            await updateBatchScheduleStatus(req.body.schedule_id);
+        }
+
+        const [updatedRows] = await db.query("SELECT * FROM swimming_enrollments WHERE enrollment_id = ?", [id]);
+        res.json({ success: true, enrollment: updatedRows[0] });
+    } catch (error) {
+        console.error("Error updating enrollment:", error);
+        res.status(500).json({ success: false, error: "Failed to update enrollment", details: error.message });
+    }
+});
+
+/**
  * GET /api/swimming/admin/schedules
- * Get all schedules grouped by coach and lesson type
+ * Get batch schedule data for admin panel
  */
 router.get("/admin/schedules", async (req, res) => {
     try {
@@ -1474,13 +2614,30 @@ router.put("/admin/students/:id/schedule", async (req, res) => {
 router.get("/admin/calendar/lessons", async (req, res) => {
     try {
         const [lessons] = await db.query(`
+            SELECT
+                se.enrollment_id,
+                se.booking_reference,
+                CONCAT(se.first_name, ' ', se.last_name) AS student_name,
+                se.lesson_type,
+                COALESCE(sc.name, se.admin_assigned_coach, se.preferred_coach) AS coach_name,
+                se.admin_lesson_dates AS dates,
+                se.admin_lesson_time AS time,
+                se.enrollment_status,
+                b.payment_status,
+                b.booking_status,
+                se.mobile_phone AS student_phone
+            FROM swimming_enrollments se
+            LEFT JOIN bookings b ON se.booking_reference = b.booking_reference
+            LEFT JOIN swimming_coaches sc ON CAST(sc.coach_id AS CHAR) = se.admin_assigned_coach
+            WHERE se.enrollment_status = 'Approved'
+                AND se.admin_lesson_dates IS NOT NULL
+            UNION ALL
             SELECT 
-                bi.item_id,
-                b.booking_id,
+                se.enrollment_id,
                 b.booking_reference,
                 CONCAT(se.first_name, ' ', se.last_name) AS student_name,
                 bi.item_name AS lesson_type,
-                COALESCE(sc.name, se.preferred_coach) AS coach_name,
+                COALESCE(sc2.name, se.preferred_coach) AS coach_name,
                 JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.dates')) AS dates,
                 JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.time')) AS time,
                 se.enrollment_status,
@@ -1490,12 +2647,12 @@ router.get("/admin/calendar/lessons", async (req, res) => {
             FROM booking_items bi
             INNER JOIN bookings b ON bi.booking_id = b.booking_id
             INNER JOIN swimming_enrollments se ON se.booking_reference = b.booking_reference
-            LEFT JOIN swimming_coaches sc ON CAST(sc.coach_id AS CHAR) = se.preferred_coach
+            LEFT JOIN swimming_coaches sc2 ON CAST(sc2.coach_id AS CHAR) = se.preferred_coach
             WHERE bi.item_type = 'Swimming'
                 AND bi.item_description IS NOT NULL
                 AND b.booking_status IN ('Confirmed', 'Pending')
                 AND se.enrollment_status = 'Approved'
-            ORDER BY JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.time')) ASC
+                AND (se.admin_lesson_dates IS NULL OR se.admin_lesson_dates = '[]')
         `);
 
         // Transform the response to parse dates array
@@ -1503,16 +2660,15 @@ router.get("/admin/calendar/lessons", async (req, res) => {
             let datesArray = [];
             try {
                 if (lesson.dates) {
-                    // Remove quotes and parse the JSON array
-                    datesArray = JSON.parse(lesson.dates);
+                    datesArray = typeof lesson.dates === 'string' ? JSON.parse(lesson.dates) : lesson.dates;
                 }
             } catch (e) {
-                console.error('Error parsing dates for lesson:', lesson.item_id, e);
+                console.error('Error parsing dates for lesson:', lesson.enrollment_id, e);
             }
 
             return {
-                item_id: lesson.item_id,
-                booking_id: lesson.booking_id,
+                item_id: lesson.enrollment_id,
+                booking_id: lesson.booking_id || null,
                 booking_reference: lesson.booking_reference,
                 student_name: lesson.student_name,
                 lesson_type: lesson.lesson_type,
@@ -1537,6 +2693,79 @@ router.get("/admin/calendar/lessons", async (req, res) => {
         res.status(500).json({
             success: false,
             error: "Failed to fetch calendar lessons",
+            details: error.message
+        });
+    }
+});
+
+/**
+ * GET /api/swimming/admin/today-schedules
+ * Get today's approved lesson schedule summary for the admin dashboard
+ */
+router.get("/admin/today-schedules", async (req, res) => {
+    try {
+        const today = new Date();
+        const yyyy = today.getFullYear();
+        const mm = String(today.getMonth() + 1).padStart(2, '0');
+        const dd = String(today.getDate()).padStart(2, '0');
+        const todayKey = `${yyyy}-${mm}-${dd}`;
+
+        const [rows] = await db.query(`
+            SELECT
+                coach_name,
+                batch_name,
+                time,
+                SUM(used_slots) AS used_slots,
+                MAX(slots_total) AS slots_total
+            FROM (
+                SELECT
+                    COALESCE(sc.name, se.admin_assigned_coach, se.preferred_coach) AS coach_name,
+                    se.lesson_type AS batch_name,
+                    se.admin_lesson_time AS time,
+                    1 AS used_slots,
+                    COALESCE(s.max_slots, 10) AS slots_total
+                FROM swimming_enrollments se
+                LEFT JOIN swimming_coaches sc ON CAST(sc.coach_id AS CHAR) = se.admin_assigned_coach
+                LEFT JOIN swimming_batch_schedules s ON se.schedule_id = s.schedule_id
+                WHERE se.enrollment_status = 'Approved'
+                  AND se.admin_lesson_dates IS NOT NULL
+                  AND JSON_CONTAINS(se.admin_lesson_dates, JSON_ARRAY(?), '$')
+                UNION ALL
+                SELECT
+                    COALESCE(sc2.name, se.preferred_coach) AS coach_name,
+                    se.lesson_type AS batch_name,
+                    JSON_UNQUOTE(JSON_EXTRACT(bi.item_description, '$.time')) AS time,
+                    1 AS used_slots,
+                    10 AS slots_total
+                FROM swimming_enrollments se
+                INNER JOIN bookings b ON se.booking_reference = b.booking_reference
+                INNER JOIN booking_items bi ON b.booking_id = bi.booking_id AND bi.item_type = 'Swimming'
+                LEFT JOIN swimming_coaches sc2 ON CAST(sc2.coach_id AS CHAR) = se.preferred_coach
+                WHERE se.enrollment_status = 'Approved'
+                  AND bi.item_description IS NOT NULL
+                  AND b.booking_status IN ('Confirmed', 'Pending')
+                  AND (se.admin_lesson_dates IS NULL OR se.admin_lesson_dates = '[]')
+                  AND JSON_CONTAINS(bi.item_description, JSON_ARRAY(?), '$.dates')
+            ) AS today_data
+            GROUP BY coach_name, batch_name, time
+            ORDER BY time ASC
+        `, [todayKey, todayKey]);
+
+        const schedules = rows.map(row => ({
+            time: row.time || 'TBD',
+            batch: row.batch_name || 'General',
+            coach: row.coach_name || 'Unassigned',
+            slotsUsed: Number(row.used_slots) || 0,
+            slotsTotal: Number(row.slots_total) || 10,
+            slotsFull: Number(row.used_slots) >= (Number(row.slots_total) || 10)
+        }));
+
+        res.json({ success: true, schedules, count: schedules.length });
+    } catch (error) {
+        console.error("Error fetching today's schedules for admin:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to fetch today's schedules",
             details: error.message
         });
     }

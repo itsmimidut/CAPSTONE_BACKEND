@@ -74,6 +74,7 @@ import analyticsRoutes from "./routes/analytics.js";
 import notificationsRoutes from "./routes/notifications.js";
 import websiteConfigRoutes from "./routes/websiteConfig.js";
 import webhooksRoutes from "./routes/webhooks.js";
+import db from "./config/db.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
@@ -229,6 +230,77 @@ app.get("/", (req, res) => {
 });
 
 // ============================================================
+// DATABASE MIGRATION HELPERS
+// ============================================================
+async function ensureSwimmingScheduleColumns() {
+  try {
+    const requiredColumns = [
+      { name: 'admin_lesson_dates', definition: "JSON NULL COMMENT 'Admin-assigned lesson dates (JSON array)'" },
+      { name: 'admin_lesson_time', definition: "VARCHAR(50) NULL COMMENT 'Admin-assigned time slot'" },
+      { name: 'admin_assigned_coach', definition: "VARCHAR(255) NULL COMMENT 'Admin-assigned coach name'" }
+    ];
+
+    const [existingColumns] = await db.query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'swimming_enrollments'
+         AND COLUMN_NAME IN (?, ?, ?)`,
+      requiredColumns.map(column => column.name)
+    );
+
+    const existingColumnSet = new Set(existingColumns.map(row => row.COLUMN_NAME));
+    const missingColumns = requiredColumns.filter(column => !existingColumnSet.has(column.name));
+
+    if (missingColumns.length === 0) {
+      return;
+    }
+
+    const alterClauses = missingColumns.map(column => `ADD COLUMN ${column.name} ${column.definition}`);
+    await db.query(`ALTER TABLE swimming_enrollments ${alterClauses.join(', ')}`);
+    console.log('[DB] Added missing swimming_enrollments schedule columns:', missingColumns.map(c => c.name).join(', '));
+  } catch (error) {
+    console.warn('[DB] Could not auto-add swimming_enrollments schedule columns:', error.message);
+  }
+}
+
+async function ensureSwimmingBatchColumns() {
+  try {
+    const requiredColumns = [
+      { name: 'batch_id', definition: 'int(11) NOT NULL' },
+      { name: 'coach_id', definition: 'int(11) DEFAULT NULL' },
+      { name: 'class_period', definition: "enum('AM','PM') NOT NULL DEFAULT 'AM'" },
+      { name: 'start_time', definition: 'time NOT NULL' },
+      { name: 'end_time', definition: 'time NOT NULL' },
+      { name: 'max_slots', definition: 'int(11) NOT NULL DEFAULT 10' },
+      { name: 'status', definition: "enum('Open','Full','Closed') NOT NULL DEFAULT 'Open'" }
+    ];
+
+    const [existingColumns] = await db.query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'swimming_batch_schedules'
+         AND COLUMN_NAME IN (?, ?, ?, ?, ?, ?, ?)`,
+      requiredColumns.map(column => column.name)
+    );
+
+    const existingColumnSet = new Set(existingColumns.map(row => row.COLUMN_NAME));
+    const missingColumns = requiredColumns.filter(column => !existingColumnSet.has(column.name));
+
+    if (missingColumns.length === 0) {
+      return;
+    }
+
+    const alterClauses = missingColumns.map(column => `ADD COLUMN ${column.name} ${column.definition}`);
+    await db.query(`ALTER TABLE swimming_batch_schedules ${alterClauses.join(', ')}`);
+    console.log('[DB] Added missing swimming_batch_schedules columns:', missingColumns.map(c => c.name).join(', '));
+  } catch (error) {
+    console.warn('[DB] Could not auto-add swimming_batch_schedules columns:', error.message);
+  }
+}
+
+// ============================================================
 // SERVER STARTUP
 // ============================================================
 /**
@@ -241,6 +313,8 @@ app.get("/", (req, res) => {
  * To test:
  * curl http://localhost:8000/api/rooms
  */
+await ensureSwimmingScheduleColumns();
+await ensureSwimmingBatchColumns();
 app.listen(8000, () => console.log("Server running at http://localhost:8000"));
 
 // npm run dev:all to run all backend and frontend servers concurrently
