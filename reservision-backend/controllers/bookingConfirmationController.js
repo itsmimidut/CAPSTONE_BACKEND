@@ -33,7 +33,7 @@ export const createBookingConfirmation = async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const { guest, checkIn, checkOut, items, paymentMethod, total, userId, isSwimmingOnly } = req.body;
+    const { guest, checkIn, checkOut, items, paymentMethod, subtotal = 0, total = 0, userId, isSwimmingOnly, entranceFee = 0, extraPersonFee = 0 } = req.body;
 
     // Debug logging
     console.log('🔍 Booking request received:');
@@ -41,6 +41,8 @@ export const createBookingConfirmation = async (req, res) => {
     console.log('  - guest email:', guest?.email);
     console.log('  - guest name:', guest?.firstName, guest?.lastName);
     console.log('  - isSwimmingOnly:', isSwimmingOnly);
+    console.log('  - entranceFee:', entranceFee);
+    console.log('  - extraPersonFee:', extraPersonFee);
 
     // Validation
     if (!guest?.firstName || !guest?.lastName || !guest?.email || !guest?.phone) {
@@ -84,6 +86,14 @@ export const createBookingConfirmation = async (req, res) => {
       await connection.rollback();
       return res.status(400).json({ success: false, error: 'At least one booking item is required' });
     }
+
+    const [bookingColumns] = await connection.query(
+      'SHOW COLUMNS FROM bookings WHERE Field IN (?, ?)',
+      ['entrance_fee', 'extra_person_fee']
+    )
+    const bookingColumnNames = bookingColumns.map(col => col.Field)
+    const hasBookingEntranceFee = bookingColumnNames.includes('entrance_fee')
+    const hasBookingExtraPersonFee = bookingColumnNames.includes('extra_person_fee')
 
     // Step 1: Get or create customer - prioritize user_id if logged in
     let customerId;
@@ -178,32 +188,45 @@ export const createBookingConfirmation = async (req, res) => {
     const bookingReference = 'EDU' + Date.now().toString().slice(-8);
 
     // Step 3: Create booking
+    const bookingFields = [
+      'booking_reference',
+      'customer_id',
+      'check_in_date',
+      'check_out_date',
+      'adults',
+      'children',
+      'arrival_time',
+      'special_requests',
+      'subtotal'
+    ]
+    const bookingValues = [
+      bookingReference,
+      customerId,
+      normalizedCheckIn,
+      normalizedCheckOut,
+      guest.adults || 2,
+      guest.children || 0,
+      guest.arrivalTime || null,
+      guest.specialRequests || '',
+      subtotal
+    ]
+
+    if (hasBookingEntranceFee) {
+      bookingFields.push('entrance_fee')
+      bookingValues.push(Number(entranceFee || 0))
+    }
+
+    if (hasBookingExtraPersonFee) {
+      bookingFields.push('extra_person_fee')
+      bookingValues.push(Number(extraPersonFee || 0))
+    }
+
+    bookingFields.push('total', 'booking_status')
+    bookingValues.push(Number(total || subtotal + Number(entranceFee || 0) + Number(extraPersonFee || 0)), 'Pending')
+
     const [bookingResult] = await connection.query(
-      `INSERT INTO bookings (
-        booking_reference, 
-        customer_id, 
-        check_in_date, 
-        check_out_date, 
-        adults, 
-        children, 
-        arrival_time, 
-        special_requests,
-        subtotal,
-        total,
-        booking_status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')`,
-      [
-        bookingReference,
-        customerId,
-        normalizedCheckIn,
-        normalizedCheckOut,
-        guest.adults || 2,
-        guest.children || 0,
-        guest.arrivalTime || null,
-        guest.specialRequests || '',
-        total,
-        total
-      ]
+      `INSERT INTO bookings (${bookingFields.join(', ')}) VALUES (${bookingFields.map(() => '?').join(', ')})`,
+      bookingValues
     );
 
     const bookingId = bookingResult.insertId;
@@ -248,6 +271,32 @@ export const createBookingConfirmation = async (req, res) => {
       const guestCount = item.swimmingDetails && item.swimmingDetails.participants
         ? item.swimmingDetails.participants
         : (item.guests || 0);
+
+      const itemExtraPersonFee = Number((item.extra_person_fee ?? item.extraPersonFee) || 0)
+      const itemExtraPersonCount = Number((item.extra_person_count ?? item.extraPersonCount) || 0)
+      const itemDescriptionPayload = item.swimmingDetails ? { ...item.swimmingDetails } : {}
+
+      const itemMeta = {
+        extraPersonFee: itemExtraPersonFee,
+        extraPersonCount: itemExtraPersonCount,
+        extraPersonBreakdown: item.extra_person_breakdown ?? item.extraPersonBreakdown ?? null,
+        durationHours: item.duration_hours ?? item.durationHours ?? null,
+        capacity: item.capacity ?? item.roomCapacity ?? item.item?.maxGuests ?? item.item?.capacity ?? null,
+        location: item.location || null,
+        bookingType: item.booking_type || item.bookingType || null,
+        guestBreakdown: item.guest_breakdown || item.guestBreakdown || null,
+        payingGuests: item.paying_guests || item.payingGuests || null
+      }
+
+      Object.entries(itemMeta).forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          itemDescriptionPayload[key] = value
+        }
+      })
+
+      const itemDescription = Object.keys(itemDescriptionPayload).length > 0
+        ? JSON.stringify(itemDescriptionPayload)
+        : null
 
       if (item.perNight && !item.swimmingDetails) {
         const requestedIds = Array.isArray(item.selectedInventoryItemIds)
@@ -416,7 +465,7 @@ export const createBookingConfirmation = async (req, res) => {
               nights,
               item.price * (item.perNight ? nights : 1),
               true,
-              item.description || null
+              itemDescription
             ]
           );
         }
@@ -456,42 +505,17 @@ export const createBookingConfirmation = async (req, res) => {
           nights,
           totalPrice,
           item.perNight || false,
-          item.swimmingDetails ? JSON.stringify(item.swimmingDetails) : null
+          itemDescription
         ]
       );
 
-      // Add swimming session dates as occupied dates
-      if (item.swimmingDetails && item.swimmingDetails.dates && item.swimmingDetails.dates.length > 0) {
-        // Only insert if we have a valid numeric ID
-        if (numericItemId) {
-          const swimmingDates = item.swimmingDetails.dates.map(date => [
-            numericItemId,
-            bookingId,
-            date
-          ]);
+      console.log(`📦 Added item to booking: ${itemName}, Qty: ${requestedQty}, Guests: ${guestCount}   `);
+      if (item.swimmingDetails) {
+        const swimmingDates = Array.isArray(item.swimmingDetails.dates)
+          ? item.swimmingDetails.dates.map(date => [numericItemId, bookingId, date])
+          : [];
 
-          // **VALIDATION**: Check if any swimming dates are already occupied
-          const dateStrings = swimmingDates.map(d => d[2]);
-          const [conflictingDates] = await connection.query(
-            `SELECT DISTINCT occupied_date FROM occupied_dates 
-             WHERE inventory_item_id = ? AND occupied_date IN (?)`,
-            [numericItemId, dateStrings]
-          );
-
-          if (conflictingDates.length > 0) {
-            await connection.rollback();
-            const conflictDates = conflictingDates.map(d => d.occupied_date).join(', ');
-            console.error(`❌ Swimming date conflict for item ${numericItemId}: ${conflictDates}`);
-            return res.status(409).json({
-              success: false,
-              error: 'Some swimming session dates have already been booked',
-              conflict_dates: conflictingDates.map(d => d.occupied_date),
-              item_id: numericItemId,
-              item_name: itemName
-            });
-          }
-
-          // All dates available - proceed with insert
+        if (numericItemId && swimmingDates.length > 0) {
           await connection.query(
             'INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date) VALUES ?',
             [swimmingDates]
@@ -502,6 +526,7 @@ export const createBookingConfirmation = async (req, res) => {
           console.warn(`⚠️ No numeric item ID found for swimming, skipping occupied_dates`);
         }
       }
+
 
       // Add occupied dates for rooms/cottages (skip for swimming - already handled above)
       if (item.perNight && checkIn && checkOut && !item.swimmingDetails) {
@@ -665,7 +690,7 @@ export const updatePaymentStatus = async (req, res) => {
     if (status === 'paid') {
       await db.query(
         'UPDATE bookings SET payment_status = ?, booking_status = ? WHERE booking_id = ?',
-        ['Paid', 'Confirmed', bookingId]
+        ['Paid', 'Pending', bookingId]
       );
 
       await db.query(

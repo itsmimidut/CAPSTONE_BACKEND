@@ -714,6 +714,16 @@ export const getAdminReservations = async (req, res) => {
     const cacheKey = buildReservationCacheKey(req.query);
     const cachedPayload = getCachedReservationResponse(cacheKey);
 
+    const hasBookingColumn = async (columnName) => {
+      const [columns] = await db.query(`SHOW COLUMNS FROM bookings LIKE ?`, [columnName]);
+      return Array.isArray(columns) && columns.length > 0;
+    }
+
+    const hasEntranceFee = await hasBookingColumn('entrance_fee');
+    const hasExtraPersonFee = await hasBookingColumn('extra_person_fee');
+    const entranceFeeSelect = hasEntranceFee ? 'COALESCE(b.entrance_fee, 0) AS entrance_fee,' : '0 AS entrance_fee,';
+    const extraPersonFeeSelect = hasExtraPersonFee ? 'COALESCE(b.extra_person_fee, 0) AS extra_person_fee,' : '0 AS extra_person_fee,';
+
     if (cachedPayload) {
       // Cache hit: return cached response with unchanged structure.
       return res.json(cachedPayload);
@@ -733,6 +743,9 @@ export const getAdminReservations = async (req, res) => {
         b.booking_status,
         b.payment_status,
         b.payment_method,
+        b.subtotal,
+        ${entranceFeeSelect}
+        ${extraPersonFeeSelect}
         b.total,
         b.created_at,
         c.customer_id,
@@ -792,6 +805,58 @@ export const getAdminReservations = async (req, res) => {
 
     // Execute query
     const [reservations] = await db.query(query, params);
+
+    if (reservations.length > 0) {
+      const bookingIds = reservations.map(r => r.booking_id)
+      const [items] = await db.query(
+        `SELECT
+           bi.item_id,
+           bi.booking_id,
+           bi.inventory_item_id,
+           bi.item_type,
+           bi.item_name,
+           bi.quantity,
+           bi.unit_price,
+           bi.nights,
+           bi.total_price,
+           bi.guests,
+           bi.item_description,
+           bi.per_night
+         FROM booking_items bi
+         WHERE bi.booking_id IN (?)
+         ORDER BY bi.booking_id, bi.item_id`,
+        [bookingIds]
+      )
+
+      const itemsByBooking = items.reduce((acc, item) => {
+        if (!acc[item.booking_id]) acc[item.booking_id] = []
+        acc[item.booking_id].push({
+          item_id: item.item_id,
+          inventory_item_id: item.inventory_item_id,
+          item_name: item.item_name,
+          category: item.item_type,
+          category_type: item.item_type,
+          quantity: item.quantity,
+          price: Number(item.unit_price || 0),
+          nights: item.nights || 0,
+          duration_hours: 0,
+          capacity: null,
+          location: null,
+          line_total: Number(item.total_price || 0),
+          guests: item.guests || 0,
+          guest_breakdown: null,
+          paying_guests: item.guests || 0,
+          entrance_fee: 0,
+          extra_person_fee: 0,
+          extra_person_breakdown: null
+        })
+        return acc
+      }, {})
+
+      reservations.forEach(reservation => {
+        reservation.items_details = itemsByBooking[reservation.booking_id] || []
+      })
+    }
 
     // Get total count for pagination
     let countQuery = `
