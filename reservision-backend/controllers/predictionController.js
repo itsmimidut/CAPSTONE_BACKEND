@@ -10,7 +10,7 @@ import { fileURLToPath } from "url";
  */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PY_SCRIPT = path.resolve(__dirname, "../../../PREDICTIVE ANALYTICS/predict_real.py");
+const PY_SCRIPT = path.resolve(__dirname, "../../../Predictive_Analytics/predict_real.py");
 
 /**
  * ============================================================

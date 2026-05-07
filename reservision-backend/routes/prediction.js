@@ -75,7 +75,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ✅ Correct relative path for your structure:
-const PY_SCRIPT = path.resolve(__dirname, "../../../PREDICTIVE ANALYTICS/predict_real.py");
+const PY_SCRIPT = path.resolve(__dirname, "../../../Predictive_Analytics/predict_real.py");
 
 function runPython(args) {
   return new Promise((resolve, reject) => {
