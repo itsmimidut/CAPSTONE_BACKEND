@@ -465,7 +465,10 @@ export const createEshopOrder = async (req, res) => {
             locationNumber,
             deliveryNotes,
             totalAmount,
-            customerId
+            customerId,
+            activeBookingId,
+            bookingReference,
+            deliverySource
         } = req.body;
 
         // Validate required fields
@@ -559,8 +562,8 @@ export const createEshopOrder = async (req, res) => {
         const [result] = await connection.query(
             `INSERT INTO pos_transactions 
             (receipt_no, items, type, payment_method, total_amount, transaction_date, transaction_time, 
-             location_type, location_number, delivery_notes, customer_id) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             location_type, location_number, delivery_notes, customer_id, active_booking_id, booking_reference, delivery_source) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 receiptNo,
                 itemsJson,
@@ -572,7 +575,10 @@ export const createEshopOrder = async (req, res) => {
                 locationType,
                 locationNumber || null,
                 deliveryNotes || null,
-                customerId || null
+                customerId || null,
+                activeBookingId || null,
+                bookingReference || null,
+                deliverySource || null
             ]
         );
 

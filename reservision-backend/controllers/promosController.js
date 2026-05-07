@@ -1,6 +1,6 @@
 import { db } from "../config/db.js";
 
-const PROMO_CATEGORY_VALUES = new Set(["all", "rooms", "cottages", "events", "food"]);
+const PROMO_CATEGORY_VALUES = new Set(["all", "rooms", "cottages", "events", "food","swimming"]);
 const PROMO_DISCOUNT_TYPES = new Set(["percent", "fixed"]);
 
 const toNumberOrDefault = (value, defaultValue = 0) => {
@@ -266,71 +266,141 @@ export const deletePromo = async (req, res) => {
 };
 
 export const validatePromo = async (req, res) => {
-    const code = String(req.query.code || "").trim().toUpperCase();
-    const requestedCategory = String(req.query.category || "").trim().toLowerCase();
-    const requestedItemId = String(req.query.item_id || req.query.itemId || "").trim();
-    const requestedSubtotal = toNullableNumber(req.query.subtotal);
+  try {
+    const code = String(req.body.code || "").trim().toUpperCase();
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
 
     if (!code) {
-        return res.status(400).json(buildPromoValidationFailure("Promo code is required."));
+      return res.status(400).json(buildPromoValidationFailure("Promo code is required."));
+    }
+
+    if (!items.length) {
+      return res.status(400).json(buildPromoValidationFailure("Please select an item before applying promo."));
     }
 
     const rows = await loadPromos("WHERE UPPER(p.code) = ?", [code], "LIMIT 1");
 
     if (!rows.length) {
-        return res.json(buildPromoValidationFailure("Promo code not found."));
+      return res.json(buildPromoValidationFailure("Promo code not found."));
     }
 
     const promo = mapPromoRow(rows[0]);
-    const now = new Date();
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
     if (!promo.is_active) {
-        return res.json(buildPromoValidationFailure("This promo code is inactive."));
+      return res.json(buildPromoValidationFailure("This promo code is inactive."));
     }
 
-    if (promo.start_date && new Date(promo.start_date) > now) {
-        return res.json(buildPromoValidationFailure(`This promo code is not yet valid (starts ${new Date(promo.start_date).toLocaleDateString()}).`));
+    if (promo.start_date) {
+      const start = new Date(`${promo.start_date}T00:00:00`);
+      if (today < start) {
+        return res.json(buildPromoValidationFailure("This promo code is not yet valid."));
+      }
     }
 
-    if (promo.end_date && new Date(promo.end_date) < now) {
+    if (promo.end_date) {
+      const end = new Date(`${promo.end_date}T23:59:59`);
+      if (today > end) {
         return res.json(buildPromoValidationFailure("This promo code has expired."));
+      }
     }
 
-    if (promo.usage_limit !== null && Number(promo.times_used || 0) >= Number(promo.usage_limit)) {
-        return res.json(buildPromoValidationFailure("This promo code has reached its usage limit."));
+    if (
+      promo.usage_limit !== null &&
+      Number(promo.times_used || 0) >= Number(promo.usage_limit)
+    ) {
+      return res.json(buildPromoValidationFailure("This promo code has reached its usage limit."));
     }
 
-    if (requestedCategory && promo.category !== "all" && promo.category !== requestedCategory) {
-        return res.json(buildPromoValidationFailure("This promo code does not apply to the selected category."));
+    const scope = String(promo.applies_to_category || promo.category || "all").toLowerCase();
+
+    const promoItemIds = Array.isArray(promo.item_ids)
+      ? promo.item_ids.map(String)
+      : normalizeItemIds(promo.item_ids);
+
+    const eligibleSubtotal = items.reduce((sum, item) => {
+      const itemId = String(item.item_id || item.id || "").trim();
+      const category = String(item.category || "").trim().toLowerCase();
+      const lineTotal = Number(item.line_total || 0);
+
+      let eligible = false;
+
+      if (scope === "all") eligible = true;
+      if (scope === "rooms" && category === "rooms") eligible = true;
+      if (scope === "cottages" && category === "cottages") eligible = true;
+      if (scope === "events" && category === "events") eligible = true;
+      if (scope === "food" && category === "food") eligible = true;
+      if (scope === "swimming" && category === "swimming") eligible = true;
+
+      if (promoItemIds.length && promoItemIds.includes(itemId)) {
+        eligible = true;
+      }
+
+      return eligible ? sum + lineTotal : sum;
+    }, 0);
+
+    if (eligibleSubtotal <= 0) {
+      return res.json(buildPromoValidationFailure(
+        "This promo code does not apply to the selected item."
+      ));
     }
 
-    if (requestedSubtotal !== null && requestedSubtotal < Number(promo.min_subtotal || 0)) {
-        return res.json(buildPromoValidationFailure(`A minimum subtotal of ${Number(promo.min_subtotal || 0).toFixed(2)} is required for this promo.`));
+    const minSubtotal = Number(promo.min_subtotal || 0);
+
+    if (minSubtotal > 0 && eligibleSubtotal < minSubtotal) {
+      return res.json(buildPromoValidationFailure(
+        `A minimum eligible subtotal of ₱${minSubtotal.toLocaleString()} is required for this promo.`
+      ));
     }
 
-    if (requestedItemId && promo.item_ids.length && !promo.item_ids.includes(requestedItemId)) {
-        return res.json(buildPromoValidationFailure("This promo code does not apply to the selected item."));
+    const discountType = String(promo.discount_type || promo.type || "percent").toLowerCase();
+    const discountValue = Number(promo.discount_value ?? promo.value ?? 0);
+
+    let discount = 0;
+
+    if (discountType === "percent") {
+      discount = eligibleSubtotal * (discountValue / 100);
+    } else {
+      discount = discountValue;
     }
+
+    discount = Math.min(discount, eligibleSubtotal);
 
     return res.json({
-        success: true,
-        valid: true,
-        promo: {
-            code: promo.code,
-            type: promo.type,
-            value: promo.value,
-            category: promo.category,
-            item_ids: promo.item_ids,
-            min_subtotal: promo.min_subtotal,
-            promo_id: promo.promo_id,
-            id: promo.id,
-            name: promo.name,
-            description: promo.description,
-            is_active: promo.is_active,
-            usage_limit: promo.usage_limit,
-            times_used: promo.times_used,
-            start_date: promo.start_date,
-            end_date: promo.end_date,
-        },
+      success: true,
+      valid: true,
+      eligibleSubtotal,
+      discount,
+      promo: {
+        promo_id: promo.promo_id,
+        id: promo.id,
+        name: promo.name,
+        code: promo.code,
+        description: promo.description,
+        discount_type: discountType,
+        discount_value: discountValue,
+        type: discountType,
+        value: discountValue,
+        applies_to_category: scope,
+        category: scope,
+        item_ids: promo.item_ids,
+        min_subtotal: promo.min_subtotal,
+        usage_limit: promo.usage_limit,
+        times_used: promo.times_used,
+        is_active: promo.is_active,
+        start_date: promo.start_date,
+        end_date: promo.end_date
+      }
     });
+  } catch (error) {
+    console.error("Validate promo error:", error);
+    return res.status(500).json({
+      success: false,
+      valid: false,
+      message: "Failed to validate promo.",
+      error: error.message
+    });
+  }
 };

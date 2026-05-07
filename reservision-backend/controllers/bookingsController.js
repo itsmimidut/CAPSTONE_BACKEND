@@ -1677,7 +1677,7 @@ export const processCheckIn = async (req, res) => {
     }
 
     const currentStatus = String(existingBooking[0].booking_status || '').toLowerCase().replace(/[^a-z]/g, '');
-    
+
     // Only allow check-in from Confirmed or Paid status
     if (!['confirmed', 'paid'].includes(currentStatus)) {
       return res.status(400).json({
@@ -1754,7 +1754,7 @@ export const processCheckOut = async (req, res) => {
     }
 
     const currentStatus = String(existingBooking[0].booking_status || '').toLowerCase().replace(/[^a-z]/g, '');
-    
+
     // Only allow check-out from Checked-In status
     if (currentStatus !== 'checkedin') {
       return res.status(400).json({
@@ -2056,5 +2056,205 @@ export const createBookingWithAutoAssign = async (req, res) => {
 
   } finally {
     await connection.release();
+  }
+};
+
+/**
+ * ============================================================
+ * GET CUSTOMER ACTIVE CHECKED-IN STAY
+ * ============================================================
+ *
+ * Endpoint: GET /api/bookings/customer/:userId/active-stay
+ *
+ * Purpose:
+ * - Find the logged-in customer's current checked-in booking
+ * - Return room/cottage details for E-Shop delivery location auto-fill
+ * - Only returns active checked-in bookings (not pending/confirmed)
+ *
+ * Response:
+ * {
+ *   success: true,
+ *   data: {
+ *     booking_id: 123,
+ *     booking_reference: "BK20260425001",
+ *     booking_status: "Checked-In",
+ *     payment_status: "Paid",
+ *     check_in_date: "2026-04-25",
+ *     check_out_date: "2026-04-27",
+ *     item_id: 45,
+ *     item_name: "DELUXE ROOM 1",
+ *     category: "Room",
+ *     booking_type: "room",
+ *     room_number: "DELUXE ROOM 1",
+ *     unit_number: "1",
+ *     unit_label: "DELUXE ROOM 1",
+ *     location: "Main Building"
+ *   }
+ * }
+ */
+export const getCustomerActiveStay = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'User ID is required'
+      });
+    }
+
+    const [rows] = await db.query(`
+      SELECT
+        b.booking_id,
+        b.booking_reference,
+        b.booking_status,
+        b.payment_status,
+        b.check_in_date,
+        b.check_out_date,
+        bi.item_id,
+        bi.item_name,
+        bi.category,
+        bi.booking_type,
+        bi.location,
+        bi.capacity,
+        ii.unit_number,
+        ii.unit_label
+      FROM bookings b
+      JOIN booking_items bi ON bi.booking_id = b.booking_id
+      LEFT JOIN inventory_items ii
+        ON ii.inventory_item_id = bi.inventory_item_id
+        OR ii.item_id = bi.item_id
+      WHERE b.user_id = ?
+        AND LOWER(REPLACE(b.booking_status, '-', '_')) = 'checked_in'
+        AND (
+          LOWER(bi.category) LIKE '%room%'
+          OR LOWER(bi.category) LIKE '%cottage%'
+          OR LOWER(bi.booking_type) IN ('room', 'cottage')
+          OR LOWER(bi.item_name) LIKE '%room%'
+          OR LOWER(bi.item_name) LIKE '%cottage%'
+        )
+      ORDER BY b.actual_check_in_time DESC, b.check_in_date DESC
+      LIMIT 1
+    `, [userId]);
+
+    if (!rows.length) {
+      return res.json({
+        success: false,
+        message: 'No active checked-in room or cottage found.'
+      });
+    }
+
+    const row = rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        booking_id: row.booking_id,
+        booking_reference: row.booking_reference,
+        booking_status: row.booking_status,
+        payment_status: row.payment_status,
+        check_in_date: row.check_in_date,
+        check_out_date: row.check_out_date,
+        item_id: row.item_id,
+        item_name: row.item_name,
+        category: row.category,
+        booking_type: row.booking_type,
+        room_number: row.unit_label || row.unit_number || row.item_name,
+        unit_number: row.unit_number,
+        unit_label: row.unit_label,
+        location: row.location
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching active stay:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch active stay',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Get current checked-in room number for logged-in customer
+ * Simplified endpoint that returns only the room_number
+ * 
+ * GET /api/bookings/customer/:userId/current-room
+ * 
+ * Params:
+ * - userId: User ID (from logged-in user)
+ * 
+ * Response (success):
+ * {
+ *   success: true,
+ *   room_number: "101"
+ * }
+ * 
+ * Response (no active room):
+ * {
+ *   success: false,
+ *   room_number: null,
+ *   message: "No current checked-in room found."
+ * }
+ * 
+ * Error:
+ * {
+ *   success: false,
+ *   room_number: null,
+ *   message: "Failed to fetch current room number",
+ *   error: "error message"
+ * }
+ */
+export const getCustomerCurrentRoom = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        room_number: null,
+        message: 'User ID is required'
+      });
+    }
+
+    const [rows] = await db.query(`
+      SELECT
+        ii.room_number
+      FROM bookings b
+      JOIN customers c
+        ON c.customer_id = b.customer_id
+      JOIN booking_items bi
+        ON bi.booking_id = b.booking_id
+      JOIN inventory_items ii
+        ON ii.item_id = bi.inventory_item_id
+      WHERE c.user_id = ?
+        AND LOWER(REPLACE(b.booking_status, '-', '_')) = 'checked_in'
+        AND LOWER(ii.category_type) = 'room'
+      ORDER BY b.actual_check_in_time DESC, b.check_in_date DESC
+      LIMIT 1
+    `, [userId]);
+
+    if (!rows.length) {
+      return res.json({
+        success: false,
+        room_number: null,
+        message: 'No current checked-in room found.'
+      });
+    }
+
+    return res.json({
+      success: true,
+      room_number: rows[0].room_number
+    });
+
+  } catch (error) {
+    console.error('Fetch current checked-in room error:', error);
+    return res.status(500).json({
+      success: false,
+      room_number: null,
+      message: 'Failed to fetch current room number',
+      error: error.message
+    });
   }
 };

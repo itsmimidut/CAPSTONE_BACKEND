@@ -26,6 +26,8 @@ import {
   getCustomerBookingHistory,
   getBookingHistoryByEmail,
   getBookingHistoryByUserId,
+  getCustomerActiveStay,
+  getCustomerCurrentRoom,
   getBookingQRCode,
   createBooking,
   updateBooking,
@@ -57,6 +59,12 @@ router.get("/user/:userId/history", getBookingHistoryByUserId);
 
 // Customer booking history by email (fallback)
 router.get("/email/:email/history", getBookingHistoryByEmail);
+
+// Get active checked-in stay for customer (for E-Shop delivery location)
+router.get("/customer/:userId/active-stay", getCustomerActiveStay);
+
+// Get current checked-in room number for customer (simplified E-Shop endpoint)
+router.get("/customer/:userId/current-room", getCustomerCurrentRoom);
 
 // Get all bookings
 router.get("/", getBookings);
