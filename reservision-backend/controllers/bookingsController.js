@@ -748,6 +748,9 @@ export const getAdminReservations = async (req, res) => {
         ${extraPersonFeeSelect}
         b.total,
         b.created_at,
+          COALESCE(r.refund_status, b.refund_status, '') AS refund_status,
+          COALESCE(r.refund_amount, b.refund_amount, 0) AS refund_amount,
+          r.refunded_at,
         c.customer_id,
         COALESCE(NULLIF(TRIM(c.first_name), ''), NULLIF(TRIM(u.first_name), ''), NULLIF(TRIM(b.first_name), '')) as first_name,
         COALESCE(NULLIF(TRIM(c.last_name), ''), NULLIF(TRIM(u.last_name), ''), NULLIF(TRIM(b.last_name), '')) as last_name,
@@ -762,6 +765,9 @@ export const getAdminReservations = async (req, res) => {
       LEFT JOIN user u ON c.user_id = u.user_id
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       LEFT JOIN booking_items bi ON b.booking_id = bi.booking_id
+      LEFT JOIN refunds r ON r.refund_id = (
+        SELECT MAX(refund_id) FROM refunds WHERE booking_id = b.booking_id
+      )
       WHERE 1=1
     `;
 
@@ -821,8 +827,14 @@ export const getAdminReservations = async (req, res) => {
            bi.total_price,
            bi.guests,
            bi.item_description,
-           bi.per_night
+           bi.per_night,
+           COALESCE(ii.category, bi.item_type) AS category,
+           COALESCE(ii.category_type, bi.item_type) AS category_type,
+           ii.max_guests,
+           ii.room_number,
+           ii.name AS inventory_name
          FROM booking_items bi
+         LEFT JOIN inventory_items ii ON bi.inventory_item_id = ii.item_id
          WHERE bi.booking_id IN (?)
          ORDER BY bi.booking_id, bi.item_id`,
         [bookingIds]
@@ -830,31 +842,34 @@ export const getAdminReservations = async (req, res) => {
 
       const itemsByBooking = items.reduce((acc, item) => {
         if (!acc[item.booking_id]) acc[item.booking_id] = []
+        const itemName = item.item_name || item.inventory_name || 'N/A'
         acc[item.booking_id].push({
-          item_id: item.item_id,
+          booking_item_id: item.item_id,
           inventory_item_id: item.inventory_item_id,
-          item_name: item.item_name,
-          category: item.item_type,
-          category_type: item.item_type,
+          item_name: itemName,
+          category: item.category,
+          category_type: item.category_type,
+          booking_type: item.item_type,
+          item_type: item.item_type,
           quantity: item.quantity,
-          price: Number(item.unit_price || 0),
           nights: item.nights || 0,
           duration_hours: 0,
-          capacity: null,
-          location: null,
-          line_total: Number(item.total_price || 0),
-          guests: item.guests || 0,
-          guest_breakdown: null,
-          paying_guests: item.guests || 0,
+          capacity: item.max_guests,
+          room_number: item.room_number,
+          line_total: Number(item.total_price || 0) || Number(item.unit_price || 0) * Number(item.quantity || 1),
           entrance_fee: 0,
           extra_person_fee: 0,
-          extra_person_breakdown: null
+          guest_breakdown: item.item_description || null
         })
         return acc
       }, {})
 
       reservations.forEach(reservation => {
-        reservation.items_details = itemsByBooking[reservation.booking_id] || []
+        const details = itemsByBooking[reservation.booking_id] || []
+        reservation.items_details = details
+        reservation.items_summary = details.length
+          ? details.map(i => i.item_name).filter(Boolean).join(', ')
+          : 'N/A'
       })
     }
 
@@ -971,9 +986,15 @@ export const getCustomerBookingHistory = async (req, res) => {
         MAX(p.payment_reference) as payment_reference,
         MAX(p.payment_method) as payment_method,
         MAX(p.status) as payment_status,
-        MAX(p.paid_at) as paid_at
+        MAX(p.paid_at) as paid_at,
+        COALESCE(MAX(r.refund_status), COALESCE(b.refund_status, '')) AS refund_status,
+        COALESCE(MAX(r.refund_amount), b.refund_amount, 0) AS refund_amount,
+        MAX(r.refunded_at) AS refunded_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
+      LEFT JOIN refunds r ON r.refund_id = (
+        SELECT MAX(refund_id) FROM refunds WHERE booking_id = b.booking_id
+      )
       WHERE b.customer_id = ?
       GROUP BY b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.adults, b.children, b.total, b.booking_status, b.created_at
     `;
@@ -1118,9 +1139,15 @@ export const getBookingHistoryByUserId = async (req, res) => {
         LOWER(COALESCE(b.payment_status, 'pending')) as payment_status,
         MAX(p.payment_reference) as payment_reference,
         MAX(p.payment_method) as payment_method,
-        MAX(p.paid_at) as paid_at
+        MAX(p.paid_at) as paid_at,
+        COALESCE(MAX(r.refund_status), COALESCE(b.refund_status, '')) AS refund_status,
+        COALESCE(MAX(r.refund_amount), b.refund_amount, 0) AS refund_amount,
+        MAX(r.refunded_at) AS refunded_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
+        LEFT JOIN refunds r ON r.refund_id = (
+          SELECT MAX(refund_id) FROM refunds WHERE booking_id = b.booking_id
+        )
       WHERE b.customer_id = ?
       GROUP BY b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.adults, b.children, b.total, b.booking_status, b.created_at, b.payment_status
     `;

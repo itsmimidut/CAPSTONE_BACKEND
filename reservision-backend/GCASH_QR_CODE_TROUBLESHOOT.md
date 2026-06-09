@@ -71,7 +71,6 @@ cat .env | grep PAYMONGO
 
 Should see:
 ```
-PAYMONGO_SECRET_KEY=sk_live_... (or sk_test_...)
 ```
 
 **If missing or empty:**

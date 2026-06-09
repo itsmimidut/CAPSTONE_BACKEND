@@ -71,6 +71,18 @@ const mapRestaurantItems = (rows) => rows.map(item => ({
 }));
 
 const fetchRestaurantItems = async () => {
+    /**
+     * FEATURE: Automatic filtering of items with critical inventory ingredients
+     * 
+     * When an ingredient for a menu item has 'critical' status in the inventory,
+     * that menu item is automatically excluded from the POS list.
+     * 
+     * STATUS LEVELS:
+     * - critical: quantity <= threshold/2 (ITEM HIDDEN FROM POS)
+     * - low: threshold/2 < quantity <= threshold
+     * - good: quantity > threshold
+     */
+
     const [columnRows] = await db.query(
         `SELECT COLUMN_NAME
          FROM INFORMATION_SCHEMA.COLUMNS
@@ -81,6 +93,7 @@ const fetchRestaurantItems = async () => {
 
     const columnSet = new Set(columnRows.map(row => row.COLUMN_NAME));
     const selectColumns = [
+        'menu_id',
         'name',
         'price',
         "COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description"
@@ -96,7 +109,32 @@ const fetchRestaurantItems = async () => {
          ORDER BY name`
     );
 
-    return mapRestaurantItems(menuItems);
+    // Filter out items with critical inventory ingredients
+    const filteredItems = [];
+
+    for (const item of menuItems) {
+        try {
+            // Check if this menu item has any ingredients with critical status
+            const [ingredients] = await db.query(`
+                SELECT i.status
+                FROM menu_ingredients mi
+                JOIN inventory i ON mi.inventory_id = i.inventory_id
+                WHERE mi.menu_id = ? AND i.status = 'critical'
+                LIMIT 1
+            `, [item.menu_id]);
+
+            // Only include item if it has no critical ingredients
+            if (ingredients.length === 0) {
+                filteredItems.push(item);
+            }
+        } catch (error) {
+            // If there's an error checking ingredients, include the item (fail-safe)
+            console.log(`⚠️ Error checking ingredients for menu_id ${item.menu_id}:`, error.message);
+            filteredItems.push(item);
+        }
+    }
+
+    return mapRestaurantItems(filteredItems);
 };
 
 // ============================================================
@@ -111,25 +149,40 @@ const fetchRestaurantItems = async () => {
  */
 export const getAllTransactions = async (req, res) => {
     try {
-        const { userId } = req.query;
+        const { userId, startDate, endDate } = req.query;
+        console.log('[posController] getAllTransactions called with query:', req.query);
 
         let query = 'SELECT * FROM pos_transactions';
-        let params = [];
+        const conditions = [];
+        const params = [];
 
-        // If userId provided, filter by that user
         if (userId) {
-            query += ' WHERE user_id = ?';
+            conditions.push('user_id = ?');
             params.push(userId);
+        }
+        if (startDate) {
+            conditions.push('DATE(transaction_date) >= ?');
+            params.push(startDate);
+        }
+        if (endDate) {
+            conditions.push('DATE(transaction_date) <= ?');
+            params.push(endDate);
+        }
+
+        if (conditions.length > 0) {
+            query += ` WHERE ${conditions.join(' AND ')}`;
         }
 
         query += ' ORDER BY created_at DESC';
 
+        console.log('[posController] getAllTransactions - final query:', query, 'params:', params);
         const [rows] = await db.query(query, params);
 
         // Parse items JSON string back to array
         const transactions = rows.map(row => ({
             ...row,
-            items: JSON.parse(row.items || '[]')
+            items: JSON.parse(row.items || '[]'),
+            bookingDetails: parseJsonArray(row.booking_details || row.bookingDetails)
         }));
 
         res.json(transactions);
@@ -162,13 +215,72 @@ export const getTransaction = async (req, res) => {
 
         const transaction = {
             ...rows[0],
-            items: JSON.parse(rows[0].items || '[]')
+            items: JSON.parse(rows[0].items || '[]'),
+            bookingDetails: parseJsonArray(rows[0].booking_details || rows[0].bookingDetails)
         };
 
         res.json(transaction);
     } catch (error) {
         console.error('Error fetching transaction:', error);
         res.status(500).json({ error: 'Failed to fetch transaction' });
+    }
+};
+
+export const getTopPosItems = async (req, res) => {
+    try {
+        const { startDate, endDate, from_date, to_date } = req.query;
+        console.log('[posController] getTopPosItems called with query:', req.query);
+        const conditions = ['pt.total_amount IS NOT NULL', 'COALESCE(pt.type, "") NOT IN ("E-Shop","Delivery")'];
+        const params = [];
+        const start = startDate || from_date;
+        const end = endDate || to_date;
+
+        if (start) {
+            conditions.push('DATE(pt.transaction_date) >= ?');
+            params.push(start);
+        }
+        if (end) {
+            conditions.push('DATE(pt.transaction_date) <= ?');
+            params.push(end);
+        }
+
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+        const sql = `SELECT
+                             COALESCE(pti.item_name, 'N/A') AS item,
+                             SUM(COALESCE(pti.quantity, 0)) AS quantity,
+                             SUM(COALESCE(pti.quantity, 0) * COALESCE(pti.unit_price, 0)) AS sales
+                         FROM pos_transaction_items pti
+                         JOIN pos_transactions pt ON pt.id = pti.transaction_id
+                         ${whereClause}
+                         GROUP BY pti.item_name
+                         ORDER BY sales DESC, quantity DESC
+                         LIMIT 10`;
+
+        console.log('[posController] getTopPosItems - final query:', sql, 'params:', params);
+
+        const [rows] = await db.query(
+            sql,
+            params
+        );
+
+        // If debug flag provided, also return the matching transaction count and SQL for troubleshooting
+        if (req.query && String(req.query.debug) === '1') {
+            try {
+                const countSql = `SELECT COUNT(DISTINCT pt.id) AS cnt FROM pos_transactions pt ${whereClause}`
+                const [countRows] = await db.query(countSql, params)
+                const transactionCount = Number(countRows[0]?.cnt || 0)
+                return res.json({ success: true, data: rows, debug: { sql, params, transactionCount, countSql } })
+            } catch (err) {
+                console.warn('[posController] getTopPosItems debug count failed:', err.message)
+                return res.json({ success: true, data: rows, debug: { sql, params } })
+            }
+        }
+
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        console.error('Error fetching top POS items:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch top POS items', error: error.message });
     }
 };
 
@@ -324,6 +436,10 @@ export const createTransaction = async (req, res) => {
         if (columnSet.has('payment_url') && normalizedPaymentUrl) {
             insertColumns.push('payment_url');
             insertValues.push(normalizedPaymentUrl);
+        }
+        if (columnSet.has('booking_details')) {
+            insertColumns.push('booking_details');
+            insertValues.push(JSON.stringify(req.body.bookingDetails || req.body.booking_details || []));
         }
         if (columnSet.has('user_id') && userId) {
             insertColumns.push('user_id');

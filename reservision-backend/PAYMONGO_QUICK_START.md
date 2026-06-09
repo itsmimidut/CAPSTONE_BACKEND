@@ -22,8 +22,6 @@
 1. Login to dashboard
 2. Go to: **Developers** → **API Keys**
 3. You'll see TWO keys:
-   - **Secret Key** (sk_test_...) ← Copy this
-   - **Public Key** (pk_test_...) ← Not needed for now
 
 ### Step 3: Update .env File
 
@@ -172,7 +170,6 @@ GET http://localhost:8000/api/paymongo/payment-status/{paymentId}
 When ready for real payments:
 
 1. Complete business verification
-2. Get **live** API keys (sk_live_...)
 3. Update `.env` with live keys
 4. Enable real payment methods
 5. Configure payout bank account

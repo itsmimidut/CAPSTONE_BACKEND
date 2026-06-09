@@ -298,6 +298,215 @@ router.get('/instructor/dashboard/:coachId', async (req, res) => {
 });
 
 /**
+ * GET /api/swimming/instructor/attendance/history/:coachId
+ * Attendance history summary for instructor.
+ */
+router.get('/instructor/attendance/history/:coachId', async (req, res) => {
+    try {
+        const { coachId } = req.params
+
+        if (!coachId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Coach ID is required'
+            })
+        }
+
+        const [rows] = await db.query(
+            `
+      SELECT
+        a.attendance_date,
+        a.schedule_id,
+        COALESCE(a.batch_id, s.batch_id) AS batch_id,
+        b.batch_name,
+        b.lesson_type,
+        s.class_period,
+        s.start_time,
+        s.end_time,
+        COUNT(DISTINCT a.enrollment_id) AS total,
+        SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) AS present,
+        SUM(CASE WHEN a.status = 'Absent' THEN 1 ELSE 0 END) AS absent,
+        SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END) AS late,
+        SUM(CASE WHEN a.status = 'Excused' THEN 1 ELSE 0 END) AS excused
+      FROM swimming_attendance a
+      LEFT JOIN swimming_batch_schedules s
+        ON s.schedule_id = a.schedule_id
+      LEFT JOIN swimming_batches b
+        ON b.batch_id = COALESCE(a.batch_id, s.batch_id)
+      WHERE a.coach_id = ?
+         OR s.coach_id = ?
+      GROUP BY
+        a.attendance_date,
+        a.schedule_id,
+        COALESCE(a.batch_id, s.batch_id),
+        b.batch_name,
+        b.lesson_type,
+        s.class_period,
+        s.start_time,
+        s.end_time
+      ORDER BY a.attendance_date DESC, s.start_time DESC
+      LIMIT 50
+      `,
+            [coachId, coachId]
+        )
+
+        return res.json({
+            success: true,
+            history: rows.map(row => ({
+                id: `${row.schedule_id}-${row.attendance_date}`,
+                date: row.attendance_date,
+                attendance_date: row.attendance_date,
+                schedule_id: row.schedule_id,
+                batch_id: row.batch_id,
+                batch: row.batch_name || 'N/A',
+                batch_name: row.batch_name || 'N/A',
+                lesson_type: row.lesson_type || 'N/A',
+                schedule: `${row.class_period || ''} ${row.start_time || ''} - ${row.end_time || ''}`.trim(),
+                class_period: row.class_period,
+                start_time: row.start_time,
+                end_time: row.end_time,
+                present: Number(row.present || 0),
+                absent: Number(row.absent || 0),
+                late: Number(row.late || 0),
+                excused: Number(row.excused || 0),
+                total: Number(row.total || 0),
+                status: 'Saved'
+            }))
+        })
+    } catch (error) {
+        console.error('Error fetching instructor attendance history:', error)
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to fetch attendance history',
+            error: error.message
+        })
+    }
+})
+
+/**
+ * POST /api/swimming/instructor/attendance
+ * Save instructor attendance records.
+ */
+router.post('/instructor/attendance', async (req, res) => {
+    const connection = await db.getConnection()
+
+    try {
+        await connection.beginTransaction()
+
+        const {
+            coach_id,
+            schedule_id,
+            batch_id,
+            attendance_date,
+            records
+        } = req.body
+
+        if (!coach_id || !schedule_id || !attendance_date || !Array.isArray(records)) {
+            await connection.rollback()
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required attendance fields.'
+            })
+        }
+
+        for (const record of records) {
+            await connection.query(
+                `
+        INSERT INTO swimming_attendance (
+          coach_id,
+          schedule_id,
+          batch_id,
+          enrollment_id,
+          attendance_date,
+          status,
+          remarks,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+          status = VALUES(status),
+          remarks = VALUES(remarks),
+          updated_at = NOW()
+        `,
+                [
+                    coach_id,
+                    schedule_id,
+                    batch_id || null,
+                    record.enrollment_id,
+                    attendance_date,
+                    record.status || record.attendance_status || 'Present',
+                    record.remarks || ''
+                ]
+            )
+        }
+
+        await connection.commit()
+
+        return res.json({
+            success: true,
+            message: 'Attendance saved successfully.'
+        })
+    } catch (error) {
+        await connection.rollback()
+        console.error('Error saving attendance:', error)
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to save attendance.',
+            error: error.message
+        })
+    } finally {
+        connection.release()
+    }
+})
+
+/**
+ * GET /api/swimming/instructor/attendance/:scheduleId/:date
+ * Load previously saved attendance records for a schedule and date.
+ */
+router.get('/instructor/attendance/:scheduleId/:date', async (req, res) => {
+    try {
+        const { scheduleId, date } = req.params
+
+        const [records] = await db.query(
+            `
+      SELECT
+        a.attendance_id,
+        a.coach_id,
+        a.schedule_id,
+        a.batch_id,
+        a.enrollment_id,
+        a.attendance_date,
+        a.status,
+        a.remarks,
+        e.first_name,
+        e.last_name,
+        e.email
+      FROM swimming_attendance a
+      LEFT JOIN swimming_enrollments e
+        ON e.enrollment_id = a.enrollment_id
+      WHERE a.schedule_id = ?
+        AND a.attendance_date = ?
+      ORDER BY e.last_name ASC, e.first_name ASC
+      `,
+            [scheduleId, date]
+        )
+
+        return res.json({
+            success: true,
+            records
+        })
+    } catch (error) {
+        console.error('Error fetching attendance records:', error)
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to fetch attendance records',
+            error: error.message
+        })
+    }
+})
+
+/**
  * GET /api/swimming/instructor/dashboard-data/:coachId
  * Instructor dashboard summary using admin-style data filtered by coach.
  */

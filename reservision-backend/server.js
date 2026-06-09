@@ -71,9 +71,12 @@ import otpRoutes from "./routes/otp.js";
 import customersRoutes from "./routes/customers.js";
 import userManagementRoutes from "./routes/userManagement.js";
 import analyticsRoutes from "./routes/analytics.js";
-import notificationsRoutes from "./routes/notifications.js";
 import websiteConfigRoutes from "./routes/websiteConfig.js";
 import webhooksRoutes from "./routes/webhooks.js";
+import adminRefundRoutes from "./routes/adminRefundRoutes.js";
+import adminSalesReportRoutes from "./routes/adminSalesReportRoutes.js";
+import adminNotificationRoutes from "./routes/adminNotificationRoutes.js";
+import notificationsRoutes from "./routes/notifications.js";
 import db from "./config/db.js";
 
 // ============================================================
@@ -175,8 +178,17 @@ app.use("/api/analytics", analyticsRoutes);
 // User Management (Admin)
 app.use("/api/users", userManagementRoutes);
 
-// Notification Counts
-app.use("/api/notifications", notificationsRoutes);
+// Admin Refund Management
+app.use("/api/admin/refunds", adminRefundRoutes);
+
+// Admin Sales Analytics Reports
+app.use("/api/admin/reports", adminSalesReportRoutes);
+
+// Admin Notifications
+app.use('/api/admin', adminNotificationRoutes);
+
+// Notification badge counts
+app.use('/api/notifications', notificationsRoutes);
 
 // Website Content Configuration
 app.use('/api/website-config', websiteConfigRoutes);
@@ -218,6 +230,14 @@ app.get("/", (req, res) => {
         byId: "/api/bookings/:id",
         byReference: "/api/bookings/reference/:reference",
         occupiedDates: "/api/bookings/occupied-dates"
+      },
+      adminReports: {
+        salesAnalytics: "/api/admin/reports/sales-analytics",
+        export: "/api/admin/reports/sales-analytics/export"
+      },
+      adminNotifications: {
+        list: "/api/admin/notifications",
+        pendingCounts: "/api/notifications/pending-counts"
       },
       resort: {
         chatGroq: "/api/resort/chat/groq",
@@ -261,6 +281,64 @@ async function ensureSwimmingScheduleColumns() {
     console.log('[DB] Added missing swimming_enrollments schedule columns:', missingColumns.map(c => c.name).join(', '));
   } catch (error) {
     console.warn('[DB] Could not auto-add swimming_enrollments schedule columns:', error.message);
+  }
+}
+
+async function ensureRefundsSchema() {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS refunds (
+        refund_id INT AUTO_INCREMENT PRIMARY KEY,
+        booking_id INT NOT NULL,
+        payment_id INT NULL,
+        customer_id INT NULL,
+        refund_reference VARCHAR(50) UNIQUE,
+        refund_type ENUM('Full', 'Partial', 'No Refund') DEFAULT NULL,
+        refund_reason VARCHAR(255) DEFAULT 'Waiting for admin review',
+        refund_note TEXT,
+        original_amount DECIMAL(10,2) DEFAULT 0,
+        refund_amount DECIMAL(10,2) DEFAULT 0,
+        refund_method VARCHAR(50),
+        refund_status ENUM('Pending', 'Approved', 'Rejected', 'Refunded') DEFAULT 'Pending',
+        gateway_reference VARCHAR(100) NULL,
+        gateway_status VARCHAR(50) NULL,
+        requested_by VARCHAR(100) NULL,
+        approved_by VARCHAR(100) NULL,
+        rejected_by VARCHAR(100) NULL,
+        requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        approved_at TIMESTAMP NULL,
+        refunded_at TIMESTAMP NULL,
+        rejected_at TIMESTAMP NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_booking_id (booking_id),
+        INDEX idx_refund_status (refund_status),
+        INDEX idx_requested_at (requested_at),
+        FOREIGN KEY (booking_id) REFERENCES bookings(booking_id)
+      )
+    `);
+
+    const bookingColumns = [
+      { name: 'refund_status', definition: "VARCHAR(50) DEFAULT 'No Refund'" },
+      { name: 'refund_amount', definition: 'DECIMAL(10,2) DEFAULT 0' },
+      { name: 'last_refunded_at', definition: 'TIMESTAMP NULL' }
+    ];
+
+    const [existingColumns] = await db.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bookings' AND COLUMN_NAME IN (?, ?, ?)`,
+      bookingColumns.map((column) => column.name)
+    );
+    const existingColumnSet = new Set(existingColumns.map((row) => row.COLUMN_NAME));
+    const missingColumns = bookingColumns.filter((column) => !existingColumnSet.has(column.name));
+
+    if (missingColumns.length > 0) {
+      const alterClauses = missingColumns.map((column) => `ADD COLUMN ${column.name} ${column.definition}`);
+      await db.query(`ALTER TABLE bookings ${alterClauses.join(', ')}`);
+    }
+
+    console.log('[DB] Ensured refunds table and booking refund columns.');
+  } catch (error) {
+    console.warn('[DB] Could not ensure refunds schema:', error.message);
   }
 }
 
@@ -313,6 +391,7 @@ async function ensureSwimmingBatchColumns() {
  * To test:
  * curl http://localhost:8000/api/rooms
  */
+await ensureRefundsSchema();
 await ensureSwimmingScheduleColumns();
 await ensureSwimmingBatchColumns();
 app.listen(8000, () => console.log("Server running at http://localhost:8000"));

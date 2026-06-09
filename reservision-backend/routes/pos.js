@@ -30,6 +30,9 @@ router.get('/items', posController.getAllItems);
 // GET items by category
 router.get('/items/category/:category', posController.getItemsByCategory);
 
+// GET top POS items for reporting
+router.get('/top-items', posController.getTopPosItems);
+
 // ============================================================
 // THERMAL PRINTER ROUTES
 // ============================================================
