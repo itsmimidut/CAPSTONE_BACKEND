@@ -8,9 +8,18 @@
  * - Atomically assign first available room for date range
  * - Prevent double booking with transactions and locks
  * - Query optimization for room availability
+ *
+ * Status lifecycle (inventory_items.status ENUM):
+ * - Available — operational / bookable; future stays use occupied_dates
+ * - Occupied — currently in use (admin/manual or operational flag)
+ * - Under Maintenance — not bookable
+ *
+ * Auto-assignment must NOT write invalid values (e.g. "Booked").
+ * Date occupancy is owned by occupied_dates (+ bookings), not status.
  */
 
 import db from "../config/db.js";
+import { isBookableInventoryStatus } from "./inventoryBookabilityService.js";
 
 /**
  * Extract base room name from inventory item name
@@ -53,8 +62,8 @@ export const getGroupedRooms = async () => {
         'status', status
       )) AS all_rooms
     FROM inventory_items
-    WHERE category_type = 'room' 
-      AND status IN ('Available', 'Booked')
+    WHERE category_type = 'room'
+      AND status IN ('Available', 'Occupied')
     GROUP BY SUBSTRING(name, 1, CHAR_LENGTH(name) - 2), price, max_guests, description, category_type
     ORDER BY price ASC
   `;
@@ -108,6 +117,7 @@ export const checkRoomAvailability = async (roomType, checkInDate, checkOutDate)
     LEFT JOIN occupied_dates od ON ii.item_id = od.inventory_item_id
     WHERE SUBSTRING(ii.name, 1, CHAR_LENGTH(ii.name) - 2) = ?
       AND ii.category_type = 'room'
+      AND ii.status = 'Available'
     GROUP BY ii.item_id, ii.name, ii.room_number, ii.status
     HAVING booked_nights_in_range = 0
     ORDER BY ii.item_id ASC
@@ -115,10 +125,11 @@ export const checkRoomAvailability = async (roomType, checkInDate, checkOutDate)
 
     try {
         const [rooms] = await db.query(query, [checkIn, checkOut, roomType]);
+        const availableRooms = rooms.filter((room) => isBookableInventoryStatus(room.status));
         return {
             success: true,
-            available_rooms: rooms,
-            available_count: rooms.length
+            available_rooms: availableRooms,
+            available_count: availableRooms.length
         };
     } catch (error) {
         console.error('Error checking availability:', error);
@@ -135,16 +146,18 @@ export const checkRoomAvailability = async (roomType, checkInDate, checkOutDate)
  * ⚠️ CRITICAL: Must be called within a database transaction
  * 
  * Process:
- * 1. Use FOR UPDATE lock to reserve the row
- * 2. Update room status to 'Booked'
- * 3. Insert occupied_dates for entire stay
- * 4. Return assigned room details
+ * 1. Use FOR UPDATE lock to reserve an Available room with no date conflicts
+ * 2. Re-assert bookable status (do not mutate physical status)
+ * 3. Return assigned room details + stay date list
+ *
+ * Caller must insert occupied_dates AFTER the booking row exists
+ * (live schema requires booking_id NOT NULL + FK).
  * 
  * @param {Connection} connection - MySQL connection (for transaction)
  * @param {string} roomType - Base room name (e.g., "FAMILY ROOM")
  * @param {Date} checkInDate - Check-in date
  * @param {Date} checkOutDate - Check-out date
- * @returns {Object} - {success: bool, item_id: int, room_name: string, error?: string}
+ * @returns {Object} - {success: bool, item_id: int, room_name: string, occupied_dates?: string[], error?: string}
  */
 export const autoAssignRoom = async (connection, roomType, checkInDate, checkOutDate) => {
     try {
@@ -152,9 +165,9 @@ export const autoAssignRoom = async (connection, roomType, checkInDate, checkOut
         const checkOut = checkOutDate.toISOString().split('T')[0];
         const nights = Math.ceil((checkOutDate - checkInDate) / (1000 * 60 * 60 * 24));
 
-        // STEP 1: Find first available room (with row lock to prevent double-booking)
+        // STEP 1: Find first Available room (row lock) excluding date conflicts
         const [availableRooms] = await connection.query(
-            `SELECT item_id, name, price
+            `SELECT item_id, name, price, status
        FROM inventory_items 
        WHERE category_type = 'room'
          AND SUBSTRING(name, 1, CHAR_LENGTH(name) - 2) = ?
@@ -164,8 +177,8 @@ export const autoAssignRoom = async (connection, roomType, checkInDate, checkOut
            FROM occupied_dates 
            WHERE occupied_date BETWEEN ? AND ?
          )
-       FOR UPDATE
-       LIMIT 1`,
+       LIMIT 1
+       FOR UPDATE`,
             [roomType, checkIn, checkOut]
         );
 
@@ -181,22 +194,16 @@ export const autoAssignRoom = async (connection, roomType, checkInDate, checkOut
         const roomName = assignedRoom.name;
         const roomPrice = assignedRoom.price;
 
-        // STEP 2: Update room status to 'Booked'
-        const [updateResult] = await connection.query(
-            `UPDATE inventory_items 
-       SET status = ?, updated_at = NOW() 
-       WHERE item_id = ? AND status = 'Available'`,
-            ['Booked', itemId]
-        );
-
-        if (updateResult.affectedRows === 0) {
+        // STEP 2: Keep physical status Available — occupancy is date-based.
+        // Never write invalid ENUM values such as "Booked".
+        if (!isBookableInventoryStatus(assignedRoom.status)) {
             return {
                 success: false,
-                error: 'Room status update failed - room may have been booked by another user'
+                error: 'Room is no longer bookable - may have been taken by another user'
             };
         }
 
-        // STEP 3: Generate all dates in stay period and insert into occupied_dates
+        // STEP 3: Build stay dates for the caller to persist with booking_id
         const datesList = [];
         const currentDate = new Date(checkInDate);
 
@@ -205,21 +212,14 @@ export const autoAssignRoom = async (connection, roomType, checkInDate, checkOut
             currentDate.setDate(currentDate.getDate() + 1);
         }
 
-        // Batch insert occupied dates
-        for (const date of datesList) {
-            await connection.query(
-                `INSERT IGNORE INTO occupied_dates (inventory_item_id, occupied_date, created_at) 
-         VALUES (?, ?, NOW())`,
-                [itemId, date]
-            );
-        }
-
         return {
             success: true,
             item_id: itemId,
             room_name: roomName,
             room_price: parseFloat(roomPrice),
-            nights: nights
+            nights: nights,
+            occupied_dates: datesList,
+            status_preserved: 'Available',
         };
 
     } catch (error) {
@@ -229,6 +229,29 @@ export const autoAssignRoom = async (connection, roomType, checkInDate, checkOut
             error: error.message
         };
     }
+};
+
+/**
+ * Persist occupied_dates for an assigned room after booking_id exists.
+ */
+export const insertOccupiedDatesForBooking = async (connection, {
+  inventoryItemId,
+  bookingId,
+  dates = [],
+}) => {
+  const itemId = Number(inventoryItemId)
+  const bid = Number(bookingId)
+  if (!Number.isFinite(itemId) || itemId <= 0 || !Number.isFinite(bid) || bid <= 0) {
+    throw new Error('inventoryItemId and bookingId are required')
+  }
+
+  for (const date of dates) {
+    await connection.query(
+      `INSERT IGNORE INTO occupied_dates (inventory_item_id, booking_id, occupied_date, created_at)
+       VALUES (?, ?, ?, NOW())`,
+      [itemId, bid, date]
+    )
+  }
 };
 
 /**

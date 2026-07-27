@@ -94,7 +94,7 @@ INSERT INTO inventory_items (
   ('Room', 'room', 'R102', 'FAMILY ROOM 2', 
    'Spacious room perfect for families with 2 beds and living area', 4, 4500, 'Available', NOW(), NOW()),
   ('Room', 'room', 'R103', 'FAMILY ROOM 3', 
-   'Spacious room perfect for families with 2 beds and living area', 4, 4500, 'Booked', NOW(), NOW()),
+   'Spacious room perfect for families with 2 beds and living area', 4, 4500, 'Occupied', NOW(), NOW()),
   ('Room', 'room', 'R201', 'DELUXE ROOM 1', 
    'Luxurious room with premium amenities and ocean view', 2, 5500, 'Available', NOW(), NOW()),
   ('Room', 'room', 'R202', 'DELUXE ROOM 2', 
@@ -118,7 +118,7 @@ SELECT
   MIN(item_id) AS primary_item_id
 FROM inventory_items
 WHERE category_type = 'room' 
-  AND status IN ('Available', 'Booked')
+  AND status IN ('Available', 'Occupied')
 GROUP BY SUBSTRING(name, 1, CHAR_LENGTH(name) - 2), price, max_guests, description
 ORDER BY price ASC;
 

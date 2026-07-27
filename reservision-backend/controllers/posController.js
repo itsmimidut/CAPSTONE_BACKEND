@@ -19,6 +19,50 @@
  */
 
 import { db } from '../config/db.js';
+import { assertCustomerIdAccess } from '../middleware/ownership.js';
+import { calculateTransactionTotal, PosPricingError } from '../services/posPricingService.js';
+import { generateReceiptNumber } from '../services/receiptService.js';
+import { POS_PAYMENT_STATUS, POS_TRANSACTION_STATUS } from '../utils/paymentStatuses.js';
+import { markPending, markPaid } from '../services/paymentStatusService.js';
+import { applyInventoryDeduction } from '../services/inventorySettlementService.js';
+import { finalizeBookingsForPaidTransaction } from '../services/bookingCheckoutService.js';
+import { createPosGcashInvoice } from '../services/posXenditService.js';
+import { voidTransaction, TransactionVoidError } from '../services/transactionVoidService.js';
+import { getPosTransactionColumnSet } from '../services/paymentStatusService.js';
+import { pushPaymentToDisplay } from '../services/displayPaymentService.js';
+import {
+    syncPosTransactionByReceipt,
+    syncRecentPendingPosTransactions,
+} from '../services/posXenditSyncService.js';
+import {
+    PosReceiptPrintError,
+    prepareAndQueuePrint,
+    normalizeReceiptNo,
+    retryFailedPrintJob,
+} from '../services/posReceiptPrintService.js';
+import { getPrintJobById, listPrintJobsByReceipt } from '../services/printJobService.js';
+import {
+    completeOrderSession,
+    lockActiveOrderSession,
+    PosOrderSessionError,
+} from '../services/posOrderSessionService.js';
+import { logSystemEvent } from '../utils/logger.js';
+
+const getAuthenticatedUserId = (req) => Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
+
+const roundMoney = (value) => Math.round(Number(value || 0) * 100) / 100;
+
+const isCashPayment = (method) => String(method || '').trim().toLowerCase() === 'cash';
+const isGcashPayment = (method) => String(method || '').trim().toLowerCase() === 'gcash';
+
+const resolveCustomerIdForUser = async (userId) => {
+    const [customerRows] = await db.query(
+        'SELECT customer_id FROM customers WHERE user_id = ? LIMIT 1',
+        [userId],
+    );
+
+    return customerRows.length > 0 ? customerRows[0].customer_id : null;
+};
 
 const parseJsonArray = (value) => {
     if (Array.isArray(value)) return value;
@@ -61,10 +105,14 @@ const normalizeAddOnOption = (addon, index) => {
 };
 
 const mapRestaurantItems = (rows) => rows.map(item => ({
+    id: item.menu_id,
+    menu_id: item.menu_id,
+    item_id: item.menu_id,
     category: 'restaurant',
     name: item.name,
     price: parseFloat(item.price),
     description: item.description || 'Uncategorized',
+    image_url: item.image_url || '',
     sizes: parseJsonArray(item.sizes).map((size, index) => normalizeSizeOption(size, index)),
     addons: parseJsonArray(item.addons).map((addon, index) => normalizeAddOnOption(addon, index)),
     available: 1
@@ -96,6 +144,7 @@ const fetchRestaurantItems = async () => {
         'menu_id',
         'name',
         'price',
+        'image_url',
         "COALESCE(NULLIF(TRIM(category), ''), 'Uncategorized') as description"
     ];
 
@@ -152,20 +201,31 @@ export const getAllTransactions = async (req, res) => {
         const { userId, startDate, endDate } = req.query;
         console.log('[posController] getAllTransactions called with query:', req.query);
 
-        let query = 'SELECT * FROM pos_transactions';
+        try {
+            await syncRecentPendingPosTransactions(10);
+        } catch (syncError) {
+            console.warn('[posController] Pending POS Xendit sync skipped:', syncError.message);
+        }
+
+        let query = `
+            SELECT pt.*,
+                   NULLIF(TRIM(CONCAT(vu.first_name, ' ', vu.last_name)), '') AS voided_by_name
+            FROM pos_transactions pt
+            LEFT JOIN user vu ON pt.voided_by = vu.user_id
+        `;
         const conditions = [];
         const params = [];
 
         if (userId) {
-            conditions.push('user_id = ?');
+            conditions.push('pt.user_id = ?');
             params.push(userId);
         }
         if (startDate) {
-            conditions.push('DATE(transaction_date) >= ?');
+            conditions.push('DATE(pt.transaction_date) >= ?');
             params.push(startDate);
         }
         if (endDate) {
-            conditions.push('DATE(transaction_date) <= ?');
+            conditions.push('DATE(pt.transaction_date) <= ?');
             params.push(endDate);
         }
 
@@ -173,7 +233,7 @@ export const getAllTransactions = async (req, res) => {
             query += ` WHERE ${conditions.join(' AND ')}`;
         }
 
-        query += ' ORDER BY created_at DESC';
+        query += ' ORDER BY pt.created_at DESC';
 
         console.log('[posController] getAllTransactions - final query:', query, 'params:', params);
         const [rows] = await db.query(query, params);
@@ -205,7 +265,7 @@ export const getTransaction = async (req, res) => {
     try {
         const { id } = req.params;
         const [rows] = await db.query(
-            'SELECT * FROM pos_transactions WHERE transaction_id = ?',
+            'SELECT * FROM pos_transactions WHERE id = ?',
             [id]
         );
 
@@ -223,6 +283,68 @@ export const getTransaction = async (req, res) => {
     } catch (error) {
         console.error('Error fetching transaction:', error);
         res.status(500).json({ error: 'Failed to fetch transaction' });
+    }
+};
+
+/**
+ * Handler: GET /api/pos/payment-status/:receiptNo
+ * Public read-only status for GCash return URL after POS payment.
+ */
+export const getPosPaymentStatusByReceipt = async (req, res) => {
+    try {
+        const receiptNo = String(req.params.receiptNo || '').trim();
+        if (!receiptNo) {
+            return res.status(400).json({ success: false, error: 'Receipt number is required' });
+        }
+
+        let [rows] = await db.query(
+            `SELECT receipt_no, payment_status, status, total_amount, transaction_date, transaction_time, xendit_invoice_id
+             FROM pos_transactions
+             WHERE receipt_no = ?
+             LIMIT 1`,
+            [receiptNo]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({ success: false, error: 'POS transaction not found' });
+        }
+
+        let tx = rows[0];
+        let paymentStatus = String(tx.payment_status || '').toUpperCase();
+
+        if (paymentStatus === 'PENDING' && tx.xendit_invoice_id) {
+            try {
+                await syncPosTransactionByReceipt(receiptNo);
+                [rows] = await db.query(
+                    `SELECT receipt_no, payment_status, status, total_amount, transaction_date, transaction_time, xendit_invoice_id
+                     FROM pos_transactions
+                     WHERE receipt_no = ?
+                     LIMIT 1`,
+                    [receiptNo]
+                );
+                tx = rows[0] || tx;
+                paymentStatus = String(tx.payment_status || '').toUpperCase();
+            } catch (syncError) {
+                console.warn('getPosPaymentStatusByReceipt sync failed:', syncError.message);
+            }
+        }
+
+        return res.json({
+            success: true,
+            receiptNo: tx.receipt_no,
+            payment_status: paymentStatus,
+            transaction_status: String(tx.status || 'ACTIVE').toUpperCase(),
+            isPaid: paymentStatus === 'PAID',
+            isPending: paymentStatus === 'PENDING',
+            isFailed: ['FAILED', 'EXPIRED', 'VOIDED'].includes(paymentStatus),
+            total_amount: Number(tx.total_amount || 0),
+            transaction_date: tx.transaction_date,
+            transaction_time: tx.transaction_time,
+            invoiceId: tx.xendit_invoice_id || null,
+        });
+    } catch (error) {
+        console.error('getPosPaymentStatusByReceipt error:', error);
+        return res.status(500).json({ success: false, error: 'Failed to fetch POS payment status' });
     }
 };
 
@@ -307,102 +429,107 @@ export const createTransaction = async (req, res) => {
     const connection = await db.getConnection();
     try {
         const {
-            receiptNo,
             items,
             type,
             payment,
-            total,
-            date,
-            time,
-            receipt_no,
             payment_method,
-            total_amount,
-            cash_received,
+            cash_received: cashReceivedSnake,
             cashReceived,
             paid_amount,
             paidAmount,
-            change_amount,
-            changeAmount,
             transaction_date,
             transaction_time,
+            date,
+            time,
             paymentUrl,
             payment_url,
-            userId
+            order_session_id: orderSessionIdSnake,
+            orderSessionId,
+            station_id: stationIdSnake,
+            stationId,
+            terminal_id: terminalIdSnake,
+            terminalId,
         } = req.body;
 
-        const normalizedReceiptNo = receiptNo ?? receipt_no;
-        const normalizedItems = items;
-        const normalizedType = type ?? 'Walk-in';
-        const normalizedPayment = payment ?? payment_method;
-        const normalizedTotal = total ?? total_amount;
-        const normalizedPaidAmount =
-            cash_received ?? cashReceived ?? paid_amount ?? paidAmount ?? normalizedTotal;
-        const normalizedChangeAmount = change_amount ?? changeAmount ?? 0;
-        const normalizedDate = date ?? transaction_date;
-        const normalizedTime = time ?? transaction_time;
-        const normalizedPaymentUrl = paymentUrl ?? payment_url ?? null;
-
-        // Validate required fields
-        if (!normalizedReceiptNo || !normalizedItems || !normalizedPayment || normalizedTotal === undefined) {
-            return res.status(400).json({
-                error: 'Missing required fields: receiptNo, items, payment, total'
+        const authenticatedUserId = getAuthenticatedUserId(req);
+        if (!authenticatedUserId) {
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication required',
+                code: 'UNAUTHORIZED',
             });
         }
 
-        // Start transaction for atomicity
-        await connection.beginTransaction();
+        const normalizedType = type ?? 'Walk-in';
+        const normalizedPayment = payment ?? payment_method;
+        const normalizedPaymentUrl = paymentUrl ?? payment_url ?? null;
 
-        // Deduct inventory for items that have menu_id
-        for (const item of normalizedItems) {
-            let menuId = item.menu_id;
-
-            // If no menu_id provided, try to find by name
-            if (!menuId && item.name) {
-                const [menuResult] = await connection.query(
-                    'SELECT menu_id FROM menu_items WHERE name = ? LIMIT 1',
-                    [item.name]
-                );
-                menuId = menuResult?.[0]?.menu_id;
-            }
-
-            // If we found a menu item, deduct its ingredients
-            if (menuId) {
-                const [ingredients] = await connection.query(`
-                    SELECT inventory_id, quantity_needed
-                    FROM menu_ingredients
-                    WHERE menu_id = ?
-                `, [menuId]);
-
-                const quantity = item.quantity || 1;
-
-                // Deduct each ingredient
-                for (const ingredient of ingredients) {
-                    const deductAmount = ingredient.quantity_needed * quantity;
-
-                    await connection.query(`
-                        UPDATE inventory 
-                        SET quantity = quantity - ?,
-                            status = CASE
-                                WHEN (quantity - ?) <= threshold * 0.25 THEN 'critical'
-                                WHEN (quantity - ?) <= threshold THEN 'low'
-                                ELSE 'good'
-                            END,
-                            updated_at = NOW()
-                        WHERE inventory_id = ?
-                    `, [deductAmount, deductAmount, deductAmount, ingredient.inventory_id]);
-                }
-            }
+        if (!Array.isArray(items) || items.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'At least one item is required',
+            });
         }
 
-        // Convert items array to JSON string for storage
-        const itemsJson = JSON.stringify(normalizedItems);
+        if (!normalizedPayment) {
+            return res.status(400).json({
+                success: false,
+                error: 'Payment method is required',
+            });
+        }
 
-        const [columnRows] = await connection.query(
-            `SELECT COLUMN_NAME
-             FROM INFORMATION_SCHEMA.COLUMNS
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pos_transactions'`
+        await connection.beginTransaction();
+
+        const requestedOrderSessionId = orderSessionIdSnake ?? orderSessionId ?? null;
+        const normalizedStationId = stationIdSnake ?? stationId ?? null;
+        const normalizedTerminalId = terminalIdSnake ?? terminalId ?? null;
+        const orderSession = requestedOrderSessionId
+            ? await lockActiveOrderSession(connection, {
+                sessionId: requestedOrderSessionId,
+                userId: authenticatedUserId,
+                stationId: normalizedStationId,
+                terminalId: normalizedTerminalId,
+            })
+            : null;
+
+        // Always stamp walk-in POS sales with MySQL server date/time so they
+        // stay aligned with station-day service order numbers in PH timezones.
+        const [[serverClock]] = await connection.query(
+            'SELECT CURDATE() AS transaction_date, CURTIME() AS transaction_time'
         );
-        const columnSet = new Set(columnRows.map(row => row.COLUMN_NAME));
+        const normalizedDate = orderSession?.service_order_date
+            ?? serverClock.transaction_date;
+        const normalizedTime = serverClock.transaction_time;
+
+        const { items: pricedItems, totalAmount } = await calculateTransactionTotal(items, connection);
+        const normalizedReceiptNo = await generateReceiptNumber(connection);
+
+        let normalizedPaidAmount = totalAmount;
+        let normalizedChangeAmount = 0;
+
+        if (isCashPayment(normalizedPayment)) {
+            const tendered = Number(cashReceivedSnake ?? cashReceived ?? paid_amount ?? paidAmount);
+            if (!Number.isFinite(tendered) || tendered < totalAmount) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    error: 'Cash received must be greater than or equal to the computed total',
+                    total_amount: totalAmount,
+                });
+            }
+            normalizedPaidAmount = roundMoney(tendered);
+            normalizedChangeAmount = roundMoney(tendered - totalAmount);
+        }
+
+        const paymentStatus = isCashPayment(normalizedPayment)
+            ? POS_PAYMENT_STATUS.PAID
+            : POS_PAYMENT_STATUS.PENDING;
+        const paymentProcessed = isCashPayment(normalizedPayment) ? 1 : 0;
+        const paidAtValue = isCashPayment(normalizedPayment) ? new Date() : null;
+
+        const itemsJson = JSON.stringify(pricedItems);
+
+        const columnSet = await getPosTransactionColumnSet(connection);
 
         const insertColumns = [
             'receipt_no',
@@ -416,7 +543,7 @@ export const createTransaction = async (req, res) => {
             normalizedReceiptNo,
             itemsJson,
             normalizedPayment,
-            normalizedTotal,
+            totalAmount,
             normalizedDate,
             normalizedTime
         ];
@@ -441,9 +568,65 @@ export const createTransaction = async (req, res) => {
             insertColumns.push('booking_details');
             insertValues.push(JSON.stringify(req.body.bookingDetails || req.body.booking_details || []));
         }
-        if (columnSet.has('user_id') && userId) {
+        if (columnSet.has('user_id')) {
             insertColumns.push('user_id');
-            insertValues.push(userId);
+            insertValues.push(authenticatedUserId);
+        }
+        if (columnSet.has('payment_status')) {
+            insertColumns.push('payment_status');
+            insertValues.push(paymentStatus);
+        }
+        if (columnSet.has('payment_processed')) {
+            insertColumns.push('payment_processed');
+            insertValues.push(paymentProcessed);
+        }
+        if (columnSet.has('status')) {
+            insertColumns.push('status');
+            insertValues.push(POS_TRANSACTION_STATUS.ACTIVE);
+        }
+        if (columnSet.has('paid_at') && paidAtValue) {
+            insertColumns.push('paid_at');
+            insertValues.push(paidAtValue);
+        }
+        if (orderSession && columnSet.has('service_order_number')) {
+            insertColumns.push('service_order_number');
+            insertValues.push(orderSession.service_order_number);
+        }
+        if (orderSession && columnSet.has('service_order_date')) {
+            insertColumns.push('service_order_date');
+            insertValues.push(orderSession.service_order_date);
+        }
+        if (orderSession && columnSet.has('order_type')) {
+            insertColumns.push('order_type');
+            insertValues.push(orderSession.order_type);
+        }
+        if (orderSession && columnSet.has('station_id')) {
+            insertColumns.push('station_id');
+            insertValues.push(orderSession.station_id);
+        }
+        if (orderSession && columnSet.has('terminal_id')) {
+            insertColumns.push('terminal_id');
+            insertValues.push(orderSession.terminal_id);
+        }
+        if (orderSession && columnSet.has('location_type')) {
+            insertColumns.push('location_type');
+            insertValues.push(orderSession.location_type);
+        }
+        if (orderSession && columnSet.has('location_number')) {
+            insertColumns.push('location_number');
+            insertValues.push(orderSession.location_number);
+        }
+        if (orderSession && columnSet.has('delivery_notes')) {
+            insertColumns.push('delivery_notes');
+            insertValues.push(orderSession.delivery_notes);
+        }
+        if (orderSession && columnSet.has('pickup_name')) {
+            insertColumns.push('pickup_name');
+            insertValues.push(orderSession.pickup_name);
+        }
+        if (orderSession && columnSet.has('recipient_name')) {
+            insertColumns.push('recipient_name');
+            insertValues.push(orderSession.recipient_name);
         }
 
         const placeholders = insertColumns.map(() => '?').join(', ');
@@ -452,6 +635,30 @@ export const createTransaction = async (req, res) => {
             insertValues
         );
 
+        const transactionId = result.insertId;
+        let invoicePayload = null;
+
+        if (isCashPayment(normalizedPayment)) {
+            await applyInventoryDeduction(connection, { payment_status: paymentStatus, items: pricedItems }, pricedItems);
+            await finalizeBookingsForPaidTransaction(connection, pricedItems, authenticatedUserId);
+            await markPaid(connection, transactionId, { paidAt: paidAtValue || new Date() });
+        } else if (isGcashPayment(normalizedPayment)) {
+            const payerEmail = String(req.body.payer_email || req.body.email || 'pos@eduardos.com').trim();
+            const payerName = String(req.body.payer_name || req.body.customerName || 'POS Walk-in').trim();
+            invoicePayload = await createPosGcashInvoice({
+                receiptNo: normalizedReceiptNo,
+                amount: totalAmount,
+                email: payerEmail,
+                customerName: payerName,
+                description: `Eduardo's Resort POS - ${normalizedReceiptNo}`,
+            });
+            await markPending(connection, transactionId, {
+                invoiceId: invoicePayload.invoiceId,
+                paymentReference: invoicePayload.paymentReference,
+                paymentUrl: invoicePayload.paymentUrl,
+            });
+        }
+
         const [detailTableRows] = await connection.query(
             `SELECT COUNT(*) AS total
              FROM INFORMATION_SCHEMA.TABLES
@@ -459,7 +666,7 @@ export const createTransaction = async (req, res) => {
         );
 
         if (detailTableRows[0]?.total > 0) {
-            for (const item of normalizedItems) {
+            for (const item of pricedItems) {
                 const quantity = Number(item.quantity ?? item.qty ?? 1);
                 const lineTotal = Number(item.price ?? 0);
                 const unitPrice = Number(item.unitPrice ?? (quantity > 0 ? lineTotal / quantity : lineTotal));
@@ -481,19 +688,86 @@ export const createTransaction = async (req, res) => {
             }
         }
 
-        // Commit the transaction
+        if (orderSession) {
+            await completeOrderSession(connection, orderSession.id, transactionId);
+        }
+
         await connection.commit();
 
+        let displayPush = null;
+        if (isGcashPayment(normalizedPayment) && invoicePayload) {
+            try {
+                displayPush = await pushPaymentToDisplay({
+                    stationId: req.body?.station_id || req.body?.stationId,
+                    terminalId: req.body?.terminal_id || req.body?.terminalId,
+                    receiptNo: normalizedReceiptNo,
+                    amount: totalAmount,
+                    invoiceId: invoicePayload.invoiceId,
+                    paymentUrl: invoicePayload.paymentUrl,
+                    items: pricedItems,
+                    serviceOrderNumber: orderSession?.service_order_number ?? null,
+                    orderType: orderSession?.order_type ?? null,
+                    locationNumber: orderSession?.location_number ?? null,
+                });
+            } catch (displayError) {
+                console.warn('Customer display push failed:', displayError.message);
+            }
+        }
+
         res.status(201).json({
-            message: 'Transaction created successfully with inventory deduction',
-            transactionId: result.insertId,
-            receiptNo: normalizedReceiptNo
+            success: true,
+            message: isGcashPayment(normalizedPayment)
+                ? 'POS transaction created. Awaiting GCash payment confirmation.'
+                : 'Transaction created successfully with inventory deduction',
+            transactionId,
+            receiptNo: normalizedReceiptNo,
+            receipt_no: normalizedReceiptNo,
+            total_amount: totalAmount,
+            paid_amount: normalizedPaidAmount,
+            change_amount: normalizedChangeAmount,
+            payment_status: paymentStatus,
+            payment_url: invoicePayload?.paymentUrl || normalizedPaymentUrl || null,
+            xendit_invoice_id: invoicePayload?.invoiceId || null,
+            items: pricedItems,
+            display_push: displayPush,
+            service_order_number: orderSession?.service_order_number ?? null,
+            service_order_date: orderSession?.service_order_date ?? null,
+            order_type: orderSession?.order_type ?? null,
+            location_type: orderSession?.location_type ?? null,
+            location_number: orderSession?.location_number ?? null,
+            pickup_name: orderSession?.pickup_name ?? null,
+            recipient_name: orderSession?.recipient_name ?? null,
+            delivery_notes: orderSession?.delivery_notes ?? null,
         });
     } catch (error) {
-        // Rollback on error
         await connection.rollback();
+
+        if (error instanceof PosPricingError) {
+            return res.status(error.statusCode || 400).json({
+                success: false,
+                error: error.message,
+                code: error.code,
+            });
+        }
+
+        if (error instanceof PosOrderSessionError) {
+            return res.status(error.statusCode || 400).json({
+                success: false,
+                error: error.message,
+                code: error.code,
+            });
+        }
+
+        if (error?.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({
+                success: false,
+                error: 'Receipt number conflict. Please retry checkout.',
+                code: 'DUPLICATE_RECEIPT',
+            });
+        }
+
         console.error('Error creating transaction:', error);
-        res.status(500).json({ error: 'Failed to create transaction', details: error.message });
+        res.status(500).json({ success: false, error: 'Failed to create transaction', details: error.message });
     } finally {
         connection.release();
     }
@@ -509,22 +783,49 @@ export const createTransaction = async (req, res) => {
  * Params: id - Transaction ID
  */
 export const deleteTransaction = async (req, res) => {
+    return res.status(410).json({
+        success: false,
+        error: 'Transaction deletion is disabled. Use POST /api/pos/transactions/:id/void instead.',
+        code: 'DELETE_DISABLED',
+    });
+};
+
+export const voidPosTransaction = async (req, res) => {
     try {
-        const { id } = req.params;
+        const transactionId = Number(req.params.id);
+        const voidReason = String(req.body?.reason || req.body?.void_reason || '').trim();
 
-        const [result] = await db.query(
-            'DELETE FROM pos_transactions WHERE id = ?',
-            [id]
-        );
+        if (!voidReason) {
+            return res.status(400).json({ success: false, error: 'Void reason is required' });
+        }
+        const voidedBy = getAuthenticatedUserId(req);
 
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ error: 'Transaction not found' });
+        if (!transactionId) {
+            return res.status(400).json({ success: false, error: 'Transaction id is required' });
         }
 
-        res.json({ message: 'Transaction deleted successfully' });
+        if (!voidedBy) {
+            return res.status(401).json({ success: false, error: 'Authentication required' });
+        }
+
+        const result = await voidTransaction({
+            transactionId,
+            voidedBy,
+            voidReason,
+        });
+
+        return res.json(result);
     } catch (error) {
-        console.error('Error deleting transaction:', error);
-        res.status(500).json({ error: 'Failed to delete transaction' });
+        if (error instanceof TransactionVoidError) {
+            return res.status(error.statusCode || 400).json({
+                success: false,
+                error: error.message,
+                code: error.code,
+            });
+        }
+
+        console.error('voidPosTransaction error:', error);
+        return res.status(500).json({ success: false, error: 'Failed to void transaction' });
     }
 };
 
@@ -537,18 +838,80 @@ export const deleteTransaction = async (req, res) => {
  * Purpose: Delete all transaction history
  */
 export const clearAllTransactions = async (req, res) => {
-    try {
-        await db.query('DELETE FROM pos_transactions');
-        res.json({ message: 'All transactions cleared successfully' });
-    } catch (error) {
-        console.error('Error clearing transactions:', error);
-        res.status(500).json({ error: 'Failed to clear transactions' });
-    }
+    return res.status(410).json({
+        success: false,
+        error: 'Clearing transaction history is disabled. Void individual transactions instead.',
+        code: 'CLEAR_DISABLED',
+    });
 };
 
-// ============================================================
-// CREATE E-SHOP ORDER
-// ============================================================
+const normalizeEshopPaymentMethod = (body) => {
+    const raw = body?.paymentMethod ?? body?.payment_method ?? 'cash';
+    const key = String(raw).trim().toLowerCase();
+    if (key === 'gcash') return { key: 'gcash', label: 'GCash' };
+    if (key === 'maya') return { key: 'maya', label: 'Maya' };
+    return { key: 'cash', label: 'Cash on Delivery' };
+};
+
+const resolveInitialFulfillmentMethod = (locationType) => (
+    String(locationType || '').trim().toLowerCase() === 'room'
+        ? 'delivery'
+        : 'pickup'
+);
+
+const deductEshopInventory = async (connection, cart) => {
+    const [columnRows] = await connection.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inventory'
+           AND COLUMN_NAME IN ('reorder_level', 'threshold')`
+    );
+    const hasReorderLevel = columnRows.some((row) => row.COLUMN_NAME === 'reorder_level');
+    const reorderExpr = hasReorderLevel ? 'COALESCE(reorder_level, threshold)' : 'threshold';
+
+    for (const item of cart) {
+        const [menuResult] = await connection.query(
+            'SELECT menu_id FROM menu_items WHERE name = ? LIMIT 1',
+            [item.name]
+        );
+
+        const menuId = menuResult?.[0]?.menu_id;
+        if (!menuId) continue;
+
+        const [ingredients] = await connection.query(`
+            SELECT inventory_id, quantity_needed
+            FROM menu_ingredients
+            WHERE menu_id = ?
+        `, [menuId]);
+
+        const quantity = item.qty || 1;
+
+        for (const ingredient of ingredients) {
+            const deductAmount = ingredient.quantity_needed * quantity;
+
+            const [invRows] = await connection.query(
+                `SELECT inventory_id, quantity, ${reorderExpr} AS reorder_level
+                 FROM inventory
+                 WHERE inventory_id = ?
+                 LIMIT 1`,
+                [ingredient.inventory_id]
+            );
+            const inv = invRows[0];
+            if (!inv) continue;
+            const nextQty = Number(inv.quantity || 0) - Number(deductAmount || 0);
+            const reorderLevel = Math.max(0, Number(inv.reorder_level || 0));
+            const nextStatus = nextQty <= 0 ? 'critical' : (nextQty <= reorderLevel ? 'low' : 'good');
+
+            await connection.query(`
+                UPDATE inventory 
+                SET quantity = ?,
+                    status = ?,
+                    updated_at = NOW()
+                WHERE inventory_id = ?
+            `, [nextQty, nextStatus, ingredient.inventory_id]);
+        }
+    }
+};
 /**
  * Handler: POST /api/pos/eshop/order
  * 
@@ -560,9 +923,10 @@ export const clearAllTransactions = async (req, res) => {
  *   locationType: string ("Room", "Cottage", "Day Guest"),
  *   locationNumber: string (optional for Day Guest),
  *   deliveryNotes: string (optional),
- *   totalAmount: number,
- *   customerId: number (optional - if user is logged in)
+ *   totalAmount: number
  * }
+ *
+ * customer_id and user_id are derived from the authenticated session (not req.body).
  * 
  * Response:
  * {
@@ -581,13 +945,37 @@ export const createEshopOrder = async (req, res) => {
             locationNumber,
             deliveryNotes,
             totalAmount,
-            customerId,
-            activeBookingId,
-            bookingReference,
-            deliverySource
+            serviceFee,
+            grandTotal,
+            email,
+            customerName,
         } = req.body;
 
-        // Validate required fields
+        const payment = normalizeEshopPaymentMethod(req.body);
+        if (payment.key === 'maya') {
+            return res.status(400).json({
+                success: false,
+                error: 'Maya payments are not available yet. Please choose Cash or GCash.',
+            });
+        }
+
+        const userId = req.user?.id;
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication required',
+                code: 'UNAUTHORIZED',
+            });
+        }
+
+        const customerId = await resolveCustomerIdForUser(userId);
+        if (!customerId) {
+            return res.status(400).json({
+                success: false,
+                error: 'CUSTOMER_NOT_FOUND',
+            });
+        }
+
         if (!cart || !Array.isArray(cart) || cart.length === 0) {
             return res.status(400).json({
                 error: 'Cart is required and must contain at least one item'
@@ -600,119 +988,177 @@ export const createEshopOrder = async (req, res) => {
             });
         }
 
-        if (locationType !== 'Day Guest' && !locationNumber) {
+        if (locationType === 'Room' && !locationNumber) {
             return res.status(400).json({
-                error: `Location number is required for ${locationType}`
+                error: 'Delivery location is required for room delivery'
             });
         }
 
-        if (totalAmount === undefined || totalAmount <= 0) {
+        const feeAmount = roundMoney(serviceFee || 0);
+        const computedGrandTotal = roundMoney(
+            grandTotal > 0 ? grandTotal : Number(totalAmount || 0) + feeAmount
+        );
+
+        if (!computedGrandTotal || computedGrandTotal <= 0) {
             return res.status(400).json({
                 error: 'Total amount is required and must be greater than 0'
             });
         }
 
-        // Generate unique receipt number: ESHOP-YYYYMMDD-####
         const now = new Date();
         const dateStr = now.toISOString().split('T')[0].replace(/-/g, '');
         const randomNum = Math.floor(Math.random() * 9000) + 1000;
         const receiptNo = `ESHOP-${dateStr}-${randomNum}`;
 
-        // Start transaction for atomicity
         await connection.beginTransaction();
 
-        // Deduct inventory for restaurant items
-        for (const item of cart) {
-            // Try to find menu item by name
-            const [menuResult] = await connection.query(
-                'SELECT menu_id FROM menu_items WHERE name = ? LIMIT 1',
-                [item.name]
-            );
-
-            const menuId = menuResult?.[0]?.menu_id;
-
-            // If we found a menu item, deduct its ingredients
-            if (menuId) {
-                const [ingredients] = await connection.query(`
-                    SELECT inventory_id, quantity_needed
-                    FROM menu_ingredients
-                    WHERE menu_id = ?
-                `, [menuId]);
-
-                const quantity = item.qty || 1;
-
-                // Deduct each ingredient
-                for (const ingredient of ingredients) {
-                    const deductAmount = ingredient.quantity_needed * quantity;
-
-                    await connection.query(`
-                        UPDATE inventory 
-                        SET quantity = quantity - ?,
-                            status = CASE
-                                WHEN (quantity - ?) <= threshold * 0.25 THEN 'critical'
-                                WHEN (quantity - ?) <= threshold THEN 'low'
-                                ELSE 'good'
-                            END,
-                            updated_at = NOW()
-                        WHERE inventory_id = ?
-                    `, [deductAmount, deductAmount, deductAmount, ingredient.inventory_id]);
-                }
-            }
-        }
-
-        // Format items for storage
         const itemsFormatted = cart.map(item => ({
+            menu_id: item.menu_id || item.id || null,
             name: item.name,
             price: parseFloat(item.price),
             quantity: item.qty,
-            subtotal: parseFloat(item.price) * item.qty
+            subtotal: parseFloat(item.price) * item.qty,
+            image_url: String(item.image_url || item.image || '').trim(),
+            customization: item.customization || null,
         }));
 
         const itemsJson = JSON.stringify(itemsFormatted);
-
-        // Get current date and time
         const transactionDate = now.toISOString().split('T')[0];
         const transactionTime = now.toTimeString().split(' ')[0];
+        const columnSet = await getPosTransactionColumnSet(connection);
+        const fulfillmentMethod = resolveInitialFulfillmentMethod(locationType);
+        const isCash = payment.key === 'cash';
+        const isGcash = payment.key === 'gcash';
+        const paymentStatus = POS_PAYMENT_STATUS.PENDING;
 
-        // Insert order into pos_transactions
+        if (isCash) {
+            await deductEshopInventory(connection, cart);
+        }
+
+        const insertColumns = [
+            'receipt_no',
+            'items',
+            'payment_method',
+            'total_amount',
+            'transaction_date',
+            'transaction_time',
+        ];
+        const insertValues = [
+            receiptNo,
+            itemsJson,
+            payment.label,
+            computedGrandTotal,
+            transactionDate,
+            transactionTime,
+        ];
+
+        const optionalFields = [
+            ['type', 'E-Shop'],
+            ['location_type', locationType],
+            ['location_number', locationNumber || null],
+            ['delivery_notes', deliveryNotes || null],
+            ['customer_id', customerId],
+            ['user_id', userId],
+            ['fulfillment_method', fulfillmentMethod],
+            ['fulfillment_status', 'received'],
+        ];
+
+        for (const [column, value] of optionalFields) {
+            if (columnSet.has(column)) {
+                insertColumns.push(column);
+                insertValues.push(value);
+            }
+        }
+
+        if (columnSet.has('payment_status')) {
+            insertColumns.push('payment_status');
+            insertValues.push(paymentStatus);
+        }
+        if (columnSet.has('payment_processed')) {
+            insertColumns.push('payment_processed');
+            insertValues.push(0);
+        }
+        if (columnSet.has('status')) {
+            insertColumns.push('status');
+            insertValues.push(POS_TRANSACTION_STATUS.ACTIVE);
+        }
+        if (columnSet.has('fulfillment_updated_at')) {
+            insertColumns.push('fulfillment_updated_at');
+            insertValues.push(now);
+        }
+
+        const placeholders = insertColumns.map(() => '?').join(', ');
         const [result] = await connection.query(
-            `INSERT INTO pos_transactions 
-            (receipt_no, items, type, payment_method, total_amount, transaction_date, transaction_time, 
-             location_type, location_number, delivery_notes, customer_id, active_booking_id, booking_reference, delivery_source) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                receiptNo,
-                itemsJson,
-                'E-Shop',
-                'Cash on Delivery',
-                totalAmount,
-                transactionDate,
-                transactionTime,
-                locationType,
-                locationNumber || null,
-                deliveryNotes || null,
-                customerId || null,
-                activeBookingId || null,
-                bookingReference || null,
-                deliverySource || null
-            ]
+            `INSERT INTO pos_transactions (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+            insertValues
         );
 
-        // Commit the transaction
+        const transactionId = result.insertId;
+        let invoicePayload = null;
+
+        if (columnSet.has('fulfillment_status')) {
+            await connection.query(
+                `INSERT INTO pos_fulfillment_history (
+                    transaction_id, from_status, to_status, changed_by, change_reason
+                 ) VALUES (?, NULL, 'received', NULL, 'Order placed')`,
+                [transactionId],
+            );
+        }
+
+        if (isGcash) {
+            const payerEmail = String(email || req.user?.email || 'eshop@eduardos.com').trim();
+            const payerName = String(customerName || req.user?.name || 'E-Shop Customer').trim();
+            const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+            invoicePayload = await createPosGcashInvoice({
+                receiptNo,
+                amount: computedGrandTotal,
+                email: payerEmail,
+                customerName: payerName,
+                description: `Eduardo's E-Shop Order - ${receiptNo}`,
+                successRedirectUrl: `${frontendUrl}/customer?activeSection=esop&eshopPayment=success&order=${receiptNo}`,
+                failureRedirectUrl: `${frontendUrl}/customer?activeSection=esop&eshopPayment=failed&order=${receiptNo}`,
+            });
+
+            await markPending(connection, transactionId, {
+                invoiceId: invoicePayload.invoiceId,
+                paymentReference: invoicePayload.paymentReference,
+                paymentUrl: invoicePayload.paymentUrl,
+            });
+        }
+
         await connection.commit();
 
-        res.status(201).json({
+        const responseBody = {
             success: true,
-            orderId: result.insertId,
-            receiptNo: receiptNo,
-            message: 'Order placed successfully! Your food will be delivered in 30-45 minutes.',
+            orderId: transactionId,
+            order_number: receiptNo,
+            receiptNo,
+            receipt_no: receiptNo,
+            payment_method: payment.key,
+            payment_status: isCash ? 'CASH_ON_DELIVERY' : paymentStatus,
+            message: isGcash
+                ? 'Order created. Complete GCash payment to confirm your order.'
+                : 'Order placed successfully! Your food will be delivered in 30-45 minutes.',
             estimatedDelivery: '30-45 minutes',
             deliveryLocation: locationType === 'Day Guest'
                 ? 'Day Guest Area'
-                : `${locationType} ${locationNumber}`
-        });
+                : locationType === 'Cottage'
+                    ? 'Restaurant Pickup'
+                    : `${locationType} ${locationNumber || ''}`.trim(),
+            service_fee: feeAmount,
+            grand_total: computedGrandTotal,
+        };
+
+        if (invoicePayload) {
+            responseBody.invoice_url = invoicePayload.paymentUrl;
+            responseBody.payment_url = invoicePayload.paymentUrl;
+            responseBody.xendit_invoice_id = invoicePayload.invoiceId;
+            responseBody.qr_code = invoicePayload.paymentUrl;
+        }
+
+        res.status(201).json(responseBody);
     } catch (error) {
-        // Rollback on error
         await connection.rollback();
         console.error('Error creating e-shop order:', error);
         res.status(500).json({
@@ -731,28 +1177,94 @@ export const createEshopOrder = async (req, res) => {
  * Handler: GET /api/pos/orders/customer/:customerId
  * 
  * Purpose: Get order history for a specific customer
- * Params: customerId - User ID
+ * Params: customerId - customers.customer_id (not user_id)
  * Response: Array of customer's E-Shop orders
  */
+const fetchEshopOrdersForCustomer = async (customerId) => {
+    const [orders] = await db.query(
+        `SELECT * FROM pos_transactions 
+         WHERE type = 'E-Shop' AND customer_id = ?
+         ORDER BY transaction_date DESC, transaction_time DESC
+         LIMIT 50`,
+        [customerId],
+    );
+
+    const parsedOrders = orders.map((order) => ({
+        ...order,
+        items: parseJsonArray(order.items),
+    }));
+
+    const itemNames = [...new Set(parsedOrders
+        .flatMap((order) => order.items)
+        .map((item) => String(item?.name || item?.item_name || '').trim())
+        .filter(Boolean))];
+
+    const menuByName = new Map();
+    if (itemNames.length) {
+        const placeholders = itemNames.map(() => '?').join(', ');
+        const [menuRows] = await db.query(
+            `SELECT menu_id, name, image_url FROM menu_items WHERE name IN (${placeholders})`,
+            itemNames,
+        );
+        menuRows.forEach((menuItem) => {
+            menuByName.set(String(menuItem.name || '').trim().toLowerCase(), menuItem);
+        });
+    }
+
+    return parsedOrders.map((order) => ({
+        ...order,
+        items: order.items.map((item) => {
+            const menuItem = menuByName.get(String(item?.name || item?.item_name || '').trim().toLowerCase());
+            return {
+                ...item,
+                menu_id: item?.menu_id || menuItem?.menu_id || null,
+                image_url: item?.image_url || item?.image || menuItem?.image_url || '',
+            };
+        }),
+    }));
+};
+
+/**
+ * Handler: GET /api/pos/orders/me
+ * Returns E-Shop orders for the authenticated user (customer_id resolved server-side).
+ */
+export const getMyEshopOrders = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication required',
+                code: 'UNAUTHORIZED',
+            });
+        }
+
+        const customerId = await resolveCustomerIdForUser(userId);
+        if (!customerId) {
+            return res.status(400).json({
+                success: false,
+                error: 'CUSTOMER_NOT_FOUND',
+            });
+        }
+
+        const orders = await fetchEshopOrdersForCustomer(customerId);
+        return res.json(orders);
+    } catch (error) {
+        console.error('Error fetching my e-shop orders:', error);
+        return res.status(500).json({ error: 'Failed to fetch order history' });
+    }
+};
+
 export const getCustomerOrders = async (req, res) => {
     try {
         const { customerId } = req.params;
 
-        const [orders] = await db.query(
-            `SELECT * FROM pos_transactions 
-             WHERE type = 'E-Shop' AND (customer_id = ? OR customer_id IS NULL)
-             ORDER BY transaction_date DESC, transaction_time DESC
-             LIMIT 50`,
-            [customerId]
-        );
+        if (!(await assertCustomerIdAccess(req, res, customerId))) {
+            return;
+        }
 
-        // Parse items JSON for each order
-        const ordersWithParsedItems = orders.map(order => ({
-            ...order,
-            items: JSON.parse(order.items || '[]')
-        }));
-
-        res.json(ordersWithParsedItems);
+        const orders = await fetchEshopOrdersForCustomer(customerId);
+        res.json(orders);
     } catch (error) {
         console.error('Error fetching customer orders:', error);
         res.status(500).json({ error: 'Failed to fetch order history' });
@@ -960,111 +1472,278 @@ export const getItemsByCategory = async (req, res) => {
 // THERMAL PRINTER ENDPOINTS
 // ============================================================
 
+const DEPRECATED_PRINT_MESSAGE =
+    'This endpoint is deprecated. Use POST /api/pos/print/:receiptNo with { type: "regular" | "booking" }.';
+
 /**
- * Handler: POST /api/pos/print/booking
- * 
- * Purpose: Print a booking receipt directly to USB thermal printer
- * Request Body: Receipt data (guest name, dates, total, etc.)
- * Response: Print status
+ * Handler: POST /api/pos/print/:receiptNo
+ * Secure print — backend rebuilds receipt data from the database.
  */
-export const printBookingReceipt = async (req, res) => {
+export const printReceiptSecure = async (req, res) => {
     try {
-        const receiptData = req.body;
+        const receiptNo = String(req.params.receiptNo || '').trim();
+        const { type, bookingReference, source } = req.body || {};
+        const stationId = req.body?.stationId ?? req.body?.station_id ?? null;
+        const requestedBy = Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
+        const printSource = String(source || 'manual').trim().toLowerCase() === 'auto'
+            ? 'auto'
+            : 'manual';
 
-        console.log(`\n📋 Print Booking Receipt Request:`);
-        console.log(`   Receipt: ${receiptData.receiptNo}`);
-        console.log(`   Guest: ${receiptData.guestName}`);
-        console.log(`   Booking Ref: ${receiptData.bookingReference}`);
-        console.log(`   Payment Method: ${receiptData.paymentMethod}`);
-        console.log(`   Payment URL: ${receiptData.paymentUrl ? '✅ SET' : '❌ MISSING'}`);
-
-        const { printBookingReceipt: printBooking } = await import('../services/printerService.js');
-
-        // Validate required fields
-        if (!receiptData.receiptNo || !receiptData.guestName || !receiptData.total) {
-            console.error(`❌ Missing required fields:`, {
-                receiptNo: !!receiptData.receiptNo,
-                guestName: !!receiptData.guestName,
-                total: !!receiptData.total
-            });
+        if (!receiptNo) {
             return res.status(400).json({
                 success: false,
-                message: 'Missing required receipt data'
+                message: 'Receipt number is required',
+                code: 'MISSING_RECEIPT',
             });
         }
 
-        // Send to printer
-        const result = await printBooking(receiptData);
+        if (printSource === 'auto') {
+            const { queueCheckoutPrints } = await import('../services/posReceiptPrintService.js');
+            const checkoutResult = await queueCheckoutPrints({
+                receiptNo,
+                stationId,
+                requestedBy,
+            });
 
-        if (result.success) {
-            console.log(`✅ Booking receipt sent to printer: ${result.receiptNo}`);
-            res.json({
+            if (!checkoutResult.printed) {
+                return res.json({
+                    success: false,
+                    printed: false,
+                    warning: checkoutResult.warning,
+                    code: checkoutResult.code || 'PRINT_SKIPPED',
+                    warnings: checkoutResult.warnings || [],
+                });
+            }
+
+            const primary = checkoutResult.results?.[0] || {};
+            return res.json({
                 success: true,
-                message: 'Booking receipt printed successfully',
-                receiptNo: result.receiptNo
-            });
-        } else {
-            console.error(`❌ Printer service failed:`, result.message);
-            res.status(500).json({
-                success: false,
-                message: result.message || 'Failed to print receipt',
-                error: result.error
+                message: checkoutResult.results?.length > 1
+                    ? 'Receipt and order tickets sent to printer'
+                    : 'Receipt sent to printer',
+                receiptNo: primary.displayReceiptNo || receiptNo,
+                printType: primary.printType || 'regular',
+                jobId: primary.jobId || null,
+                jobStatus: primary.jobStatus || null,
+                jobFile: primary.jobFile || null,
+                duplicateSkipped: Boolean(primary.duplicateSkipped),
+                warnings: checkoutResult.warnings || [],
+                results: checkoutResult.results || [],
             });
         }
 
+        const result = await prepareAndQueuePrint({
+            receiptNo,
+            type,
+            bookingReference,
+            source: printSource,
+            requestedBy,
+            stationId,
+        });
+
+        logSystemEvent('POS_RECEIPT_PRINT', {
+            receipt_no: result.receiptNo,
+            transaction_id: result.transactionId,
+            print_type: result.printType,
+            booking_reference: result.bookingReference || null,
+            print_job_id: result.jobId,
+            job_status: result.jobStatus,
+            duplicate_skipped: Boolean(result.duplicateSkipped),
+            source: printSource,
+            status: result.duplicateSkipped ? 'duplicate_skipped' : 'queued',
+        }, 'info');
+
+        return res.json({
+            success: true,
+            message: result.duplicateSkipped
+                ? 'Print job already exists for this auto-print request'
+                : 'Receipt sent to printer',
+            receiptNo: result.displayReceiptNo,
+            printType: result.printType,
+            jobId: result.jobId,
+            jobStatus: result.jobStatus,
+            jobFile: result.jobFile || null,
+            duplicateSkipped: Boolean(result.duplicateSkipped),
+            retriedFailedJob: Boolean(result.retriedFailedJob),
+        });
     } catch (error) {
-        console.error('❌ Printer service error:', error);
-        res.status(500).json({
+        if (error instanceof PosReceiptPrintError) {
+            logSystemEvent('POS_RECEIPT_PRINT_REJECTED', {
+                receipt_no: String(req.params.receiptNo || '').trim(),
+                print_type: req.body?.type || null,
+                code: error.code,
+                reason: error.message,
+            }, 'warn');
+
+            return res.status(error.statusCode).json({
+                success: false,
+                message: error.message,
+                code: error.code,
+            });
+        }
+
+        logSystemEvent('POS_RECEIPT_PRINT_ERROR', {
+            receipt_no: String(req.params.receiptNo || '').trim(),
+            print_type: req.body?.type || null,
+            error: error.message,
+        }, 'error');
+
+        return res.status(500).json({
             success: false,
             message: 'Printer service error',
-            error: error.message
+            error: error.message,
         });
     }
 };
 
 /**
- * Handler: POST /api/pos/print/regular
- * 
- * Purpose: Print a regular POS receipt directly to USB thermal printer
- * Request Body: Receipt data (items, total, payment method)
- * Response: Print status
+ * @deprecated Use POST /api/pos/print/:receiptNo
+ */
+export const printBookingReceipt = async (req, res) => {
+    return res.status(410).json({
+        success: false,
+        message: DEPRECATED_PRINT_MESSAGE,
+        code: 'ENDPOINT_DEPRECATED',
+    });
+};
+
+/**
+ * @deprecated Use POST /api/pos/print/:receiptNo
  */
 export const printRegularReceipt = async (req, res) => {
-    try {
-        const { printRegularReceipt: printRegular } = await import('../services/printerService.js');
-        const receiptData = req.body;
+    return res.status(410).json({
+        success: false,
+        message: DEPRECATED_PRINT_MESSAGE,
+        code: 'ENDPOINT_DEPRECATED',
+    });
+};
 
-        // Validate required fields
-        if (!receiptData.receiptNo || !receiptData.items || !receiptData.total) {
+/**
+ * Handler: GET /api/pos/print-jobs/:jobId
+ */
+export const getPrintJobStatus = async (req, res) => {
+    try {
+        const jobId = Number(req.params.jobId);
+        if (!Number.isFinite(jobId) || jobId <= 0) {
             return res.status(400).json({
                 success: false,
-                message: 'Missing required receipt data'
+                message: 'Valid print job id is required',
             });
         }
 
-        // Send to printer
-        const result = await printRegular(receiptData);
-
-        if (result.success) {
-            res.json({
-                success: true,
-                message: 'Receipt printed successfully',
-                receiptNo: result.receiptNo
-            });
-        } else {
-            res.status(500).json({
+        const job = await getPrintJobById(jobId);
+        if (!job) {
+            return res.status(404).json({
                 success: false,
-                message: result.message || 'Failed to print receipt',
-                error: result.error
+                message: 'Print job not found',
+                code: 'JOB_NOT_FOUND',
             });
         }
 
+        return res.json({
+            success: true,
+            job,
+        });
     } catch (error) {
-        console.error('Printer service error:', error);
-        res.status(500).json({
+        logSystemEvent('POS_PRINT_JOB_STATUS_ERROR', {
+            job_id: req.params.jobId,
+            error: error.message,
+        }, 'error');
+
+        return res.status(500).json({
             success: false,
-            message: 'Printer service error',
-            error: error.message
+            message: 'Failed to load print job',
+            error: error.message,
+        });
+    }
+};
+
+/**
+ * Handler: POST /api/pos/print-jobs/:jobId/retry
+ */
+export const retryPrintJob = async (req, res) => {
+    try {
+        const jobId = Number(req.params.jobId);
+        if (!Number.isFinite(jobId) || jobId <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Valid print job id is required',
+            });
+        }
+
+        const requestedBy = Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
+        const result = await retryFailedPrintJob(jobId, requestedBy);
+
+        logSystemEvent('POS_PRINT_JOB_RETRY', {
+            original_job_id: jobId,
+            new_job_id: result.jobId,
+            receipt_no: result.receiptNo,
+            print_type: result.printType,
+            booking_reference: result.bookingReference || null,
+            status: result.jobStatus,
+        }, 'info');
+
+        return res.json({
+            success: true,
+            jobId: result.jobId,
+            jobStatus: result.jobStatus,
+            message: 'Print retry queued.',
+            receiptNo: result.displayReceiptNo,
+            printType: result.printType,
+            bookingReference: result.bookingReference || null,
+        });
+    } catch (error) {
+        if (error instanceof PosReceiptPrintError) {
+            return res.status(error.statusCode).json({
+                success: false,
+                message: error.message,
+                code: error.code,
+            });
+        }
+
+        logSystemEvent('POS_PRINT_JOB_RETRY_ERROR', {
+            job_id: req.params.jobId,
+            error: error.message,
+        }, 'error');
+
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to retry print job',
+            error: error.message,
+        });
+    }
+};
+
+/**
+ * Handler: GET /api/pos/print/:receiptNo/jobs
+ * List tracked print jobs for a receipt.
+ */
+export const getPrintJobsByReceipt = async (req, res) => {
+    try {
+        const receiptNo = normalizeReceiptNo(req.params.receiptNo);
+        if (!receiptNo) {
+            return res.status(400).json({
+                success: false,
+                message: 'Receipt number is required',
+            });
+        }
+
+        const jobs = await listPrintJobsByReceipt(receiptNo);
+        return res.json({
+            success: true,
+            receiptNo,
+            jobs,
+        });
+    } catch (error) {
+        logSystemEvent('POS_PRINT_JOBS_LIST_ERROR', {
+            receipt_no: String(req.params.receiptNo || '').trim(),
+            error: error.message,
+        }, 'error');
+
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to load print jobs',
+            error: error.message,
         });
     }
 };

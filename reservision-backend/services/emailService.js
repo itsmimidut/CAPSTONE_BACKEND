@@ -1,25 +1,113 @@
 import { Resend } from 'resend';
 import * as SibApiV3Sdk from '@getbrevo/brevo';
+import db from '../config/db.js';
 
 /**
  * ============================================================
- * EMAIL SERVICE - RESEND & BREVO INTEGRATION
+ * EMAIL SERVICE - BREVO (primary) & RESEND (fallback)
  * ============================================================
- * Handles all email sending functionality using Resend API & Brevo
- * - OTP verification emails (Resend)
- * - Booking confirmations (Resend)
- * - Booking approvals (Brevo)
- * - Payment receipts (Resend)
+ * Brevo is preferred when BREVO_API_KEY + BREVO_FROM_EMAIL are set.
+ * Resend is used only as fallback; its sandbox sender cannot reach arbitrary inboxes.
  */
 
-// Initialize Resend (lazy loading)
 let resend = null;
+let brevoApi = null;
 
 function getResendClient() {
   if (!resend && process.env.RESEND_API_KEY) {
     resend = new Resend(process.env.RESEND_API_KEY);
   }
   return resend;
+}
+
+const isBrevoConfigured = () => Boolean(process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL);
+
+function getBrevoApi() {
+  if (!brevoApi) {
+    brevoApi = new SibApiV3Sdk.TransactionalEmailsApi();
+    brevoApi.setApiKey(
+      SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey,
+      process.env.BREVO_API_KEY,
+    );
+  }
+  return brevoApi;
+}
+
+const getSender = () => ({
+  email: process.env.BREVO_FROM_EMAIL || process.env.RESEND_FROM_EMAIL || 'bookings@resend.dev',
+  name: process.env.BREVO_FROM_NAME || "Eduardo's Resort",
+});
+
+/**
+ * Unified transactional email sender.
+ */
+export async function sendTransactionalEmail({ to, subject, html, text = undefined }) {
+  if (!to) {
+    throw new Error('Recipient email is required');
+  }
+
+  const sender = getSender();
+
+  if (isBrevoConfigured()) {
+    const result = await getBrevoApi().sendTransacEmail({
+      sender: { email: sender.email, name: sender.name },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+      textContent: text,
+    });
+
+    const messageId = result?.body?.messageId || result?.messageId;
+    console.log(`✅ Email sent via Brevo to ${to} — ${subject} (${messageId || 'ok'})`);
+    return { provider: 'brevo', messageId };
+  }
+
+  const resendClient = getResendClient();
+  if (!resendClient) {
+    throw new Error(
+      'No email provider configured. Set BREVO_API_KEY + BREVO_FROM_EMAIL or RESEND_API_KEY in .env',
+    );
+  }
+
+  const result = await resendClient.emails.send({
+    from: `${sender.name} <${process.env.RESEND_FROM_EMAIL || 'bookings@resend.dev'}>`,
+    to,
+    subject,
+    html,
+    text,
+  });
+
+  if (result?.error) {
+    throw new Error(result.error.message || 'Resend email failed');
+  }
+
+  console.log(`✅ Email sent via Resend to ${to} — ${subject}`);
+  return { provider: 'resend', id: result?.data?.id };
+}
+
+/**
+ * Resolve the best customer email for a booking.
+ */
+export async function resolveCustomerEmailForBooking(bookingId) {
+  const [rows] = await db.query(
+    `SELECT
+      b.booking_id,
+      b.booking_reference,
+      b.check_in_date,
+      b.check_out_date,
+      b.total,
+      COALESCE(NULLIF(TRIM(u.email), ''), NULLIF(TRIM(c.email), ''), NULLIF(TRIM(b.email), '')) AS email,
+      COALESCE(u.first_name, c.first_name, 'Guest') AS first_name,
+      COALESCE(u.last_name, c.last_name, '') AS last_name
+     FROM bookings b
+     LEFT JOIN customers c ON c.customer_id = b.customer_id
+     LEFT JOIN \`user\` u ON u.user_id = c.user_id
+     WHERE b.booking_id = ?
+     LIMIT 1`,
+    [bookingId],
+  );
+
+  return rows[0] || null;
 }
 
 /**
@@ -29,12 +117,6 @@ function getResendClient() {
  * @param {string} firstName - User's first name
  */
 export async function sendOTPEmail(email, otpCode, firstName = 'Guest') {
-  const resendClient = getResendClient();
-
-  if (!resendClient) {
-    throw new Error('Resend API key not configured. Add RESEND_API_KEY to .env file');
-  }
-
   const htmlContent = `
 <!DOCTYPE html>
 <html>
@@ -112,15 +194,12 @@ export async function sendOTPEmail(email, otpCode, firstName = 'Guest') {
   `;
 
   try {
-    const result = await resendClient.emails.send({
-      from: "Eduardo's Resort <bookings@resend.dev>", // Change to your verified domain
+    return await sendTransactionalEmail({
       to: email,
       subject: `${otpCode} is your verification code`,
       html: htmlContent,
-      text: `Hi ${firstName}, Your verification code is: ${otpCode}. This code expires in 10 minutes. Never share this code with anyone.`
+      text: `Hi ${firstName}, Your verification code is: ${otpCode}. This code expires in 10 minutes. Never share this code with anyone.`,
     });
-
-    return result;
   } catch (error) {
     console.error('Error sending OTP email:', error);
     throw error;
@@ -132,13 +211,6 @@ export async function sendOTPEmail(email, otpCode, firstName = 'Guest') {
  * @param {Object} bookingData - Complete booking information
  */
 export async function sendBookingConfirmationEmail(bookingData) {
-  const useBrevo = Boolean(process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL);
-  const resendClient = getResendClient();
-
-  if (!useBrevo && !resendClient) {
-    throw new Error('No email service configured. Set RESEND_API_KEY or BREVO_API_KEY with BREVO_FROM_EMAIL');
-  }
-
   const {
     email,
     firstName = '',
@@ -267,35 +339,12 @@ export async function sendBookingConfirmationEmail(bookingData) {
   `;
 
   try {
-    if (useBrevo) {
-      console.log('📤 Sending booking confirmation via Brevo to:', email);
-      const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
-      apiInstance.setApiKey(SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey, process.env.BREVO_API_KEY);
-
-      const result = await apiInstance.sendTransacEmail({
-        sender: { email: process.env.BREVO_FROM_EMAIL, name: process.env.BREVO_FROM_NAME || "Eduardo's Resort" },
-        to: [{ email }],
-        subject: `Booking Confirmed - ${bookingReference}`,
-        htmlContent
-      });
-
-      console.log('✅ Booking confirmation sent via Brevo:', result.messageId || result.id || 'unknown');
-      return result;
-    }
-
-    if (!resendClient) {
-      throw new Error('No email service configured. Set RESEND_API_KEY or BREVO_API_KEY with BREVO_FROM_EMAIL');
-    }
-
-    console.log('📤 Sending booking confirmation via Resend to:', email);
-    const result = await resendClient.emails.send({
-      from: `Eduardo's Resort <${process.env.RESEND_FROM_EMAIL || 'bookings@resend.dev'}>`,
+    console.log('📤 Sending booking confirmation to:', email);
+    return await sendTransactionalEmail({
       to: email,
       subject: `Booking Confirmed - ${bookingReference}`,
-      html: htmlContent
+      html: htmlContent,
     });
-
-    return result;
   } catch (error) {
     console.error('Error sending booking confirmation email:', error);
     throw error;
@@ -308,12 +357,8 @@ export async function sendBookingConfirmationEmail(bookingData) {
  * @param {object} bookingData - Booking details
  */
 export async function sendBookingApprovalEmail(email, bookingData) {
-  const apiKey = process.env.BREVO_API_KEY;
-  const fromEmail = process.env.BREVO_FROM_EMAIL;
-  const displayName = process.env.BREVO_FROM_NAME || "Eduardo's Resort";
-
-  if (!apiKey || !fromEmail) {
-    console.warn('⚠️ BREVO_API_KEY or BREVO_FROM_EMAIL not configured. Skipping approval email.');
+  if (!email) {
+    console.warn('⚠️ Approval email skipped: no recipient email');
     return null;
   }
 
@@ -463,38 +508,15 @@ export async function sendBookingApprovalEmail(email, bookingData) {
   `;
 
   try {
-    console.log('📤 Attempting to send approval email via Brevo...');
-    console.log('   To:', email);
-    console.log('   Subject:', `✓ Booking Approved - Welcome to Eduardo's Resort! (${bookingReference})`);
-
-    const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
-    apiInstance.setApiKey(SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey, apiKey);
-
-    const result = await apiInstance.sendTransacEmail({
-      sender: { email: fromEmail, name: displayName },
-      to: [{ email }],
+    console.log('📤 Sending booking approval email to:', email);
+    return await sendTransactionalEmail({
+      to: email,
       subject: `✓ Booking Approved - Welcome to Eduardo's Resort! (${bookingReference})`,
-      htmlContent: htmlContent
+      html: htmlContent,
     });
-
-    console.log('✅ Approval email sent successfully via Brevo!');
-    console.log('   Message ID:', result.messageId);
-    console.log('   Recipient:', email);
-    return result;
   } catch (error) {
     const errorMsg = error?.response?.data?.message || error?.message || 'Unknown error';
-    console.error('❌ Error sending booking approval email via Brevo!');
-    console.error('   Error Type:', error.name);
-    console.error('   Error Message:', errorMsg);
-    console.error('   Full Error:', error);
-
-    // Check for IP whitelist issues
-    if (errorMsg.includes('unrecognised IP') || errorMsg.includes('IP')) {
-      console.error('   ⚠️ IP not whitelisted in Brevo - Email blocked');
-      console.warn('   💡 Solution: Add your server IP to Brevo whitelist at https://app.brevo.com/settings/keys/api');
-    }
-
-    // Don't throw - we don't want to fail the booking confirmation if email fails
+    console.error('❌ Error sending booking approval email:', errorMsg);
     return null;
   }
 }
@@ -505,12 +527,6 @@ export async function sendBookingApprovalEmail(email, bookingData) {
  * @param {string} qrCodeBase64 - Base64 encoded QR code image
  */
 export async function sendBookingConfirmationWithQR(bookingData, qrCodeBase64) {
-  const resendClient = getResendClient();
-
-  if (!resendClient) {
-    throw new Error('Resend API key not configured');
-  }
-
   const {
     email,
     firstName,
@@ -583,8 +599,9 @@ export async function sendBookingConfirmationWithQR(bookingData, qrCodeBase64) {
           <!-- Header -->
           <tr>
             <td style="padding: 24px 30px 40px; text-align: center;">
-              <h1 style="margin: 0 0 8px; color: #1a202c; font-size: 32px; font-weight: 700;">Booking Confirmed!</h1>
+              <h1 style="margin: 0 0 8px; color: #1a202c; font-size: 32px; font-weight: 700;">Payment Received!</h1>
               <p style="margin: 0; color: #10B981; font-size: 16px; font-weight: 600;">Reference: ${bookingReference}</p>
+              <p style="margin: 12px 0 0; color: #4a5568; font-size: 14px;">Your reservation is pending admin approval. You will receive another email once confirmed.</p>
             </td>
           </tr>
           
@@ -658,11 +675,10 @@ export async function sendBookingConfirmationWithQR(bookingData, qrCodeBase64) {
   `;
 
   try {
-    const result = await resendClient.emails.send({
-      from: "Eduardo's Resort <bookings@resend.dev>",
+    const result = await sendTransactionalEmail({
       to: email,
-      subject: `🎉 Booking Confirmed - ${bookingReference}`,
-      html: htmlContent
+      subject: `Payment Received - ${bookingReference}`,
+      html: htmlContent,
     });
 
     console.log(`✅ Booking confirmation email with QR sent to ${email}`);
@@ -673,9 +689,59 @@ export async function sendBookingConfirmationWithQR(bookingData, qrCodeBase64) {
   }
 }
 
+/**
+ * Send refund processed email (Sprint 4.5)
+ */
+export async function sendRefundProcessedEmail({
+  email,
+  firstName = 'Guest',
+  bookingReference,
+  refundAmount,
+  gatewayReference,
+}) {
+  if (!email) {
+    console.warn('Refund email skipped: no recipient email');
+    return null;
+  }
+
+  const htmlContent = `
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#f3f4f6; padding:24px;">
+  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;padding:32px;">
+    <h2 style="color:#0369a1;margin-top:0;">Your Refund Has Been Processed</h2>
+    <p>Hi ${firstName},</p>
+    <p>We have successfully processed your refund for Eduardo's Resort.</p>
+    <table style="width:100%;border-collapse:collapse;margin:20px 0;">
+      <tr><td style="padding:8px 0;color:#64748b;">Booking Reference</td><td style="padding:8px 0;"><strong>${bookingReference || 'N/A'}</strong></td></tr>
+      <tr><td style="padding:8px 0;color:#64748b;">Amount</td><td style="padding:8px 0;"><strong>₱${Number(refundAmount || 0).toLocaleString()}</strong></td></tr>
+      <tr><td style="padding:8px 0;color:#64748b;">Refund Reference</td><td style="padding:8px 0;"><strong>${gatewayReference || 'N/A'}</strong></td></tr>
+    </table>
+    <p style="color:#64748b;font-size:14px;">Funds may take a few business days to appear in your account depending on your payment provider.</p>
+  </div>
+</body>
+</html>`;
+
+  try {
+    const result = await sendTransactionalEmail({
+      to: email,
+      subject: 'Your Refund Has Been Processed',
+      html: htmlContent,
+    });
+    console.log(`✅ Refund processed email sent to ${email}`);
+    return result;
+  } catch (error) {
+    console.error('Refund processed email failed:', error.message);
+    return null;
+  }
+}
+
 export default {
+  sendTransactionalEmail,
+  resolveCustomerEmailForBooking,
   sendOTPEmail,
   sendBookingConfirmationEmail,
   sendBookingConfirmationWithQR,
-  sendBookingApprovalEmail
+  sendBookingApprovalEmail,
+  sendRefundProcessedEmail,
 };

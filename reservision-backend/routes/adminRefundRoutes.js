@@ -5,9 +5,10 @@ import {
     createRefund,
     approveRefund,
     rejectRefund,
-    markRefunded,
     exportRefundsCSV
 } from "../controllers/adminRefundController.js";
+import { handleValidationErrors } from "../middleware/validate.js";
+import { adminRefundApproveValidators } from "../middleware/validators/refundValidators.js";
 
 const router = express.Router();
 
@@ -17,8 +18,7 @@ router.get("/:id", getRefundById);
 
 router.post("/", createRefund);
 
-router.put("/:id/approve", approveRefund);
+router.put("/:id/approve", adminRefundApproveValidators, handleValidationErrors, approveRefund);
 router.put("/:id/reject", rejectRefund);
-router.put("/:id/mark-refunded", markRefunded);
 
 export default router;

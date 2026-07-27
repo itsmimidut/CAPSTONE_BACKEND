@@ -23,10 +23,27 @@
  */
 
 import db from "../config/db.js";
+import {
+  assertCustomerIdAccess, assertBookingAccess,
+  assertEmailAccess,
+  assertUserIdAccess,
+  canAccessBookingReference,
+} from "../middleware/ownership.js";
 import { sendBookingApprovalEmail } from "../services/emailService.js";
+import {
+  getBookingNotificationTarget,
+  notifyBookingCancelled,
+  notifyBookingConfirmed,
+} from "../services/customerNotificationService.js";
+import { emitReservationChangeForBooking } from "../services/customerReservationRealtimeService.js";
 import { getQRCodeByReference } from "../services/qrCodeService.js";
 import {
+  assertInventoryItemsBookable,
+  UNAVAILABLE_BOOKING_MESSAGE,
+} from "../services/inventoryBookabilityService.js";
+import {
   autoAssignRoom,
+  insertOccupiedDatesForBooking,
   validateBookingDates,
   generateBookingReference as generateRef
 } from "../services/roomAssignmentService.js";
@@ -97,6 +114,124 @@ const setCachedReservationResponse = (key, payload) => {
 const invalidateReservationCache = () => {
   // Invalidation: clear all reservation-related cache entries after any data mutation.
   reservationResponseCache.clear();
+};
+
+const formatDateOnly = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const match = value.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (match) return match[1];
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const parseInventoryImages = (images) => {
+  if (!images) return [];
+  if (Array.isArray(images)) return images.filter(Boolean);
+  if (typeof images === 'string') {
+    try {
+      const parsed = JSON.parse(images || '[]');
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+    } catch {
+      return images.trim() ? [images.trim()] : [];
+    }
+  }
+  return [];
+};
+
+const pickInventoryPrimaryImage = (images, primaryImageIndex = 0) => {
+  const list = parseInventoryImages(images);
+  if (!list.length) return '';
+  const index = Number.isInteger(Number(primaryImageIndex)) ? Number(primaryImageIndex) : 0;
+  return list[index] || list[0] || '';
+};
+
+const BOOKING_HISTORY_ITEMS_SQL = `
+  SELECT
+    bi.*,
+    ii.images AS inventory_images,
+    ii.primaryImageIndex AS inventory_primary_image_index,
+    ii.name AS inventory_name,
+    ii.category AS inventory_category,
+    ii.category_type AS inventory_category_type
+  FROM booking_items bi
+  LEFT JOIN inventory_items ii ON bi.inventory_item_id = ii.item_id
+  WHERE bi.booking_id = ?
+`;
+
+const mapBookingHistoryItem = (item = {}) => {
+  let parsedDescription = null;
+  if (item.item_description) {
+    try {
+      parsedDescription = typeof item.item_description === 'string'
+        ? JSON.parse(item.item_description)
+        : item.item_description;
+    } catch {
+      parsedDescription = null;
+    }
+  }
+
+  // Guest breakdown: prefer real columns, fall back to legacy JSON in item_description.
+  const legacyBreakdown = parsedDescription?.guestBreakdown || parsedDescription?.guest_breakdown || {};
+  const columnsHaveBreakdown = item.total_guests != null || item.adults != null;
+
+  const adults = Number((columnsHaveBreakdown ? item.adults : legacyBreakdown.adults) || 0);
+  const children = Number((columnsHaveBreakdown ? item.children : legacyBreakdown.children) || 0);
+  const seniors = Number((columnsHaveBreakdown ? item.seniors : legacyBreakdown.seniors) || 0);
+  const infants = Number((columnsHaveBreakdown ? item.infants : legacyBreakdown.infants) || 0);
+  const breakdownSum = adults + children + seniors + infants;
+
+  const totalGuests = Number(
+    (columnsHaveBreakdown ? item.total_guests : legacyBreakdown.totalGuests)
+    || item.guests
+    || breakdownSum
+    || 0
+  );
+
+  const providedFlag = item.guest_breakdown_provided != null
+    ? (Number(item.guest_breakdown_provided) === 1)
+    : breakdownSum > 0;
+
+  const breakdownType = item.guest_breakdown_type
+    || (providedFlag ? 'exact' : 'not_provided');
+
+  const inventoryImages = parseInventoryImages(item.inventory_images);
+  const primaryImageIndex = Number.isInteger(Number(item.inventory_primary_image_index))
+    ? Number(item.inventory_primary_image_index)
+    : 0;
+  const imageUrl = pickInventoryPrimaryImage(inventoryImages, primaryImageIndex);
+
+  return {
+    item_name: item.item_name || item.inventory_name || null,
+    inventory_item_id: item.inventory_item_id != null ? Number(item.inventory_item_id) : null,
+    quantity: item.quantity,
+    item_type: item.item_type || item.inventory_category_type || item.inventory_category || null,
+    unit_price: item.unit_price,
+    total_price: item.total_price,
+    guests: item.guests != null ? Number(item.guests) : null,
+    nights: item.nights != null ? Number(item.nights) : null,
+    total_guests: totalGuests,
+    adults,
+    children,
+    seniors,
+    infants,
+    guest_breakdown_provided: providedFlag,
+    guest_breakdown_type: breakdownType,
+    booking_date: formatDateOnly(item.booking_date) || parsedDescription?.booking_date || null,
+    start_time: item.start_time || parsedDescription?.start_time || null,
+    end_time: item.end_time || parsedDescription?.end_time || null,
+    event_purpose: item.event_purpose || parsedDescription?.purpose || parsedDescription?.event_type || null,
+    notes: parsedDescription?.notes || null,
+    images: inventoryImages,
+    primaryImageIndex,
+    image_url: imageUrl || null,
+    imageUrl: imageUrl || null,
+  };
 };
 
 /**
@@ -178,6 +313,14 @@ export const getBooking = async (req, res) => {
   try {
     const { id } = req.params;
 
+    const hasAccess = await assertBookingAccess(
+      req,
+      res,
+      id
+    );
+
+    if (!hasAccess) return;
+
     // Get booking details with customer info
     const [bookings] = await db.query(
       `SELECT 
@@ -235,36 +378,61 @@ export const getBookingByReference = async (req, res) => {
   try {
     const { reference } = req.params;
 
-    // Get booking details
-    const [bookings] = await db.query(
-      `SELECT * FROM bookings WHERE booking_reference = ?`,
+    // Get booking id first
+    const [rows] = await db.query(
+      `SELECT booking_id
+       FROM bookings
+       WHERE booking_reference = ?
+       LIMIT 1`,
       [reference]
     );
 
-    if (bookings.length === 0) {
+    if (!rows.length) {
       return res.status(404).json({
         success: false,
         message: 'Booking not found'
       });
     }
 
+    const bookingId = rows[0].booking_id;
+
+    // Ownership validation
+    const hasAccess = await assertBookingAccess(
+      req,
+      res,
+      bookingId
+    );
+
+    if (!hasAccess) return;
+
+    // Only load full booking after access check
+    const [bookings] = await db.query(
+      `SELECT *
+       FROM bookings
+       WHERE booking_reference = ?`,
+      [reference]
+    );
+
     const booking = bookings[0];
 
-    // Get booking items
     const [items] = await db.query(
-      `SELECT * FROM booking_items WHERE booking_id = ?`,
+      `SELECT *
+       FROM booking_items
+       WHERE booking_id = ?`,
       [booking.booking_id]
     );
 
     booking.items = items;
 
-    res.json({
+    return res.json({
       success: true,
       data: booking
     });
+
   } catch (error) {
     console.error('Error fetching booking by reference:', error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
       message: 'Failed to fetch booking',
       error: error.message
@@ -300,6 +468,20 @@ export const createBooking = async (req, res) => {
     // Validate required fields
     if (!customer || !contact || !items || items.length === 0) {
       throw new Error('Missing required fields');
+    }
+
+    // Never trust the client-provided item status. Lock and validate every
+    // referenced inventory row on this same transaction before inserts.
+    const inventoryItemIds = items
+      .map((bookingItem) => bookingItem?.item?.item_id)
+      .filter(Boolean)
+    const bookability = await assertInventoryItemsBookable(connection, inventoryItemIds)
+    if (!bookability.ok) {
+      await connection.rollback()
+      return res.status(409).json({
+        success: false,
+        message: bookability.message || UNAVAILABLE_BOOKING_MESSAGE,
+      })
     }
 
     // Generate booking reference
@@ -607,6 +789,35 @@ export const updateBooking = async (req, res) => {
       console.log('- New status:', updates.booking_status);
     }
 
+    if (updates.booking_status && updates.booking_status !== oldBooking.booking_status) {
+      try {
+        const target = await getBookingNotificationTarget(id);
+        if (target?.user_id) {
+          if (updates.booking_status === 'Confirmed') {
+            await notifyBookingConfirmed({
+              userId: target.user_id,
+              customerId: target.customer_id,
+              bookingReference: target.booking_reference,
+            });
+          } else if (updates.booking_status === 'Cancelled') {
+            await notifyBookingCancelled({
+              userId: target.user_id,
+              customerId: target.customer_id,
+              bookingReference: target.booking_reference,
+            });
+          }
+        }
+      } catch (notifyError) {
+        console.warn('Booking status notification failed:', notifyError.message);
+      }
+
+      try {
+        await emitReservationChangeForBooking(id, { newStatus: updates.booking_status });
+      } catch (realtimeError) {
+        console.warn('Reservation realtime emit failed:', realtimeError.message);
+      }
+    }
+
     // Invalidate reservation cache after confirm/cancel/update mutations.
     invalidateReservationCache();
 
@@ -674,6 +885,25 @@ export const deleteBooking = async (req, res) => {
 
     // Invalidate reservation cache after delete/cancel mutation.
     invalidateReservationCache();
+
+    try {
+      const target = await getBookingNotificationTarget(id);
+      if (target?.user_id) {
+        await notifyBookingCancelled({
+          userId: target.user_id,
+          customerId: target.customer_id,
+          bookingReference: target.booking_reference,
+        });
+      }
+    } catch (notifyError) {
+      console.warn('Booking cancellation notification failed:', notifyError.message);
+    }
+
+    try {
+      await emitReservationChangeForBooking(id, { newStatus: 'Cancelled' });
+    } catch (realtimeError) {
+      console.warn('Reservation cancellation realtime emit failed:', realtimeError.message);
+    }
 
     res.json({
       success: true,
@@ -949,6 +1179,10 @@ export const getCustomerBookingHistory = async (req, res) => {
     const { customerId } = req.params;
     const { status, limit = 20, page = 1 } = req.query;
 
+    if (!(await assertCustomerIdAccess(req, res, customerId))) {
+      return;
+    }
+
     if (!customerId) {
       return res.status(400).json({
         success: false,
@@ -989,7 +1223,12 @@ export const getCustomerBookingHistory = async (req, res) => {
         MAX(p.paid_at) as paid_at,
         COALESCE(MAX(r.refund_status), COALESCE(b.refund_status, '')) AS refund_status,
         COALESCE(MAX(r.refund_amount), b.refund_amount, 0) AS refund_amount,
-        MAX(r.refunded_at) AS refunded_at
+        MAX(r.refunded_at) AS refunded_at,
+        MAX(r.refund_id) AS refund_id,
+        MAX(r.refund_reason) AS refund_reason,
+        MAX(r.refund_note) AS refund_note,
+        MAX(r.refund_method) AS refund_method,
+        MAX(r.requested_at) AS refund_requested_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
       LEFT JOIN refunds r ON r.refund_id = (
@@ -1020,7 +1259,7 @@ export const getCustomerBookingHistory = async (req, res) => {
     const bookingsWithDetails = await Promise.all(
       bookings.map(async (booking) => {
         const [items] = await db.query(
-          'SELECT * FROM booking_items WHERE booking_id = ?',
+          BOOKING_HISTORY_ITEMS_SQL,
           [booking.booking_id]
         );
 
@@ -1029,13 +1268,9 @@ export const getCustomerBookingHistory = async (req, res) => {
 
         return {
           ...booking,
-          items: items.map(item => ({
-            item_name: item.item_name,
-            quantity: item.quantity,
-            item_type: item.item_type,
-            unit_price: item.unit_price,
-            total_price: item.total_price
-          })),
+          check_in_date: formatDateOnly(booking.check_in_date),
+          check_out_date: formatDateOnly(booking.check_out_date),
+          items: items.map(mapBookingHistoryItem),
           qrCode: {
             reference: qrReference,
             url: `/api/qr/${booking.booking_reference}` // Endpoint to get QR
@@ -1100,6 +1335,10 @@ export const getBookingHistoryByUserId = async (req, res) => {
     const { userId } = req.params;
     const { status, limit = 50, page = 1 } = req.query;
 
+    if (!assertUserIdAccess(req, res, userId)) {
+      return;
+    }
+
     if (!userId) {
       return res.status(400).json({ success: false, error: 'User ID is required' });
     }
@@ -1142,7 +1381,12 @@ export const getBookingHistoryByUserId = async (req, res) => {
         MAX(p.paid_at) as paid_at,
         COALESCE(MAX(r.refund_status), COALESCE(b.refund_status, '')) AS refund_status,
         COALESCE(MAX(r.refund_amount), b.refund_amount, 0) AS refund_amount,
-        MAX(r.refunded_at) AS refunded_at
+        MAX(r.refunded_at) AS refunded_at,
+        MAX(r.refund_id) AS refund_id,
+        MAX(r.refund_reason) AS refund_reason,
+        MAX(r.refund_note) AS refund_note,
+        MAX(r.refund_method) AS refund_method,
+        MAX(r.requested_at) AS refund_requested_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
         LEFT JOIN refunds r ON r.refund_id = (
@@ -1169,18 +1413,14 @@ export const getBookingHistoryByUserId = async (req, res) => {
     const bookingsWithDetails = await Promise.all(
       bookings.map(async (booking) => {
         const [items] = await db.query(
-          'SELECT * FROM booking_items WHERE booking_id = ?',
+          BOOKING_HISTORY_ITEMS_SQL,
           [booking.booking_id]
         );
         return {
           ...booking,
-          items: items.map(item => ({
-            item_name: item.item_name,
-            quantity: item.quantity,
-            item_type: item.item_type,
-            unit_price: item.unit_price,
-            total_price: item.total_price
-          })),
+          check_in_date: formatDateOnly(booking.check_in_date),
+          check_out_date: formatDateOnly(booking.check_out_date),
+          items: items.map(mapBookingHistoryItem),
           qrCode: { reference: booking.booking_reference }
         };
       })
@@ -1233,6 +1473,10 @@ export const getBookingHistoryByEmail = async (req, res) => {
   try {
     const { email } = req.params;
     const { status, limit = 20, page = 1 } = req.query;
+
+    if (!assertEmailAccess(req, res, email)) {
+      return;
+    }
 
     if (!email) {
       return res.status(400).json({
@@ -1293,9 +1537,20 @@ export const getBookingHistoryByEmail = async (req, res) => {
         MAX(p.payment_reference) as payment_reference,
         MAX(p.payment_method) as payment_method,
         MAX(p.status) as payment_status,
-        MAX(p.paid_at) as paid_at
+        MAX(p.paid_at) as paid_at,
+        COALESCE(MAX(r.refund_status), COALESCE(b.refund_status, '')) AS refund_status,
+        COALESCE(MAX(r.refund_amount), b.refund_amount, 0) AS refund_amount,
+        MAX(r.refunded_at) AS refunded_at,
+        MAX(r.refund_id) AS refund_id,
+        MAX(r.refund_reason) AS refund_reason,
+        MAX(r.refund_note) AS refund_note,
+        MAX(r.refund_method) AS refund_method,
+        MAX(r.requested_at) AS refund_requested_at
       FROM bookings b
       LEFT JOIN payments p ON b.booking_id = p.booking_id
+      LEFT JOIN refunds r ON r.refund_id = (
+        SELECT MAX(refund_id) FROM refunds WHERE booking_id = b.booking_id
+      )
       WHERE b.customer_id IN (${placeholders})
       GROUP BY b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.adults, b.children, b.total, b.booking_status, b.created_at
     `;
@@ -1320,19 +1575,15 @@ export const getBookingHistoryByEmail = async (req, res) => {
     const bookingsWithDetails = await Promise.all(
       bookings.map(async (booking) => {
         const [items] = await db.query(
-          'SELECT * FROM booking_items WHERE booking_id = ?',
+          BOOKING_HISTORY_ITEMS_SQL,
           [booking.booking_id]
         );
 
         return {
           ...booking,
-          items: items.map(item => ({
-            item_name: item.item_name,
-            quantity: item.quantity,
-            item_type: item.item_type,
-            unit_price: item.unit_price,
-            total_price: item.total_price
-          })),
+          check_in_date: formatDateOnly(booking.check_in_date),
+          check_out_date: formatDateOnly(booking.check_out_date),
+          items: items.map(mapBookingHistoryItem),
           qrCode: {
             reference: booking.booking_reference,
             url: `/api/qr/${booking.booking_reference}`
@@ -1403,7 +1654,14 @@ export const getBookingQRCode = async (req, res) => {
       });
     }
 
-    // Get QR code
+    const allowed = await canAccessBookingReference(req, bookingReference);
+    if (!allowed) {
+      return res.status(404).json({
+        success: false,
+        error: 'QR code not found for this booking'
+      });
+    }
+
     const qrCodeBase64 = await getQRCodeByReference(bookingReference);
 
     if (!qrCodeBase64) {
@@ -1730,6 +1988,12 @@ export const processCheckIn = async (req, res) => {
       });
     }
 
+    try {
+      await emitReservationChangeForBooking(bookingId, { newStatus: 'Checked-In' });
+    } catch (realtimeError) {
+      console.warn('Reservation check-in realtime emit failed:', realtimeError.message);
+    }
+
     res.json({
       success: true,
       message: 'Guest checked in successfully',
@@ -1805,6 +2069,12 @@ export const processCheckOut = async (req, res) => {
         success: false,
         error: 'Failed to update booking status'
       });
+    }
+
+    try {
+      await emitReservationChangeForBooking(bookingId, { newStatus: 'Checked-Out' });
+    } catch (realtimeError) {
+      console.warn('Reservation check-out realtime emit failed:', realtimeError.message);
     }
 
     res.json({
@@ -1961,6 +2231,22 @@ export const createBookingWithAutoAssign = async (req, res) => {
         });
       }
 
+      // Re-validate the assigned unit on this same transaction. autoAssignRoom
+      // selects status='Available' and preserves it (occupancy is date-based via
+      // occupied_dates). An explicit lock/check prevents races with other writers.
+      // a race if status changes between SELECT FOR UPDATE and insert.
+      const assignedBookability = await assertInventoryItemsBookable(
+        connection,
+        [assignmentResult.item_id]
+      )
+      if (!assignedBookability.ok) {
+        await connection.rollback()
+        return res.status(409).json({
+          success: false,
+          message: assignedBookability.message || UNAVAILABLE_BOOKING_MESSAGE,
+        })
+      }
+
       // Step 2: Generate booking reference
       const bookingRef = await generateRef();
 
@@ -2014,13 +2300,12 @@ export const createBookingWithAutoAssign = async (req, res) => {
         ]
       );
 
-      // Step 5: Update occupied_dates with booking_id
-      await connection.query(
-        `UPDATE occupied_dates 
-         SET booking_id = ? 
-         WHERE inventory_item_id = ? AND booking_id IS NULL`,
-        [bookingId, assignmentResult.item_id]
-      );
+      // Step 5: Persist date occupancy with booking_id (required by live FK)
+      await insertOccupiedDatesForBooking(connection, {
+        inventoryItemId: assignmentResult.item_id,
+        bookingId,
+        dates: assignmentResult.occupied_dates || [],
+      });
 
       // Commit transaction
       await connection.commit();
@@ -2122,6 +2407,10 @@ export const createBookingWithAutoAssign = async (req, res) => {
 export const getCustomerActiveStay = async (req, res) => {
   try {
     const { userId } = req.params;
+
+    if (!assertUserIdAccess(req, res, userId)) {
+      return;
+    }
 
     if (!userId) {
       return res.status(400).json({
@@ -2236,6 +2525,10 @@ export const getCustomerActiveStay = async (req, res) => {
 export const getCustomerCurrentRoom = async (req, res) => {
   try {
     const { userId } = req.params;
+
+    if (!assertUserIdAccess(req, res, userId)) {
+      return;
+    }
 
     if (!userId) {
       return res.status(400).json({

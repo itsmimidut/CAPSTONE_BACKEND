@@ -1,11 +1,18 @@
 import db from '../config/db.js';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
+import {
+  clearAuthCookies,
+  issueAuthSession,
+  revokeAllUserRefreshTokens,
+} from '../utils/tokenService.js';
+import { assertEmailAccess, assertUserIdAccess } from '../middleware/ownership.js';
+import { syncSwimmingCoachFromUser } from '../services/syncSwimmingCoachFromUser.js';
 import fetch from 'node-fetch';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import { verifySignupVerificationToken } from '../utils/signupVerification.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,30 +40,6 @@ export const profileImageUpload = multer({
   }
 });
 
-/**
- * Returns the configured JWT secret.
- * Throws immediately if the env var is missing or still set to a known
- * insecure placeholder — this prevents accidentally signing tokens with a
- * public, guessable value in production.
- */
-const getJwtSecret = () => {
-  const secret = process.env.JWT_SECRET;
-  const INSECURE_PLACEHOLDERS = [
-    'your-secret-key',
-    'your-jwt-secret-here',
-    'change-this',
-    'changeme',
-    'secret',
-  ];
-  if (!secret || INSECURE_PLACEHOLDERS.some(p => secret.toLowerCase().includes(p))) {
-    throw new Error(
-      'JWT_SECRET is not configured or is using an insecure placeholder. ' +
-      'Set a strong random value in your .env file.'
-    );
-  }
-  return secret;
-};
-
 const AUTH_MIGRATION_FILE = 'ADD_AUTH_IMPROVEMENTS.sql';
 
 const isMissingAuthSchemaColumn = (error) => {
@@ -78,7 +61,7 @@ const isMissingAuthSchemaColumn = (error) => {
  */
 export const customerSignup = async (req, res) => {
   try {
-    const { firstName, lastName, email, password, contactNumber } = req.body;
+    const { firstName, lastName, email, password, contactNumber, emailVerificationToken, termsAccepted } = req.body;
     // Normalize email: trim whitespace and force lowercase so lookups are consistent
     const normalizedEmail = (email || '').trim().toLowerCase();
     const normalizedPhone = (contactNumber || '').trim();
@@ -100,11 +83,19 @@ export const customerSignup = async (req, res) => {
       });
     }
 
-    // Validate password strength (min 6 characters)
-    if (password.length < 6) {
+    if (termsAccepted !== true) {
+      return res.status(400).json({ success: false, error: 'Terms and Privacy consent is required' });
+    }
+
+    if (!verifySignupVerificationToken(emailVerificationToken, normalizedEmail)) {
+      return res.status(403).json({ success: false, error: 'Email verification is missing or expired' });
+    }
+
+    // Keep server rules aligned with the signup UI.
+    if (password.length < 8 || !/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/\d/.test(password)) {
       return res.status(400).json({
         success: false,
-        error: 'Password must be at least 6 characters long'
+        error: 'Password must be at least 8 characters and include uppercase, lowercase, and a number'
       });
     }
 
@@ -119,6 +110,16 @@ export const customerSignup = async (req, res) => {
         success: false,
         error: 'Email already registered'
       });
+    }
+
+    if (normalizedPhone) {
+      const [existingPhones] = await db.query(
+        'SELECT user_id FROM user WHERE phone = ? LIMIT 1',
+        [normalizedPhone]
+      );
+      if (existingPhones.length > 0) {
+        return res.status(409).json({ success: false, error: 'Contact number already registered' });
+      }
     }
 
     // Hash password
@@ -148,24 +149,18 @@ export const customerSignup = async (req, res) => {
       await connection.commit();
       connection.release();
 
-      // Generate JWT token — getJwtSecret() throws if JWT_SECRET is misconfigured
-      const token = jwt.sign(
-        {
-          id: userId,
-          email: normalizedEmail,
-          role: 'customer',
-          name: `${firstName} ${lastName}`
-        },
-        getJwtSecret(),
-        { expiresIn: '7d' }
-      );
+      await issueAuthSession(res, {
+        id: userId,
+        email: normalizedEmail,
+        role: 'customer',
+        name: `${firstName} ${lastName}`,
+      }, req);
 
       // Log signup success
       console.log(`✅ Customer signup successful: ${normalizedEmail} (User ID: ${userId})`);
 
       res.status(201).json({
         success: true,
-        token,
         customer: {
           id: userId,
           firstName,
@@ -204,7 +199,7 @@ export const customerSignup = async (req, res) => {
  */
 export const customerLogin = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, rememberMe = false } = req.body;
     // Normalize email so it matches the stored (lowercase) value
     const normalizedEmail = (email || '').trim().toLowerCase();
 
@@ -218,9 +213,10 @@ export const customerLogin = async (req, res) => {
 
     // Find user by email (all roles can login through this endpoint)
     const [users] = await db.query(
-      `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone, u.password, u.role
+      `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone, u.password, u.role,
+              u.created_at
          FROM user u
-         WHERE u.email = ? AND u.role IN ('customer', 'admin', 'restaurantstaff', 'receptionist', 'swimming_instructor')
+         WHERE LOWER(TRIM(u.email)) = ? AND u.role IN ('customer', 'admin', 'restaurantstaff', 'receptionist', 'swimming_instructor')
          LIMIT 1`,
       [normalizedEmail]
     );
@@ -234,6 +230,22 @@ export const customerLogin = async (req, res) => {
 
     const customer = users[0];
 
+    if (!customer.password || customer.password === 'GUEST_NO_PASSWORD') {
+      return res.status(401).json({
+        success: false,
+        error: 'This account was created during a guest booking without a password. Use Forgot Password to set one.',
+        code: 'GUEST_ACCOUNT'
+      });
+    }
+
+    if (!String(customer.password).startsWith('$2')) {
+      return res.status(401).json({
+        success: false,
+        error: 'Your account needs a password reset. Use Forgot Password to continue.',
+        code: 'PASSWORD_RESET_REQUIRED'
+      });
+    }
+
     // Verify password
     const isPasswordValid = await bcrypt.compare(password, customer.password);
 
@@ -244,18 +256,6 @@ export const customerLogin = async (req, res) => {
       });
     }
 
-    // Generate JWT token — getJwtSecret() throws if JWT_SECRET is misconfigured
-    const token = jwt.sign(
-      {
-        id: customer.user_id,
-        email: customer.email,
-        role: customer.role,
-        name: `${customer.first_name} ${customer.last_name}`
-      },
-      getJwtSecret(),
-      { expiresIn: '7d' }
-    );
-
     // Update last_login_at — DO NOT update created_at (that would destroy the
     // account creation timestamp). The last_login_at column is added via
     // ADD_AUTH_IMPROVEMENTS.sql migration.
@@ -264,19 +264,33 @@ export const customerLogin = async (req, res) => {
       [customer.user_id]
     );
 
+    await issueAuthSession(res, {
+      id: customer.user_id,
+      email: customer.email,
+      role: customer.role,
+      name: `${customer.first_name} ${customer.last_name}`,
+    }, req, { rememberMe: Boolean(rememberMe) });
+
+    const [customerMapRows] = await db.query(
+      'SELECT customer_id FROM customers WHERE user_id = ? LIMIT 1',
+      [customer.user_id],
+    );
+
     // Log successful login
     console.log(`✅ Customer login successful: ${normalizedEmail} (ID: ${customer.user_id})`);
 
     res.json({
       success: true,
-      token,
       customer: {
         id: customer.user_id,
+        user_id: customer.user_id,
+        customerId: customerMapRows[0]?.customer_id ?? null,
         firstName: customer.first_name,
         lastName: customer.last_name,
         email: customer.email,
         phone: customer.phone,
         role: customer.role,
+        createdAt: customer.created_at,
         coach_id: customer.coach_id || null
       },
       message: 'Login successful'
@@ -474,25 +488,26 @@ export const customerGoogleLogin = async (req, res) => {
       }
     }
 
-    // Sign the JWT — getJwtSecret() throws if JWT_SECRET is misconfigured
-    const token = jwt.sign(
-      {
-        id: userRecord.user_id,
-        email: userRecord.email,
-        role: userRecord.role,
-        name: `${userRecord.first_name} ${userRecord.last_name}`
-      },
-      getJwtSecret(),
-      { expiresIn: '7d' }
+    await issueAuthSession(res, {
+      id: userRecord.user_id,
+      email: userRecord.email,
+      role: userRecord.role,
+      name: `${userRecord.first_name} ${userRecord.last_name}`,
+    }, req);
+
+    const [googleCustomerRows] = await db.query(
+      'SELECT customer_id FROM customers WHERE user_id = ? LIMIT 1',
+      [userRecord.user_id],
     );
 
     console.log(`✅ Google login successful: ${userRecord.email} (ID: ${userRecord.user_id})`);
 
     res.json({
       success: true,
-      token,
       customer: {
         id: userRecord.user_id,
+        user_id: userRecord.user_id,
+        customerId: googleCustomerRows[0]?.customer_id ?? null,
         firstName: userRecord.first_name,
         lastName: userRecord.last_name,
         email: userRecord.email,
@@ -520,9 +535,23 @@ export const customerGoogleLogin = async (req, res) => {
  * Check if email exists in user table (for customers)
  * GET /api/customers/check-email/:email
  */
+export const checkContactExists = async (req, res) => {
+  try {
+    const contactNumber = decodeURIComponent(req.params.contactNumber || '').replace(/\D/g, '');
+    if (!/^09\d{9}$/.test(contactNumber)) {
+      return res.status(400).json({ success: false, error: 'Valid contact number is required' });
+    }
+    const [rows] = await db.query('SELECT user_id FROM user WHERE phone = ? LIMIT 1', [contactNumber]);
+    return res.json({ success: true, exists: rows.length > 0 });
+  } catch (error) {
+    console.error('Check contact error:', error);
+    return res.status(500).json({ success: false, error: 'Unable to check contact number' });
+  }
+};
+
 export const checkEmailExists = async (req, res) => {
   try {
-    const { email } = req.params;
+    const email = decodeURIComponent(req.params.email || '').trim().toLowerCase();
 
     if (!email) {
       return res.status(400).json({
@@ -531,11 +560,10 @@ export const checkEmailExists = async (req, res) => {
       });
     }
 
-    // Check if email exists (get from user table)
     const [users] = await db.query(
       `SELECT u.user_id, u.first_name, u.last_name, u.email
        FROM user u
-       WHERE u.email = ?
+       WHERE LOWER(TRIM(u.email)) = ?
        LIMIT 1`,
       [email]
     );
@@ -568,6 +596,10 @@ export const getCustomerProfile = async (req, res) => {
   try {
     const { email } = req.params;
 
+    if (!assertEmailAccess(req, res, email)) {
+      return;
+    }
+
     if (!email) {
       return res.status(400).json({
         success: false,
@@ -575,11 +607,15 @@ export const getCustomerProfile = async (req, res) => {
       });
     }
 
-    // Get customer profile from user table (basic info)
+    // Get customer profile from user table (basic + extended fields)
     const [users] = await db.query(
-      `SELECT user_id, first_name, last_name, email, phone
-       FROM user
-       WHERE email = ?
+      `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone,
+              u.address, u.city, u.country, u.postal_code, u.profile_image,
+              u.created_at AS user_created_at,
+              c.created_at AS customer_created_at
+       FROM user u
+       LEFT JOIN customers c ON c.user_id = u.user_id
+       WHERE u.email = ?
        LIMIT 1`,
       [email]
     );
@@ -592,35 +628,7 @@ export const getCustomerProfile = async (req, res) => {
     }
 
     const user = users[0];
-    console.log('👤 User found:', user.user_id, user.first_name, user.last_name);
-
-    // Try to get extended profile from customers table
-    let extendedProfile = {};
-    try {
-      const [customers] = await db.query(
-        `SELECT address, city, country, postal_code, profile_image
-         FROM user
-         WHERE user_id = ?
-         LIMIT 1`,
-        [user.user_id]
-      );
-
-      console.log('🔍 Customers query result:', customers.length, 'records found');
-      if (customers.length > 0) {
-        console.log('✅ Extended profile found:', customers[0]);
-        extendedProfile = {
-          address: customers[0].address,
-          city: customers[0].city,
-          country: customers[0].country,
-          postalCode: customers[0].postal_code,
-          profileImage: customers[0].profile_image
-        };
-      } else {
-        console.log('⚠️  No customer record found for user_id:', user.user_id);
-      }
-    } catch (e) {
-      console.warn('Could not fetch extended profile from customers table:', e.message);
-    }
+    const createdAt = user.customer_created_at || user.user_created_at || null;
 
     res.json({
       success: true,
@@ -630,7 +638,12 @@ export const getCustomerProfile = async (req, res) => {
         lastName: user.last_name,
         email: user.email,
         phone: user.phone,
-        ...extendedProfile
+        address: user.address,
+        city: user.city,
+        country: user.country,
+        postalCode: user.postal_code,
+        profileImage: user.profile_image,
+        createdAt,
       }
     });
   } catch (error) {
@@ -646,6 +659,10 @@ export const getCustomerProfileById = async (req, res) => {
   try {
     const { id } = req.params;
 
+    if (!assertUserIdAccess(req, res, id)) {
+      return;
+    }
+
     if (!id) {
       return res.status(400).json({
         success: false,
@@ -653,12 +670,14 @@ export const getCustomerProfileById = async (req, res) => {
       });
     }
 
-    // Get customer profile by ID directly from user table
     const [users] = await db.query(
-      `SELECT user_id, first_name, last_name, email, phone,
-              address, city, country, postal_code, profile_image
-       FROM user
-       WHERE user_id = ?
+      `SELECT u.user_id, u.first_name, u.last_name, u.email, u.phone,
+              u.address, u.city, u.country, u.postal_code, u.profile_image,
+              u.created_at AS user_created_at,
+              c.created_at AS customer_created_at
+       FROM user u
+       LEFT JOIN customers c ON c.user_id = u.user_id
+       WHERE u.user_id = ?
        LIMIT 1`,
       [id]
     );
@@ -671,6 +690,7 @@ export const getCustomerProfileById = async (req, res) => {
     }
 
     const customer = users[0];
+    const createdAt = customer.customer_created_at || customer.user_created_at || null;
 
     res.json({
       success: true,
@@ -684,7 +704,8 @@ export const getCustomerProfileById = async (req, res) => {
         city: customer.city,
         country: customer.country,
         postalCode: customer.postal_code,
-        profileImage: customer.profile_image
+        profileImage: customer.profile_image,
+        createdAt,
       }
     });
   } catch (error) {
@@ -703,6 +724,10 @@ export const getCustomerProfileById = async (req, res) => {
 export const updateCustomerProfile = async (req, res) => {
   try {
     const { email } = req.params;
+
+    if (!assertEmailAccess(req, res, email)) {
+      return;
+    }
 
     if (!email) {
       return res.status(400).json({
@@ -740,9 +765,19 @@ export const updateCustomerProfile = async (req, res) => {
       profileImage
     } = req.body || {};
 
+    const bodyProfileImage = profileImage;
     const uploadedProfileImage = req.file
       ? `/uploads/profiles/${req.file.filename}`
       : null;
+
+    let resolvedProfileImage = user.profile_image ?? null;
+    if (uploadedProfileImage) {
+      resolvedProfileImage = uploadedProfileImage;
+    } else if (bodyProfileImage === '' || bodyProfileImage === 'null') {
+      resolvedProfileImage = null;
+    } else if (bodyProfileImage) {
+      resolvedProfileImage = bodyProfileImage;
+    }
 
     const updated = {
       firstName: firstName ?? user.first_name,
@@ -752,7 +787,7 @@ export const updateCustomerProfile = async (req, res) => {
       city: city ?? null,
       country: country ?? 'Philippines',
       postalCode: postalCode ?? null,
-      profileImage: uploadedProfileImage ?? profileImage ?? user.profile_image ?? null
+      profileImage: resolvedProfileImage,
     };
 
     // Update user table (authentication + basic profile fields)
@@ -771,6 +806,13 @@ export const updateCustomerProfile = async (req, res) => {
         user.user_id
       ]
     );
+
+    await syncSwimmingCoachFromUser(user.user_id, null, {
+      user_id: user.user_id,
+      first_name: updated.firstName,
+      last_name: updated.lastName,
+      phone: updated.phone
+    });
 
     // Update or insert customer profile (address, city, country, postal_code)
     await db.query(
@@ -827,6 +869,10 @@ export const getCustomerIdByUserId = async (req, res) => {
   try {
     const { userId } = req.params;
 
+    if (!assertUserIdAccess(req, res, userId)) {
+      return;
+    }
+
     if (!userId) {
       return res.status(400).json({
         success: false,
@@ -876,13 +922,13 @@ export const resetPassword = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Email and new password are required' });
     }
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ success: false, error: 'Password must be at least 6 characters long' });
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters long' });
     }
 
     // Check user exists
     const [users] = await db.query(
-      'SELECT user_id FROM user WHERE email = ? LIMIT 1',
+      'SELECT user_id, email FROM user WHERE LOWER(TRIM(email)) = ? LIMIT 1',
       [normalizedEmail]
     );
 
@@ -892,10 +938,15 @@ export const resetPassword = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
+    const userId = users[0].user_id;
+
     await db.query(
-      'UPDATE user SET password = ? WHERE email = ?',
-      [hashedPassword, normalizedEmail]
+      'UPDATE user SET password = ? WHERE user_id = ?',
+      [hashedPassword, userId]
     );
+
+    await revokeAllUserRefreshTokens(userId);
+    clearAuthCookies(res);
 
     res.json({ success: true, message: 'Password updated successfully' });
   } catch (error) {
@@ -920,6 +971,10 @@ export const changeCustomerPassword = async (req, res) => {
         success: false,
         error: 'Email, current password, and new password are required'
       });
+    }
+
+    if (!assertEmailAccess(req, res, normalizedEmail)) {
+      return;
     }
 
     if (newPassword.length < 8) {
@@ -980,6 +1035,9 @@ export const changeCustomerPassword = async (req, res) => {
       'UPDATE user SET password = ? WHERE user_id = ?',
       [hashedPassword, user.user_id]
     );
+
+    await revokeAllUserRefreshTokens(user.user_id);
+    clearAuthCookies(res);
 
     res.json({
       success: true,

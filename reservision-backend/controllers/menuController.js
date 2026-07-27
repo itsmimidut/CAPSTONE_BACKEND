@@ -29,6 +29,36 @@
  */
 
 import { db } from '../config/db.js';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const MENU_UPLOAD_DIR = path.join(__dirname, '..', 'public', 'uploads', 'menu');
+if (!fs.existsSync(MENU_UPLOAD_DIR)) {
+    fs.mkdirSync(MENU_UPLOAD_DIR, { recursive: true });
+}
+
+const menuImageStorage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, MENU_UPLOAD_DIR),
+    filename: (_req, file, cb) => {
+        const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+        cb(null, unique + path.extname(file.originalname || '').toLowerCase());
+    },
+});
+
+export const menuImageUpload = multer({
+    storage: menuImageStorage,
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+        if (allowed.includes(file.mimetype)) cb(null, true);
+        else cb(new Error(`Invalid file type: ${file.mimetype}`));
+    },
+});
 
 const parseJsonArray = (value) => {
     if (!value) return [];
@@ -42,6 +72,43 @@ const parseJsonArray = (value) => {
 };
 
 const stringifyJsonArray = (value) => JSON.stringify(Array.isArray(value) ? value : []);
+
+const parseBoolean = (value, fallback = true) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value === 'boolean') return value;
+    const normalized = String(value).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+};
+
+const isMenuUploadPath = (url) => String(url || '').startsWith('/uploads/menu/');
+
+const deleteMenuImageFile = (url) => {
+    if (!isMenuUploadPath(url)) return;
+    const absolute = path.join(__dirname, '..', 'public', url.replace(/^\//, ''));
+    fs.promises.unlink(absolute).catch(() => {});
+};
+
+const resolveMenuImageUrl = (req, { existingUrl = '', allowClear = false } = {}) => {
+    if (req.file?.filename) {
+        const nextUrl = `/uploads/menu/${req.file.filename}`;
+        if (existingUrl && existingUrl !== nextUrl) deleteMenuImageFile(existingUrl);
+        return nextUrl;
+    }
+
+    const removeRequested = parseBoolean(req.body?.remove_image, false);
+    if (allowClear && removeRequested) {
+        deleteMenuImageFile(existingUrl);
+        return '';
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'image_url')) {
+        return String(req.body.image_url || '').trim();
+    }
+
+    return existingUrl || '';
+};
 
 const hasMenuCustomizationColumns = async () => {
     const [rows] = await db.query(
@@ -222,20 +289,20 @@ export const getMenuItem = async (req, res) => {
  */
 export const createMenuItem = async (req, res) => {
     try {
+        const body = req.body || {};
         const {
             name,
             price,
             category,
-            available = true,
             prep_time = 15,
             description = '',
-            image_url = '',
-            sizes = [],
-            addons = [],
-            ingredients = []
-        } = req.body;
+        } = body;
+        const available = parseBoolean(body.available, true);
+        const sizes = body.sizes;
+        const addons = body.addons;
+        const ingredients = parseJsonArray(body.ingredients);
 
-        if (!name || !price || !category) {
+        if (!name || price === undefined || price === null || price === '' || !category) {
             return res.status(400).json({ message: 'Name, price, and category are required' });
         }
 
@@ -259,25 +326,24 @@ export const createMenuItem = async (req, res) => {
         const resolvedPrice = normalizedSizes.length
             ? Number(normalizedSizes[0].price || price || 0)
             : Number(price || 0);
+        const image_url = resolveMenuImageUrl(req);
         const supportsCustomization = await hasMenuCustomizationColumns();
 
         let result;
         if (supportsCustomization) {
             [result] = await db.query(
                 'INSERT INTO menu_items (name, price, category, available, prep_time, description, image_url, sizes, addons) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [name, resolvedPrice, category, available, prep_time, description, image_url, stringifyJsonArray(normalizedSizes), stringifyJsonArray(normalizedAddons)]
+                [name, resolvedPrice, category, available, Number(prep_time) || 15, description || '', image_url, stringifyJsonArray(normalizedSizes), stringifyJsonArray(normalizedAddons)]
             );
         } else {
             [result] = await db.query(
                 'INSERT INTO menu_items (name, price, category, available, prep_time, description, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [name, resolvedPrice, category, available, prep_time, description, image_url]
+                [name, resolvedPrice, category, available, Number(prep_time) || 15, description || '', image_url]
             );
         }
 
         const menuId = result.insertId;
-        const validIngredients = Array.isArray(ingredients)
-            ? ingredients.filter((ing) => Number(ing?.inventory_id) > 0 && Number(ing?.quantity_needed) > 0)
-            : [];
+        const validIngredients = ingredients.filter((ing) => Number(ing?.inventory_id) > 0 && Number(ing?.quantity_needed) > 0);
 
         for (const ingredient of validIngredients) {
             await db.query(
@@ -288,10 +354,12 @@ export const createMenuItem = async (req, res) => {
 
         res.status(201).json({
             message: 'Menu item created successfully',
-            menu_id: menuId
+            menu_id: menuId,
+            image_url,
         });
     } catch (error) {
         console.error('Error creating menu item:', error);
+        if (req.file?.filename) deleteMenuImageFile(`/uploads/menu/${req.file.filename}`);
         res.status(500).json({ error: 'Error creating menu item' });
     }
 };
@@ -327,24 +395,50 @@ export const createMenuItem = async (req, res) => {
 export const updateMenuItem = async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, price, category, available, prep_time, description, image_url, sizes = [], addons = [], ingredients = [] } = req.body;
-        const normalizedSizes = parseJsonArray(sizes);
-        const normalizedAddons = parseJsonArray(addons);
+        const body = req.body || {};
+        const {
+            name,
+            price,
+            category,
+            prep_time,
+            description,
+        } = body;
+
+        if (!name || !category) {
+            return res.status(400).json({ message: 'Name and category are required' });
+        }
+
+        const [existingRows] = await db.query(
+            'SELECT menu_id, image_url FROM menu_items WHERE menu_id = ?',
+            [id]
+        );
+        if (!existingRows.length) {
+            return res.status(404).json({ message: 'Menu item not found' });
+        }
+
+        const available = parseBoolean(body.available, true);
+        const normalizedSizes = parseJsonArray(body.sizes);
+        const normalizedAddons = parseJsonArray(body.addons);
+        const ingredients = parseJsonArray(body.ingredients);
         const resolvedPrice = normalizedSizes.length
             ? Number(normalizedSizes[0].price || price || 0)
             : Number(price || 0);
+        const image_url = resolveMenuImageUrl(req, {
+            existingUrl: existingRows[0].image_url || '',
+            allowClear: true,
+        });
         const supportsCustomization = await hasMenuCustomizationColumns();
 
         let result;
         if (supportsCustomization) {
             [result] = await db.query(
                 'UPDATE menu_items SET name = ?, price = ?, category = ?, available = ?, prep_time = ?, description = ?, image_url = ?, sizes = ?, addons = ? WHERE menu_id = ?',
-                [name, resolvedPrice, category, available, prep_time, description, image_url, stringifyJsonArray(normalizedSizes), stringifyJsonArray(normalizedAddons), id]
+                [name, resolvedPrice, category, available, Number(prep_time) || 15, description || '', image_url, stringifyJsonArray(normalizedSizes), stringifyJsonArray(normalizedAddons), id]
             );
         } else {
             [result] = await db.query(
                 'UPDATE menu_items SET name = ?, price = ?, category = ?, available = ?, prep_time = ?, description = ?, image_url = ? WHERE menu_id = ?',
-                [name, resolvedPrice, category, available, prep_time, description, image_url, id]
+                [name, resolvedPrice, category, available, Number(prep_time) || 15, description || '', image_url, id]
             );
         }
 
@@ -352,49 +446,51 @@ export const updateMenuItem = async (req, res) => {
             return res.status(404).json({ message: 'Menu item not found' });
         }
 
-        if (Array.isArray(ingredients)) {
-            const [existingRows] = await db.query('SELECT id, inventory_id, quantity_needed FROM menu_ingredients WHERE menu_id = ?', [id]);
-            const existingByInventory = new Map(existingRows.map(row => [String(row.inventory_id), row]));
-            const ingredientIdsToKeep = new Set();
+        const [existingIngredientRows] = await db.query(
+            'SELECT id, inventory_id, quantity_needed FROM menu_ingredients WHERE menu_id = ?',
+            [id]
+        );
+        const existingByInventory = new Map(existingIngredientRows.map(row => [String(row.inventory_id), row]));
+        const ingredientIdsToKeep = new Set();
 
-            for (const ingredient of ingredients) {
-                const inventoryId = Number(ingredient.inventory_id);
-                const quantityNeeded = Number(ingredient.quantity_needed);
-                if (!inventoryId || !quantityNeeded || quantityNeeded <= 0) continue;
+        for (const ingredient of ingredients) {
+            const inventoryId = Number(ingredient.inventory_id);
+            const quantityNeeded = Number(ingredient.quantity_needed);
+            if (!inventoryId || !quantityNeeded || quantityNeeded <= 0) continue;
 
-                const existing = existingByInventory.get(String(inventoryId));
-                if (existing) {
-                    ingredientIdsToKeep.add(String(inventoryId));
-                    if (existing.quantity_needed !== quantityNeeded) {
-                        await db.query(
-                            'UPDATE menu_ingredients SET quantity_needed = ? WHERE id = ?',
-                            [quantityNeeded, existing.id]
-                        );
-                    }
-                } else {
+            const existing = existingByInventory.get(String(inventoryId));
+            if (existing) {
+                ingredientIdsToKeep.add(String(inventoryId));
+                if (Number(existing.quantity_needed) !== quantityNeeded) {
                     await db.query(
-                        'INSERT INTO menu_ingredients (menu_id, inventory_id, quantity_needed) VALUES (?, ?, ?)',
-                        [id, inventoryId, quantityNeeded]
+                        'UPDATE menu_ingredients SET quantity_needed = ? WHERE id = ?',
+                        [quantityNeeded, existing.id]
                     );
-                    ingredientIdsToKeep.add(String(inventoryId));
                 }
-            }
-
-            const toDelete = existingRows
-                .filter(row => !ingredientIdsToKeep.has(String(row.inventory_id)))
-                .map(row => row.id);
-
-            if (toDelete.length > 0) {
+            } else {
                 await db.query(
-                    `DELETE FROM menu_ingredients WHERE id IN (${toDelete.map(() => '?').join(',')})`,
-                    toDelete
+                    'INSERT INTO menu_ingredients (menu_id, inventory_id, quantity_needed) VALUES (?, ?, ?)',
+                    [id, inventoryId, quantityNeeded]
                 );
+                ingredientIdsToKeep.add(String(inventoryId));
             }
         }
 
-        res.json({ message: 'Menu item updated successfully' });
+        const toDelete = existingIngredientRows
+            .filter(row => !ingredientIdsToKeep.has(String(row.inventory_id)))
+            .map(row => row.id);
+
+        if (toDelete.length > 0) {
+            await db.query(
+                `DELETE FROM menu_ingredients WHERE id IN (${toDelete.map(() => '?').join(',')})`,
+                toDelete
+            );
+        }
+
+        res.json({ message: 'Menu item updated successfully', image_url });
     } catch (error) {
         console.error('Error updating menu item:', error);
+        if (req.file?.filename) deleteMenuImageFile(`/uploads/menu/${req.file.filename}`);
         res.status(500).json({ error: 'Error updating menu item' });
     }
 };

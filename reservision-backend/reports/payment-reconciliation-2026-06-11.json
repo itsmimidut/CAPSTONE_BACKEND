@@ -1,0 +1,14 @@
+{
+  "generated_at": "2026-06-11T10:15:35.101Z",
+  "date": "2026-06-11",
+  "issues": {
+    "missing_payment": [],
+    "missing_refund": [],
+    "amount_mismatch": []
+  },
+  "summary": {
+    "missing_payment_count": 0,
+    "missing_refund_count": 0,
+    "amount_mismatch_count": 0
+  }
+}

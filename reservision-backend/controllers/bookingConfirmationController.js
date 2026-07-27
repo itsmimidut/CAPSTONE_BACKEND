@@ -1,6 +1,28 @@
 import db from '../config/db.js';
 import { generateQRCode, formatBookingDataForQR } from '../services/qrCodeService.js';
 import { sendBookingConfirmationWithQR } from '../services/emailService.js';
+import { isCashPaymentMethod } from '../services/paymentRecordService.js';
+import { assertBookingAccess } from '../middleware/ownership.js';
+import {
+  checkAvailability,
+  normalizeDateValue,
+  normalizeTimeValue
+} from '../services/availabilityService.js';
+import {
+  assertInventoryItemsBookable,
+  UNAVAILABLE_BOOKING_MESSAGE,
+} from '../services/inventoryBookabilityService.js';
+import {
+  calculateBookingTotal,
+  mapCheckoutItemToPricingPayload,
+  getBookingPricingColumnSets,
+  buildBookingItemPricingFields,
+} from '../services/reservationPricingService.js';
+import { computeEntranceFeeForBookingItems } from '../services/entranceFeeService.js';
+import { computeExtraPersonFeeForBookingItems } from '../services/extraPersonFeeService.js';
+import { getInitialBookingPaymentState } from '../services/bookingPaymentLifecycle.js';
+
+const roundMoney = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
 /**
  * ============================================================
@@ -29,11 +51,13 @@ import { sendBookingConfirmationWithQR } from '../services/emailService.js';
  */
 export const createBookingConfirmation = async (req, res) => {
   const connection = await db.getConnection();
+  let normalizedCheckoutToken = '';
 
   try {
     await connection.beginTransaction();
 
-    const { guest, checkIn, checkOut, items, paymentMethod, subtotal = 0, total = 0, userId, isSwimmingOnly, entranceFee = 0, extraPersonFee = 0 } = req.body;
+    const { guest, checkIn, checkOut, items, paymentMethod, subtotal = 0, total = 0, userId, isSwimmingOnly, entranceFee = 0, extraPersonFee = 0, promo_id = null, promo_code = null, checkoutToken = null } = req.body;
+    normalizedCheckoutToken = String(checkoutToken || '').trim();
 
     // Debug logging
     console.log('🔍 Booking request received:');
@@ -50,8 +74,57 @@ export const createBookingConfirmation = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Guest information is required' });
     }
 
-    // Skip date validation for swimming-only bookings
-    if (!isSwimmingOnly && (!checkIn || !checkOut)) {
+    if (normalizedCheckoutToken && !/^[A-Za-z0-9-]{16,64}$/.test(normalizedCheckoutToken)) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_CHECKOUT_TOKEN',
+        error: 'Invalid checkout token.',
+      });
+    }
+
+    if (normalizedCheckoutToken) {
+      const [existingRows] = await connection.query(
+        `SELECT booking_id, booking_reference, customer_id, total, booking_status, payment_status
+         FROM bookings
+         WHERE checkout_token = ?
+         LIMIT 1`,
+        [normalizedCheckoutToken],
+      );
+      const existing = existingRows[0];
+      if (existing) {
+        await connection.rollback();
+        if (
+          existing.booking_status === 'Pending'
+          && existing.payment_status !== 'Paid'
+        ) {
+          return res.json({
+            success: true,
+            reused: true,
+            message: 'Existing pending booking reused.',
+            data: {
+              bookingId: existing.booking_id,
+              bookingReference: existing.booking_reference,
+              customerId: existing.customer_id,
+              total: Number(existing.total || 0),
+              status: 'pending',
+            },
+          });
+        }
+        return res.status(409).json({
+          success: false,
+          code: 'CHECKOUT_TOKEN_NOT_REUSABLE',
+          error: 'This checkout attempt is already closed. Start a new checkout attempt.',
+        });
+      }
+    }
+
+    const hasRoomItems = Array.isArray(items) && items.some(
+      item => (item.booking_type || item.bookingType || 'room') === 'room'
+    );
+
+    // Skip date validation for swimming-only or non-room bookings (e.g. event areas)
+    if (!isSwimmingOnly && hasRoomItems && (!checkIn || !checkOut)) {
       await connection.rollback();
       return res.status(400).json({ success: false, error: 'Check-in and check-out dates are required' });
     }
@@ -60,7 +133,7 @@ export const createBookingConfirmation = async (req, res) => {
     let normalizedCheckIn = checkIn;
     let normalizedCheckOut = checkOut;
 
-    if (!isSwimmingOnly && checkIn && checkOut) {
+    if (!isSwimmingOnly && hasRoomItems && checkIn && checkOut) {
       try {
         // Parse the date and ensure it's in YYYY-MM-DD format
         const checkInDate = new Date(checkIn);
@@ -82,18 +155,122 @@ export const createBookingConfirmation = async (req, res) => {
       }
     }
 
+    const eventOnlyItems = Array.isArray(items)
+      ? items.filter(item => (item.booking_type || item.bookingType) === 'event')
+      : [];
+
+    if (!isSwimmingOnly && !hasRoomItems && eventOnlyItems.length > 0) {
+      const firstEventDate = normalizeDateValue(
+        eventOnlyItems[0].booking_date || eventOnlyItems[0].bookingDate
+      );
+      if (firstEventDate) {
+        normalizedCheckIn = firstEventDate;
+        normalizedCheckOut = firstEventDate;
+      }
+    }
+
     if (!items || items.length === 0) {
       await connection.rollback();
       return res.status(400).json({ success: false, error: 'At least one booking item is required' });
     }
 
+    const pricingPayloadItems = items.map((item) => mapCheckoutItemToPricingPayload({
+      ...item,
+      swimmingDetails: item.swimmingDetails,
+    }, {
+      checkIn: normalizedCheckIn,
+      checkOut: normalizedCheckOut,
+      promo_id,
+      promo_code,
+    }));
+
+    const entranceFeeResult = await computeEntranceFeeForBookingItems({
+      items,
+      defaultDate: normalizedCheckIn,
+      connection,
+    });
+    if (!entranceFeeResult.success) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        error: entranceFeeResult.error || 'Failed to calculate entrance fees.',
+      });
+    }
+    const authoritativeEntranceFee = entranceFeeResult.total;
+    const extraPersonFeeResult = await computeExtraPersonFeeForBookingItems({
+      items,
+      connection,
+    });
+    const authoritativeExtraPersonFee = extraPersonFeeResult.total;
+
+    const pricingResult = await calculateBookingTotal(pricingPayloadItems, {
+      promo_id,
+      promo_code,
+      entrance_fee: authoritativeEntranceFee,
+      extra_person_fee: authoritativeExtraPersonFee,
+    }, connection);
+
+    if (!pricingResult.success) {
+      await connection.rollback();
+      return res.status(400).json({ success: false, error: pricingResult.message || 'Failed to calculate booking price.' });
+    }
+
+    const pricedItems = pricingResult.data.items;
+    const backendSubtotal = pricingResult.data.subtotal;
+    const backendTotal = pricingResult.data.total;
+    const pricingColumnSets = await getBookingPricingColumnSets(connection);
+
+    const appendPricingFields = (fields, values, priced) => {
+      const pricing = buildBookingItemPricingFields(priced, pricingColumnSets.bookingItems);
+      fields.push(...pricing.fields);
+      values.push(...pricing.values);
+    };
+
     const [bookingColumns] = await connection.query(
-      'SHOW COLUMNS FROM bookings WHERE Field IN (?, ?)',
-      ['entrance_fee', 'extra_person_fee']
+      `SHOW COLUMNS FROM bookings WHERE Field IN
+        ('entrance_fee', 'extra_person_fee', 'total_guests', 'seniors', 'infants',
+         'guest_breakdown_provided', 'guest_breakdown_type')`
     )
     const bookingColumnNames = bookingColumns.map(col => col.Field)
     const hasBookingEntranceFee = bookingColumnNames.includes('entrance_fee')
     const hasBookingExtraPersonFee = bookingColumnNames.includes('extra_person_fee')
+    const hasBookingGuestBreakdown = bookingColumnNames.includes('total_guests')
+      && bookingColumnNames.includes('guest_breakdown_provided')
+
+    // Aggregate guest breakdown across all items for booking-level summary
+    const bookingBreakdown = (Array.isArray(items) ? items : []).reduce((acc, item) => {
+      const provided = Number(item.guest_breakdown_provided) === 1
+        || item.guest_breakdown_provided === true
+      const adults = Number(item.adults || 0)
+      const children = Number(item.children || 0)
+      const seniors = Number(item.seniors || 0)
+      const infants = Number(item.infants || 0)
+      const totalGuests = Number(item.total_guests || item.guests || 0)
+
+      acc.totalGuests += totalGuests
+      acc.seniors += seniors
+      acc.infants += infants
+      if (provided && (adults + children + seniors + infants) > 0) {
+        acc.anyProvided = true
+        if (item.guest_breakdown_type && item.guest_breakdown_type !== 'not_provided') {
+          acc.types.add(item.guest_breakdown_type)
+        }
+      }
+      return acc
+    }, { totalGuests: 0, seniors: 0, infants: 0, anyProvided: false, types: new Set() })
+
+    const bookingBreakdownType = !bookingBreakdown.anyProvided
+      ? 'not_provided'
+      : (bookingBreakdown.types.has('estimated') ? 'estimated' : 'exact')
+
+    if (bookingBreakdown.totalGuests < 1) {
+      await connection.rollback()
+      return res.status(400).json({
+        success: false,
+        code: 'GUESTS_REQUIRED',
+        error: 'Please select at least one guest before continuing.',
+      })
+    }
 
     // Step 1: Get or create customer - prioritize user_id if logged in
     let customerId;
@@ -187,6 +364,42 @@ export const createBookingConfirmation = async (req, res) => {
     // Step 2: Generate booking reference
     const bookingReference = 'EDU' + Date.now().toString().slice(-8);
 
+    // Reject unavailable inventory before any booking insert or side effects.
+    // Swimming / non-inventory items are skipped (no numeric inventory_item_id).
+    const inventoryIdsToGuard = []
+    for (const item of items) {
+      if (item?.swimmingDetails) continue
+      const rawId = item?.item_id ?? item?.id
+      const numericId = Number(rawId)
+      if (Number.isFinite(numericId) && numericId > 0) {
+        inventoryIdsToGuard.push(numericId)
+      }
+      if (Array.isArray(item?.selectedInventoryItemIds)) {
+        for (const selectedId of item.selectedInventoryItemIds) {
+          const n = Number(selectedId)
+          if (Number.isFinite(n) && n > 0) inventoryIdsToGuard.push(n)
+        }
+      }
+    }
+    const bookability = await assertInventoryItemsBookable(connection, inventoryIdsToGuard)
+    if (!bookability.ok) {
+      await connection.rollback()
+      return res.status(409).json({
+        success: false,
+        message: bookability.message || UNAVAILABLE_BOOKING_MESSAGE,
+      })
+    }
+
+    const itemGuestTotal = Array.isArray(items)
+      ? items.reduce((sum, item) => {
+          const guests = Number(item.guests || item.guest_count || 0);
+          return sum + (Number.isFinite(guests) ? guests : 0);
+        }, 0)
+      : 0;
+
+    const bookingAdults = Math.max(0, Number(guest.adults || 0));
+    const bookingChildren = Number(guest.children || 0);
+
     // Step 3: Create booking
     const bookingFields = [
       'booking_reference',
@@ -204,25 +417,58 @@ export const createBookingConfirmation = async (req, res) => {
       customerId,
       normalizedCheckIn,
       normalizedCheckOut,
-      guest.adults || 2,
-      guest.children || 0,
+      bookingAdults,
+      bookingChildren,
       guest.arrivalTime || null,
       guest.specialRequests || '',
-      subtotal
+      backendSubtotal
     ]
+
+    if (normalizedCheckoutToken) {
+      bookingFields.push('checkout_token');
+      bookingValues.push(normalizedCheckoutToken);
+    }
+
+    if (pricingColumnSets.bookings.has('pricing_total')) {
+      bookingFields.splice(bookingFields.indexOf('subtotal') + 1, 0, 'pricing_total');
+      bookingValues.splice(bookingValues.indexOf(backendSubtotal) + 1, 0, backendTotal);
+    }
 
     if (hasBookingEntranceFee) {
       bookingFields.push('entrance_fee')
-      bookingValues.push(Number(entranceFee || 0))
+      bookingValues.push(authoritativeEntranceFee)
     }
 
     if (hasBookingExtraPersonFee) {
       bookingFields.push('extra_person_fee')
-      bookingValues.push(Number(extraPersonFee || 0))
+      bookingValues.push(authoritativeExtraPersonFee)
     }
 
-    bookingFields.push('total', 'booking_status')
-    bookingValues.push(Number(total || subtotal + Number(entranceFee || 0) + Number(extraPersonFee || 0)), 'Pending')
+    if (hasBookingGuestBreakdown) {
+      bookingFields.push(
+        'total_guests',
+        'seniors',
+        'infants',
+        'guest_breakdown_provided',
+        'guest_breakdown_type'
+      )
+      bookingValues.push(
+        bookingBreakdown.totalGuests || itemGuestTotal || 0,
+        bookingBreakdown.seniors || 0,
+        bookingBreakdown.infants || 0,
+        bookingBreakdown.anyProvided ? 1 : 0,
+        bookingBreakdownType
+      )
+    }
+
+    const initialPaymentState = getInitialBookingPaymentState(paymentMethod);
+    bookingFields.push('total', 'booking_status', 'payment_status', 'payment_method')
+    bookingValues.push(
+      backendTotal,
+      initialPaymentState.bookingStatus,
+      initialPaymentState.paymentStatus,
+      paymentMethod || 'xendit',
+    )
 
     const [bookingResult] = await connection.query(
       `INSERT INTO bookings (${bookingFields.join(', ')}) VALUES (${bookingFields.map(() => '?').join(', ')})`,
@@ -231,8 +477,60 @@ export const createBookingConfirmation = async (req, res) => {
 
     const bookingId = bookingResult.insertId;
 
+    // Detect guest-breakdown columns on booking_items (migration may not be applied yet)
+    const [itemBreakdownColumns] = await connection.query(
+      `SHOW COLUMNS FROM booking_items WHERE Field IN
+        ('total_guests', 'adults', 'children', 'seniors', 'infants',
+         'guest_breakdown_provided', 'guest_breakdown_type')`
+    );
+    const itemBreakdownColumnNames = new Set(itemBreakdownColumns.map(col => col.Field));
+    const hasItemGuestBreakdown = itemBreakdownColumnNames.has('total_guests')
+      && itemBreakdownColumnNames.has('adults')
+      && itemBreakdownColumnNames.has('guest_breakdown_provided');
+
+    // Normalize per-item guest breakdown -> { fields:[], values:[] } to append to any insert.
+    // Rule: never copy total_guests into adults. adults holds actual adult count only.
+    const buildBreakdownInsert = (item, fallbackGuests) => {
+      if (!hasItemGuestBreakdown) return { fields: [], values: [] };
+
+      const provided = Number(item.guest_breakdown_provided) === 1
+        || item.guest_breakdown_provided === true;
+      const adults = Math.max(0, Number(item.adults || 0));
+      const children = Math.max(0, Number(item.children || 0));
+      const seniors = Math.max(0, Number(item.seniors || 0));
+      const infants = Math.max(0, Number(item.infants || 0));
+      const breakdownSum = adults + children + seniors + infants;
+
+      const totalGuests = provided && breakdownSum > 0
+        ? breakdownSum
+        : Number(item.total_guests || fallbackGuests || item.guests || 0);
+
+      const typeRaw = String(item.guest_breakdown_type || '').toLowerCase();
+      const guestBreakdownType = (provided && breakdownSum > 0)
+        ? (['exact', 'estimated'].includes(typeRaw) ? typeRaw : 'estimated')
+        : 'not_provided';
+
+      return {
+        fields: [
+          'total_guests', 'adults', 'children', 'seniors', 'infants',
+          'guest_breakdown_provided', 'guest_breakdown_type'
+        ],
+        values: [
+          totalGuests,
+          provided ? adults : 0,
+          provided ? children : 0,
+          provided ? seniors : 0,
+          provided ? infants : 0,
+          (provided && breakdownSum > 0) ? 1 : 0,
+          guestBreakdownType
+        ]
+      };
+    };
+
     // Step 4: Add booking items
-    for (const item of items) {
+    for (let pricedIndex = 0; pricedIndex < items.length; pricedIndex += 1) {
+      const item = items[pricedIndex];
+      const priced = pricedItems[pricedIndex] || null;
       const bookingType = item.booking_type || item.bookingType || 'room'
       const isRoom = bookingType === 'room'
       const isCottage = bookingType === 'cottage'
@@ -250,10 +548,13 @@ export const createBookingConfirmation = async (req, res) => {
         ? Math.ceil((new Date(itemCheckOut) - new Date(itemCheckIn)) / 86400000)
         : 0
 
-      // For cottages/events, price doesn't multiply by nights
-      const totalPrice = isRoom
-        ? item.price * requestedQty * (nights > 0 ? nights : 1)
-        : item.price * requestedQty
+      // Backend-authoritative pricing (ignores frontend-submitted line totals)
+      const totalPrice = priced?.final_subtotal ?? (
+        isRoom
+          ? item.price * requestedQty * (nights > 0 ? nights : 1)
+          : item.price * requestedQty
+      );
+      const unitPrice = priced?.unit_price ?? item.price;
 
       // Get numeric inventory_item_id
       const itemIdValue = item.item_id || item.id
@@ -273,8 +574,61 @@ export const createBookingConfirmation = async (req, res) => {
         numericItemId = parseInt(itemIdValue)
       }
 
+      if (!item.swimmingDetails && numericItemId) {
+        const requestedCategory = isEvent ? 'event' : (isCottage ? 'cottage' : 'room');
+
+        const roomCheckIn = normalizeDateValue(itemCheckIn || normalizedCheckIn);
+        const roomCheckOut = normalizeDateValue(itemCheckOut || normalizedCheckOut);
+        const cottageDate = normalizeDateValue(itemBookingDate || itemCheckIn || normalizedCheckIn);
+        const eventDate = normalizeDateValue(item.booking_date || item.bookingDate || itemBookingDate);
+        const eventStartTime = normalizeTimeValue(item.start_time || item.startTime);
+        const eventEndTime = normalizeTimeValue(item.end_time || item.endTime);
+
+        const availabilityPayload = {
+          inventory_item_id: numericItemId,
+          category_type: requestedCategory
+        };
+
+        if (requestedCategory === 'room') {
+          availabilityPayload.check_in_date = roomCheckIn;
+          availabilityPayload.check_out_date = roomCheckOut;
+        } else if (requestedCategory === 'cottage') {
+          availabilityPayload.booking_date = cottageDate;
+        } else if (requestedCategory === 'event') {
+          availabilityPayload.booking_date = eventDate;
+          availabilityPayload.start_time = eventStartTime;
+          availabilityPayload.end_time = eventEndTime;
+        }
+
+        const availability = await checkAvailability(availabilityPayload, connection);
+        if (availability.success === false) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            reason: availability.reason || 'INVALID_REQUEST',
+            message: availability.message || 'Invalid availability check payload.'
+          });
+        }
+
+        if (!availability.available) {
+          await connection.rollback();
+          return res.status(409).json({
+            success: false,
+            reason: availability.reason || 'BOOKING_CONFLICT',
+            message: availability.message || 'This item is no longer available.',
+            conflict: availability.conflict || null
+          });
+        }
+      }
+
       // Determine item type
-      const itemType = item.swimmingDetails ? 'Swimming' : (item.category || 'Room')
+      const itemType = item.swimmingDetails
+        ? 'Swimming'
+        : isEvent
+          ? 'Event'
+          : isCottage
+            ? 'Cottage'
+            : (item.category || 'Room');
       const itemName = item.swimmingDetails
         ? (item.name || 'Swimming Lesson Package')
         : (item.name || 'Item')
@@ -284,7 +638,9 @@ export const createBookingConfirmation = async (req, res) => {
       // For swimming bookings, use participants; otherwise use guests
       const guestCount = item.swimmingDetails && item.swimmingDetails.participants
         ? item.swimmingDetails.participants
-        : (item.guests || 0)
+        : isEvent
+          ? Number(item.guests || item.guest_count || 0)
+          : (item.guests || 0)
 
       const itemExtraPersonFee = Number((item.extra_person_fee ?? item.extraPersonFee) || 0)
       const itemExtraPersonCount = Number((item.extra_person_count ?? item.extraPersonCount) || 0)
@@ -347,7 +703,7 @@ export const createBookingConfirmation = async (req, res) => {
           const [availableByIds] = await connection.query(
             `SELECT ii.item_id
              FROM inventory_items ii
-             WHERE LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+             WHERE LOWER(TRIM(COALESCE(ii.status, ''))) = 'available'
                ${candidateFilter}
                AND ii.item_id NOT IN (
                  SELECT bi.inventory_item_id
@@ -375,7 +731,7 @@ export const createBookingConfirmation = async (req, res) => {
             `SELECT ii.item_id
              FROM inventory_items ii
              WHERE LOWER(TRIM(ii.name)) = LOWER(TRIM(?))
-               AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+               AND LOWER(TRIM(COALESCE(ii.status, ''))) = 'available'
                ${candidateFilter}
                AND ii.item_id NOT IN (
                  SELECT bi.inventory_item_id
@@ -408,7 +764,7 @@ export const createBookingConfirmation = async (req, res) => {
             `SELECT ii.item_id
              FROM inventory_items ii
              WHERE LOWER(TRIM(ii.category)) = LOWER(TRIM(?))
-               AND LOWER(COALESCE(ii.status, '')) NOT IN ('under maintenance', 'maintenance')
+               AND LOWER(TRIM(COALESCE(ii.status, ''))) = 'available'
                ${candidateFilter}
                AND ii.item_id NOT IN (
                  SELECT bi.inventory_item_id
@@ -453,41 +809,50 @@ export const createBookingConfirmation = async (req, res) => {
         }
 
         const guestsPerUnit = guestCount > 0 ? Math.max(1, Math.ceil(guestCount / requestedQty)) : 0
+        const perUnitTotalPrice = roundMoney(totalPrice / requestedQty)
+        let roomUnitIndex = 0
 
         for (const unit of availableUnits) {
+          // Distribute the guest breakdown across units (per-unit share).
+          const perUnitItem = requestedQty > 1
+            ? {
+                ...item,
+                total_guests: guestsPerUnit,
+                adults: Math.ceil(Number(item.adults || 0) / requestedQty),
+                children: Math.ceil(Number(item.children || 0) / requestedQty),
+                seniors: Math.ceil(Number(item.seniors || 0) / requestedQty),
+                infants: Math.ceil(Number(item.infants || 0) / requestedQty)
+              }
+            : item
+          const roomBreakdown = buildBreakdownInsert(perUnitItem, guestsPerUnit)
+          const roomFields = [
+            'booking_id', 'inventory_item_id', 'item_type', 'item_name',
+            'batch_id', 'schedule_id', 'coach_id', 'unit_price', 'quantity',
+            'guests', 'nights', 'total_price', 'per_night', 'item_description',
+            ...roomBreakdown.fields
+          ]
+          const roomValues = [
+            bookingId,
+            unit.item_id,
+            itemType,
+            itemName,
+            null,
+            null,
+            null,
+            unitPrice,
+            1,
+            guestsPerUnit,
+            roomNights,
+            perUnitTotalPrice,
+            true,
+            itemDescription,
+            ...roomBreakdown.values
+          ]
+          appendPricingFields(roomFields, roomValues, roomUnitIndex === 0 ? priced : null)
+          roomUnitIndex += 1
           await connection.query(
-            `INSERT INTO booking_items (
-              booking_id,
-              inventory_item_id,
-              item_type,
-              item_name,
-              batch_id,
-              schedule_id,
-              coach_id,
-              unit_price,
-              quantity,
-              guests,
-              nights,
-              total_price,
-              per_night,
-              item_description
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              bookingId,
-              unit.item_id,
-              itemType,
-              itemName,
-              null,
-              null,
-              null,
-              item.price,
-              1,
-              guestsPerUnit,
-              roomNights,
-              item.price * (roomNights > 0 ? roomNights : 1),
-              true,
-              itemDescription
-            ]
+            `INSERT INTO booking_items (${roomFields.join(', ')}) VALUES (${roomFields.map(() => '?').join(', ')})`,
+            roomValues
           )
         }
 
@@ -495,39 +860,166 @@ export const createBookingConfirmation = async (req, res) => {
         continue
       }
 
+      if (isEvent && !item.swimmingDetails) {
+        const eventDate = normalizeDateValue(item.booking_date || item.bookingDate || itemBookingDate);
+        const eventStartTime = normalizeTimeValue(item.start_time || item.startTime);
+        const eventEndTime = normalizeTimeValue(item.end_time || item.endTime);
+        const eventPurpose = String(item.purpose || item.event_purpose || '').trim() || null;
+
+        if (!numericItemId) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            error: `Unable to resolve inventory item for ${itemName}`
+          });
+        }
+
+        const [areaRows] = await connection.query(
+          'SELECT max_guests, name FROM inventory_items WHERE item_id = ? LIMIT 1',
+          [numericItemId]
+        );
+        const areaCapacity = Number(areaRows[0]?.max_guests || 0);
+        if (areaCapacity > 0 && guestCount > areaCapacity) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            error: `This area can only accommodate up to ${areaCapacity} guests.`
+          });
+        }
+
+        itemDescriptionPayload.booking_date = eventDate;
+        itemDescriptionPayload.start_time = eventStartTime;
+        itemDescriptionPayload.end_time = eventEndTime;
+        itemDescriptionPayload.purpose = eventPurpose;
+        itemDescriptionPayload.event_type = item.event_type || item.eventType || eventPurpose;
+        itemDescriptionPayload.custom_event_type = item.custom_event_type || item.customEventType || null;
+        itemDescriptionPayload.notes = String(item.notes || item.special_request || '').trim() || null;
+        itemDescriptionPayload.rate_type = item.rate_type || item.rateType || null;
+
+        const eventItemDescription = Object.keys(itemDescriptionPayload).length > 0
+          ? JSON.stringify(itemDescriptionPayload)
+          : null;
+
+        const [scheduleColumns] = await connection.query(
+          `SHOW COLUMNS FROM booking_items WHERE Field IN ('booking_date', 'start_time', 'end_time', 'event_purpose')`
+        );
+        const scheduleColumnNames = new Set(scheduleColumns.map(col => col.Field));
+        const hasScheduleColumns = scheduleColumnNames.has('booking_date')
+          && scheduleColumnNames.has('start_time')
+          && scheduleColumnNames.has('end_time');
+
+        const eventBreakdown = buildBreakdownInsert(item, guestCount);
+
+        if (hasScheduleColumns) {
+          const insertFields = [
+            'booking_id', 'inventory_item_id', 'item_type', 'item_name',
+            'unit_price', 'quantity', 'guests', 'nights', 'total_price', 'per_night', 'item_description'
+          ];
+          const insertValues = [
+            bookingId,
+            numericItemId,
+            itemType,
+            itemName,
+            unitPrice,
+            1,
+            guestCount,
+            0,
+            totalPrice,
+            false,
+            eventItemDescription
+          ];
+
+          if (scheduleColumnNames.has('booking_date')) {
+            insertFields.push('booking_date');
+            insertValues.push(eventDate);
+          }
+          if (scheduleColumnNames.has('start_time')) {
+            insertFields.push('start_time');
+            insertValues.push(eventStartTime);
+          }
+          if (scheduleColumnNames.has('end_time')) {
+            insertFields.push('end_time');
+            insertValues.push(eventEndTime);
+          }
+          if (scheduleColumnNames.has('event_purpose')) {
+            insertFields.push('event_purpose');
+            insertValues.push(eventPurpose);
+          }
+
+          insertFields.push(...eventBreakdown.fields);
+          insertValues.push(...eventBreakdown.values);
+          appendPricingFields(insertFields, insertValues, priced);
+
+          await connection.query(
+            `INSERT INTO booking_items (${insertFields.join(', ')}) VALUES (${insertFields.map(() => '?').join(', ')})`,
+            insertValues
+          );
+        } else {
+          const fallbackFields = [
+            'booking_id', 'inventory_item_id', 'item_type', 'item_name',
+            'unit_price', 'quantity', 'guests', 'nights', 'total_price', 'per_night', 'item_description',
+            ...eventBreakdown.fields
+          ];
+          const fallbackValues = [
+            bookingId,
+            numericItemId,
+            itemType,
+            itemName,
+            unitPrice,
+            1,
+            guestCount,
+            0,
+            totalPrice,
+            false,
+            eventItemDescription,
+            ...eventBreakdown.values
+          ];
+          appendPricingFields(fallbackFields, fallbackValues, priced);
+          await connection.query(
+            `INSERT INTO booking_items (${fallbackFields.join(', ')}) VALUES (${fallbackFields.map(() => '?').join(', ')})`,
+            fallbackValues
+          );
+        }
+
+        if (eventDate) {
+          await connection.query(
+            'INSERT IGNORE INTO occupied_dates (inventory_item_id, booking_id, occupied_date) VALUES (?, ?, ?)',
+            [numericItemId, bookingId, eventDate]
+          );
+        }
+
+        console.log(`🎪 Reserved event area ${itemName} on ${eventDate} ${eventStartTime}-${eventEndTime}`);
+        continue;
+      }
+
+      const genericBreakdown = buildBreakdownInsert(item, guestCount);
+      const genericFields = [
+        'booking_id', 'inventory_item_id', 'item_type', 'item_name',
+        'batch_id', 'schedule_id', 'coach_id', 'unit_price', 'quantity',
+        'guests', 'nights', 'total_price', 'per_night', 'item_description',
+        ...genericBreakdown.fields
+      ];
+      const genericValues = [
+        bookingId,
+        numericItemId,
+        itemType,
+        itemName,
+        item.batch_id || null,
+        item.schedule_id || null,
+        item.coach_id || null,
+        unitPrice,
+        requestedQty,
+        guestCount,
+        isRoom ? nights : 0,
+        totalPrice,
+        isRoom,
+        itemDescription,
+        ...genericBreakdown.values
+      ];
+      appendPricingFields(genericFields, genericValues, priced);
       await connection.query(
-        `INSERT INTO booking_items (
-          booking_id, 
-          inventory_item_id, 
-          item_type,
-          item_name,
-          batch_id,
-          schedule_id,
-          coach_id,
-          unit_price, 
-          quantity, 
-          guests,
-          nights,
-          total_price,
-          per_night,
-          item_description
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          bookingId,
-          numericItemId,
-          itemType,
-          itemName,
-          item.batch_id || null,
-          item.schedule_id || null,
-          item.coach_id || null,
-          item.price,
-          requestedQty,
-          guestCount,
-          isRoom ? nights : 0,
-          totalPrice,
-          isRoom,
-          itemDescription
-        ]
+        `INSERT INTO booking_items (${genericFields.join(', ')}) VALUES (${genericFields.map(() => '?').join(', ')})`,
+        genericValues
       );
 
       console.log(`📦 Added item to booking: ${itemName}, Qty: ${requestedQty}, Guests: ${guestCount}`)
@@ -587,19 +1079,29 @@ export const createBookingConfirmation = async (req, res) => {
       }
     }
 
-    // Step 5: Create payment record (pending status)
-    const paymentReference = 'PAY' + Date.now().toString().slice(-6);
-    const [paymentResult] = await connection.query(
-      `INSERT INTO payments (
-        booking_id, 
-        customer_id, 
-        payment_reference, 
-        payment_method, 
-        amount, 
-        status
-      ) VALUES (?, ?, ?, ?, ?, 'pending')`,
-      [bookingId, customerId, paymentReference, paymentMethod, total]
-    );
+    // Step 5: Create payment record only for cash bookings.
+    // Online/Xendit payments are recorded when /api/xendit/create-payment runs.
+    let paymentId = null;
+    let paymentReference = null;
+
+    if (isCashPaymentMethod(paymentMethod)) {
+      paymentReference = `CASH-${bookingId}-${Date.now()}`;
+      const [paymentResult] = await connection.query(
+        `INSERT INTO payments (
+          booking_id,
+          customer_id,
+          payment_reference,
+          payment_method,
+          payment_gateway,
+          amount,
+          status,
+          currency,
+          created_at
+        ) VALUES (?, ?, ?, ?, 'manual', ?, 'pending', 'PHP', NOW())`,
+        [bookingId, customerId, paymentReference, paymentMethod, backendTotal],
+      );
+      paymentId = paymentResult.insertId;
+    }
 
     // Step 6: Log booking creation
     await connection.query(
@@ -636,7 +1138,7 @@ export const createBookingConfirmation = async (req, res) => {
     }
 
     // Step 8: Skip email sending here - will send only after payment is completed
-    // Email with QR code will be sent in updatePaymentStatus when status = 'paid'
+    // Confirmation email with QR is sent by Xendit webhook after verified payment
     console.log('⏳ Email will be sent after payment is confirmed');
 
     // Return success response
@@ -647,9 +1149,9 @@ export const createBookingConfirmation = async (req, res) => {
         bookingId,
         bookingReference,
         customerId,
-        paymentId: paymentResult.insertId,
+        paymentId,
         paymentReference,
-        total,
+        total: backendTotal,
         status: 'pending',
         qrCode: qrCodeData ? {
           url: qrCodeData.url,
@@ -660,6 +1162,30 @@ export const createBookingConfirmation = async (req, res) => {
 
   } catch (error) {
     await connection.rollback();
+    if (error.code === 'ER_DUP_ENTRY' && normalizedCheckoutToken) {
+      const [existingRows] = await db.query(
+        `SELECT booking_id, booking_reference, customer_id, total, booking_status, payment_status
+         FROM bookings
+         WHERE checkout_token = ?
+         LIMIT 1`,
+        [normalizedCheckoutToken],
+      );
+      const existing = existingRows[0];
+      if (existing?.booking_status === 'Pending' && existing?.payment_status !== 'Paid') {
+        return res.json({
+          success: true,
+          reused: true,
+          message: 'Existing pending booking reused.',
+          data: {
+            bookingId: existing.booking_id,
+            bookingReference: existing.booking_reference,
+            customerId: existing.customer_id,
+            total: Number(existing.total || 0),
+            status: 'pending',
+          },
+        });
+      }
+    }
     console.error('Booking confirmation error:', error);
     res.status(500).json({
       success: false,
@@ -672,141 +1198,16 @@ export const createBookingConfirmation = async (req, res) => {
 };
 
 /**
- * Update Payment Status (Called by PayMongo webhook or after payment)
- * POST /api/bookings/update-payment
- * 
- * Body: {
- *   bookingId: 123,
- *   paymentReference: "PAY123456",
- *   status: "paid",
- *   paymentIntentId: "pi_xxx",
- *   checkoutUrl: "https://..."
- * }
- */
-export const updatePaymentStatus = async (req, res) => {
-  try {
-    const { bookingId, paymentReference, status, paymentIntentId, checkoutUrl } = req.body;
-
-    const [result] = await db.query(
-      `UPDATE payments SET 
-        status = ?, 
-        payment_intent_id = ?, 
-        checkout_url = ?,
-        paid_at = IF(? = 'paid', CURRENT_TIMESTAMP, paid_at),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE booking_id = ? AND payment_reference = ?`,
-      [status, paymentIntentId, checkoutUrl, status, bookingId, paymentReference]
-    );
-
-    // Mark payment as paid and confirm the booking immediately after successful payment
-    if (status === 'paid') {
-      await db.query(
-        'UPDATE bookings SET payment_status = ?, booking_status = ? WHERE booking_id = ?',
-        ['Paid', 'Pending', bookingId]
-      );
-
-      await db.query(
-        'INSERT INTO booking_logs (booking_id, action, description, performed_by) VALUES (?, ?, ?, ?)',
-        [bookingId, 'Payment Received', `Payment completed via ${paymentIntentId}. Booking confirmed.`, 'System']
-      );
-
-      // 🎉 Step: Send confirmation email with QR code AFTER payment is confirmed
-      try {
-        console.log('📧 Sending booking confirmation email with QR code after payment...');
-
-        // Get booking details for email
-        const [bookings] = await db.query(
-          `SELECT b.booking_id, b.booking_reference, b.check_in_date, b.check_out_date, b.total,
-                  u.first_name, u.last_name, u.email
-           FROM bookings b
-           LEFT JOIN customers c ON b.customer_id = c.customer_id
-           LEFT JOIN user u ON c.user_id = u.user_id
-           WHERE b.booking_id = ?`,
-          [bookingId]
-        );
-
-        if (bookings.length > 0) {
-          const booking = bookings[0];
-
-          // Get booking items
-          const [items] = await db.query(
-            `SELECT bi.quantity as qty, bi.unit_price as price, bi.item_name as name, bi.item_type as category
-             FROM booking_items bi
-             WHERE bi.booking_id = ?`,
-            [bookingId]
-          );
-
-          // Generate QR code for paid booking
-          let qrCodeData = null;
-          try {
-            const formattedQRData = formatBookingDataForQR(
-              {
-                booking_reference: booking.booking_reference,
-                first_name: booking.first_name,
-                last_name: booking.last_name
-              },
-              items.map(item => ({
-                item_name: item.name,
-                quantity: item.qty,
-                item_type: item.category || 'Room'
-              }))
-            );
-            qrCodeData = await generateQRCode(formattedQRData);
-            console.log('✅ QR code generated for payment confirmation');
-          } catch (qrError) {
-            console.warn('⚠️ QR code generation failed:', qrError.message);
-          }
-
-          // Send email with QR
-          const emailData = {
-            email: booking.email,
-            firstName: booking.first_name,
-            lastName: booking.last_name,
-            bookingReference: booking.booking_reference,
-            checkIn: booking.check_in_date,
-            checkOut: booking.check_out_date,
-            items: items.map(item => ({
-              name: item.name,
-              qty: item.qty,
-              price: item.price
-            })),
-            total: booking.total
-          };
-
-          await sendBookingConfirmationWithQR(emailData, qrCodeData?.base64 || null);
-          console.log('✅ Confirmation email with QR sent successfully');
-        }
-      } catch (emailError) {
-        console.warn('⚠️ Email sending failed after payment:', emailError.message);
-        // Don't fail the payment update if email fails
-      }
-    }
-
-    res.json({
-      success: true,
-      message: 'Payment status updated',
-      affected: result.affectedRows
-    });
-
-  } catch (error) {
-    console.error('Update payment error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update payment status',
-      details: error.message
-    });
-  }
-};
-
-/**
  * Get Booking Details with Customer and Payment Info
  * GET /api/bookings/:id/details
  */
 export const getBookingDetails = async (req, res) => {
   try {
-    const { id } = req.params;
+    const bookingId = req.params.id;
 
-    // Get booking with customer info
+    const hasAccess = await assertBookingAccess(req, res, bookingId);
+    if (!hasAccess) return;
+
     const [bookings] = await db.query(
       `SELECT 
         b.*,
@@ -815,9 +1216,9 @@ export const getBookingDetails = async (req, res) => {
         p.paid_at, p.checkout_url
       FROM bookings b
       LEFT JOIN customers c ON b.customer_id = c.customer_id
-      LEFT JOIN payments p ON b.id = p.booking_id
-      WHERE b.id = ?`,
-      [id]
+      LEFT JOIN payments p ON p.booking_id = b.booking_id
+      WHERE b.booking_id = ?`,
+      [bookingId]
     );
 
     if (bookings.length === 0) {
@@ -832,7 +1233,7 @@ export const getBookingDetails = async (req, res) => {
       FROM booking_items bi
       LEFT JOIN inventory_items i ON bi.item_id = i.item_id
       WHERE bi.booking_id = ?`,
-      [id]
+      [bookingId]
     );
 
     res.json({

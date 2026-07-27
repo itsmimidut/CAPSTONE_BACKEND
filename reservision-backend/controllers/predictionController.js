@@ -2,6 +2,12 @@ import { db } from "../config/db.js";
 import { execFile } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
+import { getForecastReadiness } from "../services/predictionModelService.js";
+import {
+  buildForecastRecommendations,
+  computeForecastSummary,
+  toLegacyPromoSuggestion,
+} from "../services/forecastRecommendationService.js";
 
 /**
  * ============================================================
@@ -66,16 +72,6 @@ function daysBetween(start, end) {
   return Math.floor((e - s) / 86400000);
 }
 
-function sanitizePromoSuggestion(suggestion) {
-  return {
-    demand_level: sanitizeText(suggestion.demand_level),
-    title: sanitizeText(suggestion.title),
-    type: sanitizeText(suggestion.type),
-    description: sanitizeText(suggestion.description),
-    action: sanitizeText(suggestion.action),
-  };
-}
-
 function average(values = []) {
   if (!values.length) return 0;
   return values.reduce((sum, value) => sum + Number(value || 0), 0) / values.length;
@@ -84,15 +80,20 @@ function average(values = []) {
 async function getHistoricalAverageBookings(days = 30) {
   const safeDays = Math.max(7, Math.min(Number(days || 30), 365));
 
-  // Safe query: placeholders prevent SQL injection
+  // Use the same validated arrival-demand dataset that trains Prophet.
+  // This includes zero-demand calendar dates and avoids mixing booking-created
+  // dates with the model's arrival-date target.
   const [rows] = await db.query(
     `
-    SELECT DATE(created_at) AS booking_day, COUNT(*) AS bookings
-    FROM bookings
-    WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-      AND booking_status IN ('Confirmed', 'Checked-In', 'Checked-Out')
-    GROUP BY DATE(created_at)
-    ORDER BY booking_day ASC
+    SELECT
+      DATE_FORMAT(demand_date, '%Y-%m-%d') AS booking_day,
+      bookings
+    FROM booking_demand_daily
+    WHERE demand_date > DATE_SUB(
+      (SELECT MAX(demand_date) FROM booking_demand_daily),
+      INTERVAL ? DAY
+    )
+    ORDER BY demand_date ASC
     `,
     [safeDays]
   );
@@ -113,107 +114,6 @@ async function getHistoricalAverageBookings(days = 30) {
     peak: Math.max(...totals),
     min: Math.min(...totals),
   };
-}
-
-function buildPromoSuggestion(rows, baselineAvg = 0) {
-  const next7 = Array.isArray(rows) ? rows.slice(0, 7) : [];
-  const totals = next7.map((row) => Number(row.predicted_bookings || 0));
-
-  const total7 = totals.reduce((sum, value) => sum + value, 0);
-  const avg7 = next7.length ? total7 / next7.length : 0;
-  const peak7 = totals.length ? Math.max(...totals) : 0;
-  const min7 = totals.length ? Math.min(...totals) : 0;
-
-  const weekendDays = next7.filter((row) => {
-    const d = new Date(`${row.date}T00:00:00`);
-    const day = d.getDay();
-    return day === 0 || day === 6;
-  });
-
-  const weekendAvg =
-    weekendDays.length > 0
-      ? weekendDays.reduce((sum, row) => sum + Number(row.predicted_bookings || 0), 0) / weekendDays.length
-      : 0;
-
-  let suggestion;
-
-  // Best logic: compare forecast to recent real baseline
-  if (baselineAvg > 0) {
-    const ratio = avg7 / baselineAvg;
-
-    if (ratio < 0.85) {
-      suggestion = {
-        demand_level: "Low",
-        title: "Recovery Discount Promo",
-        type: "Discount",
-        description: `Forecasted demand is below your recent booking baseline. Expected average is ${Math.round(avg7)} versus recent average of ${Math.round(baselineAvg)}.`,
-        action: "Offer 10% to 15% off on weekday bookings, add free swimming access, or push cottage promos to recover demand."
-      };
-    } else if (ratio <= 1.15) {
-      suggestion = {
-        demand_level: "Medium",
-        title: "Bundle Value Promo",
-        type: "Bundle",
-        description: `Forecasted demand is close to your normal booking level. Expected average is ${Math.round(avg7)} and recent average is ${Math.round(baselineAvg)}.`,
-        action: "Offer family bundles, meal add-ons, room-plus-swimming packages, or stay extensions to raise average transaction value."
-      };
-    } else if (weekendAvg >= baselineAvg * 1.2) {
-      suggestion = {
-        demand_level: "High",
-        title: "Weekend Premium Promo",
-        type: "Upsell",
-        description: `Weekend demand is stronger than usual. Weekend average is ${Math.round(weekendAvg)} while recent daily average is ${Math.round(baselineAvg)}.`,
-        action: "Avoid large discounts. Promote premium rooms, food packages, and weekend add-ons for high-intent guests."
-      };
-    } else {
-      suggestion = {
-        demand_level: "High",
-        title: "Upsell Premium Package",
-        type: "Upsell",
-        description: `Forecasted demand is above your recent baseline. Expected average is ${Math.round(avg7)} with peak of ${Math.round(peak7)} bookings.`,
-        action: "Avoid deep discounts. Focus on premium offers, upgrades, and add-ons to maximize revenue."
-      };
-    }
-
-    return sanitizePromoSuggestion(suggestion);
-  }
-
-  // Fallback if no historical baseline exists yet
-  if (avg7 < 25) {
-    suggestion = {
-      demand_level: "Low",
-      title: "Weekday Saver Promo",
-      type: "Discount",
-      description: `Expected demand is lower than usual with an average of ${Math.round(avg7)} bookings in the next 7 days.`,
-      action: "Offer 10% to 15% off on weekday bookings, cottage packages, or free swimming access to attract more reservations."
-    };
-  } else if (avg7 < 40) {
-    suggestion = {
-      demand_level: "Medium",
-      title: "Family Bundle Promo",
-      type: "Bundle",
-      description: `Expected demand is moderate with an average of ${Math.round(avg7)} bookings in the next 7 days.`,
-      action: "Offer family bundles, meal add-ons, or room-plus-swimming packages to increase average transaction value."
-    };
-  } else if (weekendAvg >= 45) {
-    suggestion = {
-      demand_level: "High",
-      title: "Weekend Premium Promo",
-      type: "Upsell",
-      description: `Weekend demand is especially strong, averaging ${Math.round(weekendAvg)} bookings.`,
-      action: "Avoid large discounts. Push premium rooms, cottages with add-ons, and food bundles for weekend guests."
-    };
-  } else {
-    suggestion = {
-      demand_level: "High",
-      title: "Upsell Premium Package",
-      type: "Upsell",
-      description: `Strong demand is expected with an average of ${Math.round(avg7)} bookings and peak of ${Math.round(peak7)} bookings.`,
-      action: "Avoid deep discounts. Promote premium rooms, add-ons, and food packages to maximize revenue."
-    };
-  }
-
-  return sanitizePromoSuggestion(suggestion);
 }
 
 function runPython(args) {
@@ -251,22 +151,33 @@ export const predictTomorrowBookings = async (req, res) => {
 
     if (!rows.length) {
       return res.json({
+        method: "7_day_rolling_average",
+        label: "Recent 7-day average (descriptive baseline, not a model forecast)",
+        average_bookings: 0,
         prediction: 0,
+        days_included: 0,
         details: [],
+        note: "Use GET /prediction/forecast-range for Prophet model forecasts.",
       });
     }
 
     const total = rows.reduce((sum, r) => sum + Number(r.bookings || 0), 0);
     const avg = total / rows.length;
+    const roundedAvg = Math.round(avg);
 
     return res.json({
-      prediction: Math.round(avg),
+      method: "7_day_rolling_average",
+      label: "Recent 7-day average (descriptive baseline, not a model forecast)",
+      average_bookings: roundedAvg,
+      prediction: roundedAvg,
+      days_included: rows.length,
       details: rows,
+      note: "Use GET /prediction/forecast-range for Prophet model forecasts.",
     });
   } catch (error) {
     console.error("Prediction error:", error);
     return res.status(500).json({
-      error: "Prediction failed",
+      error: "Failed to compute recent booking average",
     });
   }
 };
@@ -278,6 +189,9 @@ export const predictTomorrowBookings = async (req, res) => {
  */
 export const predictDate = async (req, res) => {
   try {
+    const readinessState = await ensureForecastReady(res);
+    if (!readinessState) return;
+
     const date = sanitizeText(req.query.date || "");
     const check = ensureFutureOnlyYMD(date);
 
@@ -287,7 +201,10 @@ export const predictDate = async (req, res) => {
 
     const result = await runPython(["date", date]);
 
-    return res.json(result);
+    return res.json({
+      ...result,
+      model_metadata: result?.model_metadata || readinessState.model?.metadata || null,
+    });
   } catch (error) {
     console.error("predict-date error:", error);
     return res.status(500).json({
@@ -299,81 +216,138 @@ export const predictDate = async (req, res) => {
 
 /**
  * ============================================================
- * PYTHON MODEL: RANGE + PROMO SUGGESTION
+ * PYTHON MODELS: RANGE (Phase 4) + PROMO SUGGESTION
  * ============================================================
  */
 export const forecastRange = async (req, res) => {
   try {
-    const start = sanitizeText(req.query.start || "");
-    const end = sanitizeText(req.query.end || "");
+    const readinessState = await ensureForecastReady(res);
+    if (!readinessState) return;
+
+    // Accept both legacy (start/end) and Phase 4 (startDate/endDate) params.
+    const start = sanitizeText(req.query.startDate || req.query.start || "");
+    const end = sanitizeText(req.query.endDate || req.query.end || "");
 
     const startCheck = ensureFutureOnlyYMD(start);
     if (!startCheck.ok) {
-      return res.status(400).json({ message: startCheck.message, promo_suggestion: fallbackPromoSuggestion() });
+      return res.status(400).json({ success: false, message: startCheck.message, promo_suggestion: fallbackPromoSuggestion() });
     }
 
     const endCheck = ensureFutureOnlyYMD(end);
     if (!endCheck.ok) {
-      return res.status(400).json({ message: endCheck.message, promo_suggestion: fallbackPromoSuggestion() });
+      return res.status(400).json({ success: false, message: endCheck.message, promo_suggestion: fallbackPromoSuggestion() });
     }
 
-    if (end < start) {
-      return res.status(400).json({
-        message: "end must be greater than or equal to start",
-        promo_suggestion: fallbackPromoSuggestion()
-      });
-    }
-
-    const rangeDays = daysBetween(start, end);
-    if (rangeDays > 365) {
-      return res.status(400).json({
-        message: "Date range cannot exceed 365 days.",
-        promo_suggestion: fallbackPromoSuggestion()
-      });
-    }
+    const { generateForecastRange } = await import('../services/predictionForecastService.js');
 
     let result;
     try {
-      result = await runPython(["range", start, end]);
+      result = await generateForecastRange({
+        startDate: start,
+        endDate: end,
+        allowHistorical: true,
+      });
     } catch (err) {
-      // If python fails, still return fallback promo suggestion
-      return res.status(500).json({
-        message: "Forecast failed (python error)",
-        error: sanitizeText(err.message),
-        promo_suggestion: fallbackPromoSuggestion()
+      const status = Number(err?.status) || 500;
+      return res.status(status >= 400 && status < 600 ? status : 500).json({
+        success: false,
+        code: err?.code || 'FORECAST_FAILED',
+        message: sanitizeText(err.message || 'Forecast failed'),
+        details: err?.details || null,
+        promo_suggestion: fallbackPromoSuggestion(),
       });
     }
 
-    const rows = Array.isArray(result?.rows)
-      ? result.rows.map((row) => ({
-          date: sanitizeText(row.date),
-          predicted_bookings: Number(row.predicted_bookings || 0),
-        }))
-      : [];
+    // Backward-compatible rows for the existing Vue dashboard.
+    const rows = result.forecasts.map((row) => ({
+      date: row.date,
+      predicted_bookings: row.predicted_bookings,
+      predicted_bookings_lower: row.bookings_lower,
+      predicted_bookings_upper: row.bookings_upper,
+      predicted_total_guests: row.predicted_total_guests,
+      guests_lower: row.guests_lower,
+      guests_upper: row.guests_upper,
+    }));
 
     // Dynamic baseline from real bookings
     let historical = { baselineAvg: 0, peak: 0, min: 0 };
     try {
       historical = await getHistoricalAverageBookings(30);
     } catch {}
-    let promoSuggestion = buildPromoSuggestion(rows, historical.baselineAvg);
-    if (!promoSuggestion || typeof promoSuggestion !== 'object') {
-      promoSuggestion = fallbackPromoSuggestion();
-    }
+    const metadata = readinessState.model?.metadata || {};
+    const guestMix = {
+      ...result.guest_mix,
+      minimum_coverage_pct: Number(
+        metadata.guest_mix_minimum_coverage_pct
+        ?? metadata.minimum_guest_mix_coverage_pct
+        ?? 70
+      ),
+    };
+    const summary = computeForecastSummary(result.forecasts);
+    const recommendations = buildForecastRecommendations({
+      forecasts: result.forecasts,
+      guestMix,
+      recentBaselineAverage: historical.baselineAvg,
+      now: toYMD(nowInManila()),
+    });
+    const promoSuggestion = toLegacyPromoSuggestion(recommendations);
+    const model = {
+      ...result.model,
+      date_from: metadata.date_from || null,
+      date_to: metadata.date_to || null,
+      minimum_training_days: metadata.minimum_training_days || null,
+      data_source: metadata.data_source || null,
+      targets: metadata.targets || {},
+      metrics: {
+        mae: metadata.mae ?? metadata.targets?.bookings?.metrics?.mae ?? null,
+        rmse: metadata.rmse ?? metadata.targets?.bookings?.metrics?.rmse ?? null,
+        wape: metadata.wape ?? metadata.targets?.bookings?.metrics?.wape ?? null,
+        bias: metadata.bias ?? metadata.targets?.bookings?.metrics?.bias ?? null,
+        prediction_interval_coverage:
+          metadata.targets?.bookings?.metrics?.prediction_interval_coverage ?? null,
+      },
+      baseline_metrics: metadata.targets?.bookings?.baseline_metrics || null,
+      baseline_note: result.model?.baseline_note || metadata.baseline_note || null,
+    };
+    const limitations = [
+      ...(model.baseline_note
+        ? ['Current forecasts reflect the available historical dataset; the stored holdout note indicates limited recent arrival demand.']
+        : []),
+      ...(guestMix.ready
+        ? []
+        : [`Guest-category estimates are unavailable until reliable demographic coverage reaches ${guestMix.minimum_coverage_pct}%.`]),
+      'Recommendation rules do not currently account for verified room, activity, pool, or restaurant capacity.',
+      ...(model.baseline_note ? [model.baseline_note] : []),
+    ];
 
     return res.json({
+      success: true,
+      model,
+      forecast_range: result.forecast_range,
+      guest_mix: guestMix,
+      aggregate_interval_available: false,
+      summary,
+      forecasts: result.forecasts,
+      recommendations,
+      limitations,
+      generated_at: result.generated_at,
+      // Legacy fields kept for the current admin dashboard
       rows,
-      metrics: result?.metrics || null,
+      model_metadata: readinessState.model?.metadata || null,
       promo_suggestion: promoSuggestion,
       promo_context: {
         recent_baseline_avg: Math.round(historical.baselineAvg || 0),
         recent_peak: Math.round(historical.peak || 0),
         recent_min: Math.round(historical.min || 0),
       },
+      forecast_disclaimer:
+        "Point forecasts include Prophet confidence intervals. Do not sum daily lower/upper bounds into weekly or monthly intervals.",
+      readiness: readinessState.readiness,
     });
   } catch (error) {
     console.error("forecast-range error:", error);
     return res.status(500).json({
+      success: false,
       message: "Forecast failed",
       error: sanitizeText(error.message),
       promo_suggestion: fallbackPromoSuggestion()
@@ -384,11 +358,26 @@ export const forecastRange = async (req, res) => {
 function fallbackPromoSuggestion() {
   return {
     demand_level: "N/A",
-    title: "No Suggestion",
-    type: "N/A",
-    description: "Promo suggestion could not be generated.",
-    action: "Check backend logic or data."
+    headline: "No suggestions available",
+    description: "Rule-based suggestions could not be generated.",
+    actions: ["Check backend logic or data."],
   };
+}
+
+async function ensureForecastReady(res) {
+  const readiness = await getForecastReadiness();
+  if (!readiness.safe_for_live_use) {
+    res.status(422).json({
+      success: false,
+      code: readiness.code || "FORECAST_NOT_READY",
+      message: readiness.message,
+      readiness: readiness.readiness,
+      model: readiness.model,
+      training: readiness.training,
+    });
+    return null;
+  }
+  return readiness;
 }
 
 
@@ -514,4 +503,167 @@ export const predictionPing = async (req, res) => {
     min_allowed_date: minAllowedDateYMD(),
     python_script: PY_SCRIPT,
   });
+};
+
+export const getPredictionReadiness = async (req, res) => {
+  try {
+    const readiness = await getForecastReadiness();
+    return res.json({
+      success: readiness.safe_for_live_use,
+      ...readiness,
+    });
+  } catch (error) {
+    console.error("prediction/readiness error:", error);
+    return res.status(500).json({
+      success: false,
+      code: "READINESS_CHECK_FAILED",
+      message: "Failed to check forecast readiness",
+      error: sanitizeText(error.message),
+    });
+  }
+};
+
+/**
+ * Phase 2 only: rebuild the validated booking_demand_daily dataset.
+ * This endpoint never trains or replaces a model.
+ */
+export const syncBookingDemandDataset = async (req, res) => {
+  try {
+    const includeConfirmedFallback = String(
+      req.query.includeConfirmedFallback ?? 'false'
+    ).toLowerCase() === 'true';
+    const { syncBookingDemandDaily } = await import(
+      '../services/predictionTrainingService.js'
+    );
+    const result = await syncBookingDemandDaily({ includeConfirmedFallback });
+
+    return res.json({
+      success: true,
+      message: 'booking_demand_daily rebuilt and validated. No model training was started.',
+      ...result,
+    });
+  } catch (error) {
+    console.error('sync-booking-demand-dataset error:', error);
+    const validationFailure = error?.code === 'INVALID_BOOKING_DEMAND_DATASET';
+    return res.status(validationFailure ? 422 : 500).json({
+      success: false,
+      code: error?.code || 'BOOKING_DEMAND_SYNC_FAILED',
+      message: validationFailure
+        ? 'Booking demand dataset failed validation; the previous dataset was preserved.'
+        : 'Failed to build booking demand dataset.',
+      error: sanitizeText(error.message),
+      details: error?.details || null,
+    });
+  }
+};
+
+export const listBookingDemandDataset = async (req, res) => {
+  try {
+    const start = sanitizeText(req.query.start || '');
+    const end = sanitizeText(req.query.end || '');
+    const limit = Number(req.query.limit || 400);
+
+    if (start && !isValidYMD(start)) {
+      return res.status(400).json({
+        success: false,
+        message: 'start must use YYYY-MM-DD format.',
+      });
+    }
+    if (end && !isValidYMD(end)) {
+      return res.status(400).json({
+        success: false,
+        message: 'end must use YYYY-MM-DD format.',
+      });
+    }
+    if (start && end && start > end) {
+      return res.status(400).json({
+        success: false,
+        message: 'start must be on or before end.',
+      });
+    }
+
+    const { getBookingDemandDaily } = await import(
+      '../services/predictionTrainingService.js'
+    );
+    const rows = await getBookingDemandDaily({ start, end, limit });
+
+    return res.json({
+      success: true,
+      dataset: 'booking_demand_daily',
+      count: rows.length,
+      rows,
+    });
+  } catch (error) {
+    console.error('booking-demand-dataset list error:', error);
+    const notBuilt = error?.code === 'ER_NO_SUCH_TABLE';
+    return res.status(notBuilt ? 409 : 500).json({
+      success: false,
+      code: notBuilt ? 'BOOKING_DEMAND_DATASET_NOT_BUILT' : 'BOOKING_DEMAND_READ_FAILED',
+      message: notBuilt
+        ? 'booking_demand_daily has not been created yet. Run the Phase 2 sync first.'
+        : 'Failed to read booking demand dataset.',
+      error: sanitizeText(error.message),
+    });
+  }
+};
+
+export const syncTrainingData = async (req, res) => {
+  try {
+    const retrain = String(req.query.retrain ?? 'true').toLowerCase() !== 'false';
+    const { syncAndRetrainModel } = await import('../services/predictionTrainingService.js');
+    const result = await syncAndRetrainModel({ retrain });
+
+    return res.json({
+      success: true,
+      message: retrain
+        ? 'Training data synced and model retrain attempted.'
+        : 'Training data synced.',
+      ...result,
+    });
+  } catch (error) {
+    console.error('sync-training-data error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to sync training data',
+      error: sanitizeText(error.message),
+    });
+  }
+};
+
+/**
+ * Phase 3: train Prophet bookings + guests models from booking_demand_daily.
+ * Refuses to train when Phase 2 readiness requirements are not met.
+ */
+export const trainPredictionModels = async (req, res) => {
+  try {
+    const checkOnly = String(
+      req.query.checkOnly ?? req.body?.checkOnly ?? 'false'
+    ).toLowerCase() === 'true';
+    const testDays = Number(req.query.testDays ?? req.body?.testDays ?? 28);
+
+    const { trainForecastModels } = await import(
+      '../services/predictionTrainingService.js'
+    );
+    const result = await trainForecastModels({ checkOnly, testDays });
+
+    const status = result.ready ? 200 : 409;
+    return res.status(status).json({
+      success: result.ready,
+      message: result.ready
+        ? (checkOnly
+          ? 'Training readiness checks passed.'
+          : 'Forecast models trained and marked ready.')
+        : (result.message || 'Training Aborted'),
+      ...result,
+    });
+  } catch (error) {
+    console.error('prediction/train error:', error);
+    return res.status(500).json({
+      success: false,
+      ready: false,
+      blocking_reasons: [sanitizeText(error.message)],
+      message: 'Failed to run forecast model training',
+      error: sanitizeText(error.message),
+    });
+  }
 };

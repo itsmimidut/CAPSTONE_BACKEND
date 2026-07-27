@@ -42,22 +42,31 @@ import {
 } from "../controllers/bookingsController.js";
 import {
   createBookingConfirmation,
-  updatePaymentStatus,
   getBookingDetails
 } from "../controllers/bookingConfirmationController.js";
+import { bookingConfirmLimiter, bookingLookupLimiter } from "../middleware/rateLimiters.js";
+import { handleValidationErrors } from "../middleware/validate.js";
+import {
+  bookingConfirmValidators,
+  bookingUpdateValidators,
+} from "../middleware/validators/bookingValidators.js";
 
 const router = express.Router();
 
 // Admin reservations endpoint (must be before /:id routes)
+// ⚠️  Staff/Admin only (auth applied globally, admin check in middleware)
 router.get("/admin/reservations", getAdminReservations);
 
 // Customer booking history by customer ID
+// ⚠️ Customer only (authenticated users)
 router.get("/customer/:customerId/history", getCustomerBookingHistory);
 
 // Customer booking history by user_id (most reliable — uses logged-in user's ID)
+// ⚠️ Customer only (authenticated users)
 router.get("/user/:userId/history", getBookingHistoryByUserId);
 
 // Customer booking history by email (fallback)
+// ⚠️ Customer only (authenticated users)
 router.get("/email/:email/history", getBookingHistoryByEmail);
 
 // Get active checked-in stay for customer (for E-Shop delivery location)
@@ -67,6 +76,7 @@ router.get("/customer/:userId/active-stay", getCustomerActiveStay);
 router.get("/customer/:userId/current-room", getCustomerCurrentRoom);
 
 // Get all bookings
+// ⚠️ Staff/Admin only (auth applied globally, staff check in middleware)
 router.get("/", getBookings);
 
 // Get all occupied dates
@@ -78,8 +88,11 @@ router.get("/occupied-dates/:itemId", getOccupiedDates);
 // Get booking by reference
 router.get("/reference/:reference", getBookingByReference);
 
-// Get QR code for booking (must be before /:id route)
-router.get("/qr/:bookingReference", getBookingQRCode);
+// Staff check-in validation (staff auth enforced by middleware)
+router.get("/validate/:bookingReference", bookingLookupLimiter, validateBookingForCheckIn);
+
+// Get QR code for booking — authenticated owner or staff only
+router.get("/qr/:bookingReference", bookingLookupLimiter, getBookingQRCode);
 
 // Get booking details with customer and payment info
 router.get("/:id/details", getBookingDetails);
@@ -88,30 +101,31 @@ router.get("/:id/details", getBookingDetails);
 router.get("/:id", getBooking);
 
 // Create complete booking with customer and payment (Booking Confirmation Page)
-router.post("/confirm", createBookingConfirmation);
-
-// Update payment status (Called by PayMongo webhook or frontend after payment)
-router.post("/update-payment", updatePaymentStatus);
+// ✅ Public route (allowed by middleware) — unauthenticated customers can confirm
+router.post("/confirm", bookingConfirmLimiter, bookingConfirmValidators, handleValidationErrors, createBookingConfirmation);
 
 // Create new booking
+// ✅ Public route (allowed by middleware) — unauthenticated customers can create
 router.post("/", createBooking);
 
 // Create booking with auto-assigned room (grouped room selection)
+// ✅ Public route (allowed by middleware) — unauthenticated customers can create
 router.post("/with-auto-assign", createBookingWithAutoAssign);
 
 // Update booking
-router.put("/:id", updateBooking);
+// ⚠️ Staff/Admin only (auth applied globally, staff check in middleware)
+router.put("/:id", bookingUpdateValidators, handleValidationErrors, updateBooking);
 
 // Cancel/delete booking
+// ⚠️ Staff/Admin only (auth applied globally, staff check in middleware)
 router.delete("/:id", deleteBooking);
 
-// Validate booking for check-in/check-out
-router.get("/validate/:bookingReference", validateBookingForCheckIn);
-
 // Process guest check-in
+// ⚠️ Staff/Admin only (auth applied globally, staff check in middleware)
 router.post("/:bookingId/check-in", processCheckIn);
 
 // Process guest check-out
+// ⚠️ Staff/Admin only (auth applied globally, staff check in middleware)
 router.post("/:bookingId/check-out", processCheckOut);
 
 export default router;

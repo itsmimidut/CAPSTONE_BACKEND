@@ -43,6 +43,22 @@ const findRateForAge = (age, dayType, rates) => {
     return adultRate;
 };
 
+const findRateForCategory = (category, age, dayType, rates) => {
+    const aliases = {
+        adult: ['adult'],
+        child: ['child', 'kid', 'teen'],
+        senior: ['senior'],
+    };
+    const names = aliases[category] || [category];
+    const namedRate = rates.find((rate) => {
+        const name = String(rate.name || '').toLowerCase();
+        return rate.day_type === dayType
+            && rate.status === 'active'
+            && names.some((alias) => name.includes(alias));
+    });
+    return namedRate || findRateForAge(age, dayType, rates);
+};
+
 /**
  * Compute total entrance fee for a reservation
  * 
@@ -67,6 +83,7 @@ export const computeEntranceFee = async (input) => {
     try {
         const { adults = 0, children = 0, seniors = 0, date } = input;
         let rates = input.rates;
+        const connection = input.connection || db;
 
         // Validate input
         if (!date) {
@@ -85,7 +102,7 @@ export const computeEntranceFee = async (input) => {
 
         // Fetch rates if not provided
         if (!rates) {
-            const [fetchedRates] = await db.query(
+            const [fetchedRates] = await connection.query(
                 `SELECT * FROM entrance_rates WHERE status = 'active' ORDER BY age_min ASC`
             );
             rates = fetchedRates;
@@ -94,9 +111,9 @@ export const computeEntranceFee = async (input) => {
         const dayType = detectDayType(date);
 
         // Find rates for each category
-        const adultRate = findRateForAge(35, dayType, rates); // Default adult age
-        const childRate = findRateForAge(10, dayType, rates); // Default child age
-        const seniorRate = findRateForAge(65, dayType, rates); // Default senior age
+        const adultRate = findRateForCategory('adult', 35, dayType, rates);
+        const childRate = findRateForCategory('child', 10, dayType, rates);
+        const seniorRate = findRateForCategory('senior', 65, dayType, rates);
 
         // Calculate total
         const adultFee = adults * (adultRate?.price || 0);
@@ -127,6 +144,70 @@ export const computeEntranceFee = async (input) => {
             error: error.message
         };
     }
+};
+
+const getItemGuestBreakdown = (item = {}) => {
+    const nested = item.guest_breakdown || item.guestBreakdown || {};
+    return {
+        adults: Number(item.adults ?? nested.adults ?? 0),
+        children: Number(item.children ?? nested.children ?? 0),
+        seniors: Number(item.seniors ?? nested.seniors ?? 0),
+    };
+};
+
+const getItemEntranceDate = (item = {}, defaultDate = null) => (
+    item.booking_date
+    || item.bookingDate
+    || item.check_in_date
+    || item.checkIn
+    || item.swimmingDetails?.sessionDates?.[0]
+    || item.swimmingDetails?.dates?.[0]
+    || defaultDate
+);
+
+export const computeEntranceFeeForBookingItems = async ({
+    items = [],
+    defaultDate = null,
+    connection = null,
+} = {}) => {
+    const conn = connection || db;
+    const chargeableItems = (Array.isArray(items) ? items : []).filter((item) => {
+        const bookingType = String(
+            item.booking_type || item.bookingType || item.category_type || item.category || 'room'
+        ).toLowerCase();
+        return bookingType !== 'event';
+    });
+
+    let total = 0;
+    const breakdown = {
+        adults: { count: 0, subtotal: 0 },
+        children: { count: 0, subtotal: 0 },
+        seniors: { count: 0, subtotal: 0 },
+    };
+
+    for (const item of chargeableItems) {
+        const counts = getItemGuestBreakdown(item);
+        const date = getItemEntranceDate(item, defaultDate);
+        const result = await computeEntranceFee({
+            ...counts,
+            date,
+            connection: conn,
+        });
+
+        if (!result.success) return result;
+
+        total += Number(result.total || 0);
+        for (const category of ['adults', 'children', 'seniors']) {
+            breakdown[category].count += Number(result.breakdown[category].count || 0);
+            breakdown[category].subtotal += Number(result.breakdown[category].subtotal || 0);
+        }
+    }
+
+    return {
+        success: true,
+        total: Math.round((total + Number.EPSILON) * 100) / 100,
+        breakdown,
+    };
 };
 
 export default computeEntranceFee;

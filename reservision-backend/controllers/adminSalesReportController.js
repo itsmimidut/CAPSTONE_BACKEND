@@ -14,6 +14,9 @@
  */
 
 import db from '../config/db.js';
+import { validateSalesReportQuery, inferChartPeriod } from '../utils/salesReportQueryValidation.js';
+import { getSalesReportTransactions } from '../services/salesReportTransactionService.js';
+import { buildTransactionCsv } from '../services/salesReportCsvService.js';
 
 const formatDate = (value) => {
     if (!value) return null;
@@ -64,11 +67,37 @@ const getDateRange = (period, date, from_date, to_date) => {
         throw new Error('Invalid date range provided');
     }
 
+    const resolvedPeriod = (period || '').toLowerCase()
+        || (from_date && to_date ? inferChartPeriod(startDate, endDate) : 'month');
+
     return {
         start: startDate,
         end: endDate,
-        period: (period || 'month').toLowerCase()
+        period: resolvedPeriod
     };
+};
+
+const getPreviousDateRange = (start, end) => {
+    const startDate = new Date(`${start}T00:00:00`);
+    const endDate = new Date(`${end}T00:00:00`);
+    const diff = endDate.getTime() - startDate.getTime();
+
+    const prevEnd = new Date(startDate);
+    prevEnd.setDate(prevEnd.getDate() - 1);
+
+    const prevStart = new Date(prevEnd.getTime() - diff);
+
+    return {
+        start: formatDate(prevStart),
+        end: formatDate(prevEnd),
+    };
+};
+
+const calcPercentTrend = (current, previous) => {
+    const currentValue = Number(current || 0);
+    const previousValue = Number(previous || 0);
+    if (previousValue <= 0) return null;
+    return Number((((currentValue - previousValue) / previousValue) * 100).toFixed(1));
 };
 
 const getChannelClauses = (channel, target) => {
@@ -100,11 +129,174 @@ const getChannelClauses = (channel, target) => {
 };
 
 const normalizeReportChannel = (channel) => {
-    const normalized = (channel || '').toLowerCase();
-    if (normalized === 'reservations') return 'reservations';
-    if (normalized === 'pos') return 'pos';
+    const normalized = (channel || 'all').toLowerCase();
+    if (normalized === 'reservations' || normalized === 'reservation') return 'reservation';
+    if (normalized === 'pos' || normalized === 'restaurant' || normalized === 'restaurant_pos') return 'restaurant_pos';
+    if (normalized === 'restaurant_online') return 'restaurant_online';
     if (normalized === 'e-shop' || normalized === 'eshop') return 'eshop';
-    return normalized;
+    return normalized || 'all';
+};
+
+const buildBookingPaymentStatusClause = (payment_status, legacy = false) => {
+    const normalized = (payment_status || (legacy ? 'paid' : 'revenue')).toLowerCase();
+    if (normalized === 'all') return null;
+
+    if (normalized === 'revenue' || (legacy && normalized === 'paid')) {
+        return `(
+            LOWER(COALESCE(b.payment_status, '')) IN ('paid', 'partially refunded', 'refunded')
+            OR EXISTS (
+                SELECT 1
+                FROM payments p
+                WHERE p.booking_id = b.booking_id
+                  AND LOWER(COALESCE(p.status, '')) IN ('paid', 'settled', 'completed', 'success')
+            )
+        )`;
+    }
+
+    const statusMap = {
+        paid: "LOWER(COALESCE(b.payment_status, '')) = 'paid'",
+        partially_refunded: "LOWER(COALESCE(b.payment_status, '')) = 'partially refunded'",
+        refunded: "LOWER(COALESCE(b.payment_status, '')) = 'refunded'",
+        pending: "LOWER(COALESCE(b.payment_status, '')) IN ('pending', 'unpaid', 'partially paid')",
+        failed: "LOWER(COALESCE(b.payment_status, '')) = 'failed'",
+        expired: "LOWER(COALESCE(b.payment_status, '')) = 'expired'",
+    };
+
+    return statusMap[normalized] || null;
+};
+
+const buildPosPaymentStatusClause = (payment_status, legacy = false) => {
+    const normalized = (payment_status || (legacy ? 'paid' : 'revenue')).toLowerCase();
+    if (normalized === 'all') return null;
+
+    if (normalized === 'revenue' || (legacy && normalized === 'paid')) {
+        return "UPPER(COALESCE(pt.payment_status, 'PAID')) IN ('PAID')";
+    }
+
+    const statusMap = {
+        paid: "UPPER(COALESCE(pt.payment_status, '')) = 'PAID'",
+        partially_refunded: "UPPER(COALESCE(pt.payment_status, '')) IN ('PARTIALLY_REFUNDED', 'PARTIAL_REFUND')",
+        refunded: "UPPER(COALESCE(pt.payment_status, '')) = 'REFUNDED'",
+        pending: "UPPER(COALESCE(pt.payment_status, '')) = 'PENDING'",
+        failed: "UPPER(COALESCE(pt.payment_status, '')) = 'FAILED'",
+        expired: "UPPER(COALESCE(pt.payment_status, '')) = 'EXPIRED'",
+        voided: "UPPER(COALESCE(pt.payment_status, '')) = 'VOIDED'",
+    };
+
+    return statusMap[normalized] || null;
+};
+
+const buildBookingTransactionStatusClause = (transaction_status) => {
+    const normalized = (transaction_status || 'all').toLowerCase();
+    if (normalized === 'all') return null;
+
+    const statusExpr = "LOWER(REPLACE(COALESCE(b.booking_status, ''), '-', '_'))";
+    const statusMap = {
+        pending: `${statusExpr} = 'pending'`,
+        confirmed: `${statusExpr} = 'confirmed'`,
+        in_progress: `${statusExpr} IN ('checked_in', 'in_progress')`,
+        completed: `${statusExpr} IN ('checked_out', 'completed')`,
+        cancelled: `${statusExpr} = 'cancelled'`,
+        no_show: `${statusExpr} IN ('no_show', 'noshow')`,
+        voided: `${statusExpr} = 'voided'`,
+    };
+
+    return statusMap[normalized] || null;
+};
+
+const buildPosTransactionStatusClause = (transaction_status) => {
+    const normalized = (transaction_status || 'all').toLowerCase();
+    if (normalized === 'all') return null;
+
+    if (normalized === 'voided') {
+        return "UPPER(COALESCE(pt.transaction_status, '')) = 'VOIDED' OR UPPER(COALESCE(pt.payment_status, '')) = 'VOIDED'";
+    }
+
+    if (normalized === 'cancelled') {
+        return "UPPER(COALESCE(pt.transaction_status, '')) = 'VOIDED'";
+    }
+
+    if (normalized === 'pending') {
+        return "UPPER(COALESCE(pt.transaction_status, 'ACTIVE')) = 'ACTIVE' AND UPPER(COALESCE(pt.payment_status, 'PENDING')) = 'PENDING'";
+    }
+
+    if (normalized === 'completed') {
+        return "UPPER(COALESCE(pt.transaction_status, 'ACTIVE')) = 'ACTIVE' AND UPPER(COALESCE(pt.payment_status, 'PAID')) = 'PAID'";
+    }
+
+    if (normalized === 'in_progress') {
+        return "UPPER(COALESCE(pt.transaction_status, 'ACTIVE')) = 'ACTIVE'";
+    }
+
+    return null;
+};
+
+const buildCanonicalPaymentMethodClause = (field, payment_method, params) => {
+    const normalized = (payment_method || 'all').toLowerCase();
+    if (!normalized || normalized === 'all') return null;
+
+    if (normalized === 'cash') {
+        params.push('Cash');
+        return `${field} = ?`;
+    }
+
+    if (normalized === 'gcash') {
+        params.push('GCash');
+        return `${field} = ?`;
+    }
+
+    if (normalized === 'card') {
+        return `${field} IN ('Credit Card', 'Debit Card', 'Card')`;
+    }
+
+    if (normalized === 'bank_transfer') {
+        params.push('Bank Transfer');
+        return `${field} = ?`;
+    }
+
+    if (normalized === 'other') {
+        return `${field} NOT IN ('Cash', 'GCash', 'Maya', 'PayMaya', 'Credit Card', 'Debit Card', 'Card', 'Bank Transfer')`;
+    }
+
+    return buildPaymentClause(field, payment_method, params);
+};
+
+const buildBookingSearchClause = (search, params) => {
+    if (!search) return null;
+    const searchTerm = `%${search}%`;
+    params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    return `(
+        b.booking_reference LIKE ?
+        OR COALESCE(c.first_name, '') LIKE ?
+        OR COALESCE(c.last_name, '') LIKE ?
+        OR COALESCE(c.email, '') LIKE ?
+        OR COALESCE(u.email, '') LIKE ?
+        OR EXISTS (
+            SELECT 1
+            FROM booking_items bi_search
+            WHERE bi_search.booking_id = b.booking_id
+              AND bi_search.item_name LIKE ?
+        )
+    )`;
+};
+
+const buildPosSearchClause = (search, params) => {
+    if (!search) return null;
+    const searchTerm = `%${search}%`;
+    params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    return `(
+        COALESCE(pt.receipt_no, '') LIKE ?
+        OR CAST(pt.id AS CHAR) LIKE ?
+        OR COALESCE(u.first_name, '') LIKE ?
+        OR COALESCE(u.last_name, '') LIKE ?
+        OR COALESCE(u.email, '') LIKE ?
+        OR EXISTS (
+            SELECT 1
+            FROM pos_transaction_items pti_search
+            WHERE pti_search.transaction_id = pt.id
+              AND COALESCE(pti_search.item_name, '') LIKE ?
+        )
+    )`;
 };
 
 const buildFilter = ({ channel, payment_method, target }) => {
@@ -242,51 +434,107 @@ const buildDateClause = (alias) => {
     return `DATE(COALESCE(${alias}.transaction_date, ${alias}.created_at)) BETWEEN ? AND ?`;
 };
 
-const buildSalesAnalyticsFilters = ({ channel, payment_method, type }) => {
+const buildSalesAnalyticsFilters = ({
+    channel,
+    payment_method,
+    payment_status = 'revenue',
+    transaction_status = 'all',
+    search = '',
+    type,
+    legacy = false,
+}) => {
     const where = ['1 = 1'];
     const params = [];
+    const normalizedChannel = normalizeReportChannel(channel);
 
     if (type === 'bookings') {
-        where.push("b.booking_status != 'Cancelled'");
-        where.push("b.payment_status = 'Paid'");
-        if (channel && channel !== 'reservations' && channel !== 'all') {
+        if (normalizedChannel !== 'reservation' && normalizedChannel !== 'all') {
             where.push('0');
         }
-        const paymentClause = buildPaymentClause('b.payment_method', payment_method, params);
+
+        if (!legacy || transaction_status === 'all') {
+            const bookingStatusClause = buildBookingTransactionStatusClause(transaction_status);
+            if (bookingStatusClause) where.push(bookingStatusClause);
+        } else {
+            where.push("b.booking_status != 'Cancelled'");
+        }
+
+        const paymentStatusClause = buildBookingPaymentStatusClause(payment_status, legacy);
+        if (paymentStatusClause) where.push(paymentStatusClause);
+
+        const paymentClause = buildCanonicalPaymentMethodClause('b.payment_method', payment_method, params);
         if (paymentClause) where.push(paymentClause);
+
+        const searchClause = buildBookingSearchClause(search, params);
+        if (searchClause) where.push(searchClause);
     }
 
     if (type === 'pos') {
         where.push('COALESCE(pt.type, "") NOT IN ("E-Shop","Delivery")');
         where.push('pti.menu_id IS NULL');
-        if (channel && channel !== 'pos' && channel !== 'all') {
+
+        if (normalizedChannel !== 'restaurant_pos' && normalizedChannel !== 'all') {
             where.push('0');
         }
-        const paymentClause = buildPaymentClause('pt.payment_method', payment_method, params);
+
+        const posStatusClause = buildPosTransactionStatusClause(transaction_status);
+        if (posStatusClause) where.push(posStatusClause);
+
+        const paymentStatusClause = buildPosPaymentStatusClause(payment_status, legacy);
+        if (paymentStatusClause) where.push(paymentStatusClause);
+
+        const paymentClause = buildCanonicalPaymentMethodClause('pt.payment_method', payment_method, params);
         if (paymentClause) where.push(paymentClause);
+
+        const searchClause = buildPosSearchClause(search, params);
+        if (searchClause) where.push(searchClause);
     }
 
     if (type === 'restaurant') {
         where.push('pti.menu_id IS NOT NULL');
-        if (channel && channel !== 'restaurant' && channel !== 'all') {
+
+        if (normalizedChannel !== 'restaurant_pos' && normalizedChannel !== 'all') {
             where.push('0');
         }
-        const paymentClause = buildPaymentClause('pt.payment_method', payment_method, params);
+
+        const posStatusClause = buildPosTransactionStatusClause(transaction_status);
+        if (posStatusClause) where.push(posStatusClause);
+
+        const paymentStatusClause = buildPosPaymentStatusClause(payment_status, legacy);
+        if (paymentStatusClause) where.push(paymentStatusClause);
+
+        const paymentClause = buildCanonicalPaymentMethodClause('pt.payment_method', payment_method, params);
         if (paymentClause) where.push(paymentClause);
+
+        const searchClause = buildPosSearchClause(search, params);
+        if (searchClause) where.push(searchClause);
     }
 
     if (type === 'eshop') {
         where.push('pt.type IN ("E-Shop","Delivery")');
-        if (channel && channel !== 'eshop' && channel !== 'all') {
+
+        if (normalizedChannel !== 'eshop' && normalizedChannel !== 'all') {
             where.push('0');
         }
-        const paymentClause = buildPaymentClause('pt.payment_method', payment_method, params);
+
+        const posStatusClause = buildPosTransactionStatusClause(transaction_status);
+        if (posStatusClause) where.push(posStatusClause);
+
+        const paymentStatusClause = buildPosPaymentStatusClause(payment_status, legacy);
+        if (paymentStatusClause) where.push(paymentStatusClause);
+
+        const paymentClause = buildCanonicalPaymentMethodClause('pt.payment_method', payment_method, params);
         if (paymentClause) where.push(paymentClause);
+
+        const searchClause = buildPosSearchClause(search, params);
+        if (searchClause) where.push(searchClause);
     }
 
     return {
         clause: where.filter(Boolean).join(' AND '),
-        params
+        params,
+        requiresCustomerJoin: Boolean(search),
+        requiresUserJoin: Boolean(search),
     };
 };
 
@@ -301,13 +549,42 @@ const getPeriodExpression = (period, alias) => {
     }
 };
 
-const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, payment_method }) => {
+const querySalesAnalytics = async ({
+    period,
+    date,
+    from_date,
+    to_date,
+    channel,
+    payment_method,
+    transaction_status = 'all',
+    payment_status = 'revenue',
+    search = '',
+    legacy = false,
+}) => {
     const dateRange = getDateRange(period, date, from_date, to_date);
     const normalizedChannel = normalizeReportChannel(channel);
-    const bookingFilter = buildSalesAnalyticsFilters({ channel: normalizedChannel, payment_method, type: 'bookings' });
-    const posFilter = buildSalesAnalyticsFilters({ channel: normalizedChannel, payment_method, type: 'pos' });
-    const restaurantFilter = buildSalesAnalyticsFilters({ channel: normalizedChannel, payment_method, type: 'restaurant' });
-    const eshopFilter = buildSalesAnalyticsFilters({ channel: normalizedChannel, payment_method, type: 'eshop' });
+    const filterOptions = {
+        channel: normalizedChannel,
+        payment_method,
+        payment_status,
+        transaction_status,
+        search,
+        legacy,
+    };
+
+    const bookingFilter = buildSalesAnalyticsFilters({ ...filterOptions, type: 'bookings' });
+    const posFilter = buildSalesAnalyticsFilters({ ...filterOptions, type: 'pos' });
+    const restaurantFilter = buildSalesAnalyticsFilters({ ...filterOptions, type: 'restaurant' });
+    const eshopFilter = buildSalesAnalyticsFilters({ ...filterOptions, type: 'eshop' });
+
+    const bookingJoins = [
+        bookingFilter.requiresCustomerJoin ? 'LEFT JOIN customers c ON c.customer_id = b.customer_id' : '',
+        bookingFilter.requiresUserJoin ? 'LEFT JOIN users u ON u.user_id = b.user_id' : '',
+    ].filter(Boolean).join('\n');
+
+    const posJoins = posFilter.requiresUserJoin || restaurantFilter.requiresUserJoin || eshopFilter.requiresUserJoin
+        ? 'LEFT JOIN users u ON u.user_id = pt.user_id'
+        : '';
 
     const dateParams = [dateRange.start, dateRange.end];
     const transactionDateClause = buildDateClause('pt');
@@ -316,6 +593,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
     const [bookingSummaryRows] = await db.query(
         `SELECT COALESCE(SUM(b.total), 0) AS reservation_sales, COUNT(*) AS reservation_count
        FROM bookings b
+       ${bookingJoins}
        WHERE ${bookingFilter.clause}
          AND ${bookingDateClause}`,
         [...bookingFilter.params, ...dateParams]
@@ -326,6 +604,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
               COUNT(DISTINCT pt.id) AS pos_transactions
              FROM pos_transaction_items pti
              JOIN pos_transactions pt ON pti.transaction_id = pt.id
+             ${posJoins}
              WHERE ${posFilter.clause}
                  AND ${transactionDateClause}`,
         [...posFilter.params, ...dateParams]
@@ -337,6 +616,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
              FROM pos_transaction_items pti
              JOIN pos_transactions pt ON pti.transaction_id = pt.id
              JOIN menu_items mi ON mi.menu_id = pti.menu_id
+             ${posJoins}
              WHERE ${restaurantFilter.clause}
                  AND ${transactionDateClause}`,
         [...restaurantFilter.params, ...dateParams]
@@ -347,6 +627,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
             COALESCE(SUM(pt.total_amount), 0) AS eshop_sales,
             COUNT(DISTINCT pt.id) AS eshop_orders
         FROM pos_transactions pt
+        ${posJoins}
         WHERE ${eshopFilter.clause}
         AND ${transactionDateClause}`,
         [...eshopFilter.params, ...dateParams]
@@ -361,6 +642,43 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
     const eshopSales = Number(eShopSummaryRows[0]?.eshop_sales || 0);
     const eshopOrders = Number(eShopSummaryRows[0]?.eshop_orders || 0);
     const grossSales = reservationSales + posSales + restaurantSales + eshopSales;
+
+    const previousRange = getPreviousDateRange(dateRange.start, dateRange.end);
+    const previousDateParams = [previousRange.start, previousRange.end];
+
+    const [prevRestaurantSummaryRows] = await db.query(
+        `SELECT COALESCE(SUM(COALESCE(pti.line_total, pti.quantity * COALESCE(pti.unit_price, 0))), 0) AS restaurant_sales
+             FROM pos_transaction_items pti
+             JOIN pos_transactions pt ON pti.transaction_id = pt.id
+             JOIN menu_items mi ON mi.menu_id = pti.menu_id
+             ${posJoins}
+             WHERE ${restaurantFilter.clause}
+                 AND ${transactionDateClause}`,
+        [...restaurantFilter.params, ...previousDateParams]
+    );
+
+    const [prevPosSummaryRows] = await db.query(
+        `SELECT COALESCE(SUM(COALESCE(pti.line_total, pti.quantity * COALESCE(pti.unit_price, 0))), 0) AS pos_sales
+             FROM pos_transaction_items pti
+             JOIN pos_transactions pt ON pti.transaction_id = pt.id
+             ${posJoins}
+             WHERE ${posFilter.clause}
+                 AND ${transactionDateClause}`,
+        [...posFilter.params, ...previousDateParams]
+    );
+
+    const [prevEshopSummaryRows] = await db.query(
+        `SELECT COALESCE(SUM(pt.total_amount), 0) AS eshop_sales
+        FROM pos_transactions pt
+        ${posJoins}
+        WHERE ${eshopFilter.clause}
+        AND ${transactionDateClause}`,
+        [...eshopFilter.params, ...previousDateParams]
+    );
+
+    const prevRestaurantSales = Number(prevRestaurantSummaryRows[0]?.restaurant_sales || 0);
+    const prevPosSales = Number(prevPosSummaryRows[0]?.pos_sales || 0);
+    const prevEshopSales = Number(prevEshopSummaryRows[0]?.eshop_sales || 0);
 
     const [refundRows] = await db.query(
         `SELECT COUNT(*) AS refund_count,
@@ -386,6 +704,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
         `SELECT ${bookingPeriodExpr} AS period,
                 COALESCE(SUM(b.total), 0) AS sales
        FROM bookings b
+       ${bookingJoins}
        WHERE ${bookingFilter.clause}
          AND ${bookingDateClause}
        GROUP BY period
@@ -398,6 +717,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
                 COALESCE(SUM(COALESCE(pti.line_total, pti.quantity * COALESCE(pti.unit_price, 0))), 0) AS sales
              FROM pos_transaction_items pti
              JOIN pos_transactions pt ON pti.transaction_id = pt.id
+             ${posJoins}
              WHERE ${posFilter.clause}
                  AND ${transactionDateClause}
        GROUP BY period
@@ -411,6 +731,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
              FROM pos_transaction_items pti
              JOIN pos_transactions pt ON pti.transaction_id = pt.id
              JOIN menu_items mi ON mi.menu_id = pti.menu_id
+             ${posJoins}
              WHERE ${restaurantFilter.clause}
                  AND ${transactionDateClause}
        GROUP BY period
@@ -423,6 +744,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
                 COALESCE(SUM(COALESCE(pti.line_total, pti.quantity * COALESCE(pti.unit_price, 0))), 0) AS sales
              FROM pos_transaction_items pti
              JOIN pos_transactions pt ON pti.transaction_id = pt.id
+             ${posJoins}
              WHERE ${eshopFilter.clause}
                  AND ${transactionDateClause}
        GROUP BY period
@@ -451,10 +773,11 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
                 COUNT(*) AS count
        FROM booking_items bi
        JOIN bookings b ON bi.booking_id = b.booking_id
-       WHERE b.booking_status != 'Cancelled'
-         AND DATE(b.created_at) BETWEEN ? AND ?
+       ${bookingJoins}
+       WHERE ${bookingFilter.clause}
+         AND ${bookingDateClause}
        GROUP BY bi.item_type`,
-        dateParams
+        [...bookingFilter.params, ...dateParams]
     );
 
     const categoryMap = new Map();
@@ -489,14 +812,9 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
             count: Number(categoryMap.get('swimming')?.count || 0)
         },
         {
-            category: 'POS',
-            revenue: posSales,
-            count: totalPosTransactions
-        },
-        {
-            category: 'Restaurant/Menu',
-            revenue: restaurantSales,
-            count: restaurantOrders
+            category: 'Restaurant POS',
+            revenue: posSales + restaurantSales,
+            count: totalPosTransactions + restaurantOrders
         },
         {
             category: 'E-Shop',
@@ -515,28 +833,62 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
                 COALESCE(SUM(b.total), 0) AS amount,
                 COUNT(*) AS count
        FROM bookings b
+       ${bookingJoins}
        WHERE ${bookingFilter.clause}
          AND ${bookingDateClause}
        GROUP BY b.payment_method`,
         [...bookingFilter.params, ...dateParams]
     );
 
-    // Build a pos-only payment summary filter (avoid referencing pti here)
-    const posPaymentWhere = ['1 = 1', 'COALESCE(pt.type, "") NOT IN ("E-Shop","Delivery")'];
-    const posPaymentParams = [];
-    const posPaymentMethodClause = buildPaymentClause('pt.payment_method', payment_method, posPaymentParams);
-    if (posPaymentMethodClause) posPaymentWhere.push(posPaymentMethodClause);
-    const posPaymentWhereClause = posPaymentWhere.join(' AND ');
+    // Payment summaries aggregate at transaction level, so the line-item alias
+    // used by the POS detail queries is not available here. Use EXISTS instead
+    // of joining items, which would multiply pt.total_amount for multi-item sales.
+    const posPaymentFilterClause = posFilter.clause.replace(
+        'pti.menu_id IS NULL',
+        `EXISTS (
+            SELECT 1
+            FROM pos_transaction_items pti_payment
+            WHERE pti_payment.transaction_id = pt.id
+              AND pti_payment.menu_id IS NULL
+        )`
+    );
 
     const [posPaymentRows] = await db.query(
         `SELECT pt.payment_method AS payment_method,
-                                COALESCE(SUM(pt.total_amount), 0) AS amount,
-                                COUNT(*) AS count
+                COALESCE(SUM(pt.total_amount), 0) AS amount,
+                COUNT(*) AS count
              FROM pos_transactions pt
-             WHERE ${posPaymentWhereClause}
+             ${posJoins}
+             WHERE ${posPaymentFilterClause}
                  AND ${transactionDateClause}
              GROUP BY pt.payment_method`,
-        [...posPaymentParams, ...dateParams]
+        [...posFilter.params, ...dateParams]
+    );
+
+    const [restaurantPaymentRows] = await db.query(
+        `SELECT pt.payment_method AS payment_method,
+                COALESCE(SUM(pt.total_amount), 0) AS amount,
+                COUNT(*) AS count
+             FROM pos_transactions pt
+             JOIN pos_transaction_items pti ON pti.transaction_id = pt.id
+             JOIN menu_items mi ON mi.menu_id = pti.menu_id
+             ${posJoins}
+             WHERE ${restaurantFilter.clause}
+                 AND ${transactionDateClause}
+             GROUP BY pt.payment_method`,
+        [...restaurantFilter.params, ...dateParams]
+    );
+
+    const [eshopPaymentRows] = await db.query(
+        `SELECT pt.payment_method AS payment_method,
+                COALESCE(SUM(pt.total_amount), 0) AS amount,
+                COUNT(*) AS count
+             FROM pos_transactions pt
+             ${posJoins}
+             WHERE ${eshopFilter.clause}
+                 AND ${transactionDateClause}
+             GROUP BY pt.payment_method`,
+        [...eshopFilter.params, ...dateParams]
     );
 
     const paymentMap = new Map();
@@ -555,6 +907,20 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
         existing.count += Number(row.count || 0);
         paymentMap.set(method, existing);
     });
+    restaurantPaymentRows.forEach((row) => {
+        const method = row.payment_method || 'Unknown';
+        const existing = paymentMap.get(method) || { payment_method: method, amount: 0, count: 0 };
+        existing.amount += Number(row.amount || 0);
+        existing.count += Number(row.count || 0);
+        paymentMap.set(method, existing);
+    });
+    eshopPaymentRows.forEach((row) => {
+        const method = row.payment_method || 'Unknown';
+        const existing = paymentMap.get(method) || { payment_method: method, amount: 0, count: 0 };
+        existing.amount += Number(row.amount || 0);
+        existing.count += Number(row.count || 0);
+        paymentMap.set(method, existing);
+    });
 
     const paymentSummary = [...paymentMap.values()].sort((a, b) => b.amount - a.amount);
 
@@ -565,12 +931,13 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
                 COALESCE(SUM(bi.total_price), 0) AS revenue
        FROM booking_items bi
        JOIN bookings b ON bi.booking_id = b.booking_id
-       WHERE b.booking_status != 'Cancelled'
-         AND DATE(b.created_at) BETWEEN ? AND ?
+       ${bookingJoins}
+       WHERE ${bookingFilter.clause}
+         AND ${bookingDateClause}
        GROUP BY bi.item_name, bi.item_type
        ORDER BY revenue DESC
        LIMIT 10`,
-        dateParams
+        [...bookingFilter.params, ...dateParams]
     );
 
     const [topPosRows] = await db.query(
@@ -579,6 +946,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
                 COALESCE(SUM(COALESCE(pti.line_total, pti.quantity * COALESCE(pti.unit_price, 0))), 0) AS revenue
        FROM pos_transaction_items pti
        JOIN pos_transactions pt ON pti.transaction_id = pt.id
+       ${posJoins}
        WHERE ${posFilter.clause}
          AND ${transactionDateClause}
        GROUP BY pti.item_name
@@ -594,6 +962,7 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
        FROM pos_transaction_items pti
        JOIN pos_transactions pt ON pti.transaction_id = pt.id
     JOIN menu_items mi ON mi.menu_id = pti.menu_id
+       ${posJoins}
        WHERE ${restaurantFilter.clause}
          AND ${transactionDateClause}
        GROUP BY mi.menu_id, mi.name
@@ -602,6 +971,9 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
         [...restaurantFilter.params, ...dateParams]
     );
 
+    const restaurantPosSales = posSales + restaurantSales;
+    const restaurantPosTransactions = totalPosTransactions + restaurantOrders;
+
     const channelSummary = [
         {
             channel: 'Reservations',
@@ -609,14 +981,9 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
             count: reservationCount
         },
         {
-            channel: 'POS',
-            revenue: posSales,
-            count: totalPosTransactions
-        },
-        {
-            channel: 'Restaurant/Menu',
-            revenue: restaurantSales,
-            count: restaurantOrders
+            channel: 'Restaurant POS',
+            revenue: restaurantPosSales,
+            count: restaurantPosTransactions
         },
         {
             channel: 'E-Shop',
@@ -653,8 +1020,11 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
             period: dateRange.period,
             startDate: dateRange.start,
             endDate: dateRange.end,
-            channel: channel || null,
-            payment_method: payment_method || null
+            channel: normalizedChannel || null,
+            payment_method: payment_method || null,
+            payment_status: payment_status || null,
+            transaction_status: transaction_status || null,
+            search: search || null,
         },
         summary: {
             grossSales,
@@ -664,6 +1034,9 @@ const querySalesAnalytics = async ({ period, date, from_date, to_date, channel, 
             posSales,
             restaurantSales,
             eshopSales,
+            restaurantSalesTrend: calcPercentTrend(restaurantSales, prevRestaurantSales),
+            posSalesTrend: calcPercentTrend(posSales, prevPosSales),
+            eshopSalesTrend: calcPercentTrend(eshopSales, prevEshopSales),
             totalTransactions: reservationCount + totalPosTransactions + eshopOrders,
             refundCount,
             reservationCount,
@@ -807,7 +1180,16 @@ export const getTopMenuItems = async (req, res) => {
 export const getSalesAnalytics = async (req, res) => {
     try {
         const { period, date, from_date, to_date, channel, payment_method } = req.query;
-        const result = await querySalesAnalytics({ period, date, from_date, to_date, channel, payment_method });
+        const result = await querySalesAnalytics({
+            period,
+            date,
+            from_date,
+            to_date,
+            channel,
+            payment_method,
+            legacy: true,
+            payment_status: 'paid',
+        });
         res.json(result);
     } catch (error) {
         console.error('Error fetching sales analytics:', error);
@@ -815,10 +1197,98 @@ export const getSalesAnalytics = async (req, res) => {
     }
 };
 
+export const getSalesReports = async (req, res) => {
+    try {
+        const validation = validateSalesReportQuery(req.query);
+        if (!validation.valid) {
+            return res.status(400).json({
+                success: false,
+                message: validation.message,
+            });
+        }
+
+        const { filters } = validation;
+        const result = await querySalesAnalytics({
+            period: filters.period,
+            from_date: filters.dateFrom,
+            to_date: filters.dateTo,
+            channel: filters.channel,
+            payment_method: filters.paymentMethod,
+            transaction_status: filters.transactionStatus,
+            payment_status: filters.paymentStatus,
+            search: filters.search,
+            legacy: false,
+        });
+
+        const hasRecords = Number(result.summary?.totalTransactions || 0) > 0
+            || Number(result.summary?.grossSales || 0) > 0;
+
+        res.json({
+            success: true,
+            data: result,
+            meta: {
+                hasRecords,
+                appliedFilters: filters,
+            },
+        });
+    } catch (error) {
+        console.error('Error fetching sales reports:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Unable to load the sales report. Please check your connection and try again.',
+            details: error.message,
+        });
+    }
+};
+
+export const exportSalesReportTransactionsCsv = async (req, res) => {
+    try {
+        const validation = validateSalesReportQuery(req.query);
+        if (!validation.valid) {
+            return res.status(400).json({ success: false, message: validation.message });
+        }
+
+        const rows = await getSalesReportTransactions(validation.filters);
+        const { dateFrom, dateTo } = validation.filters;
+        const filename = `sales-transactions_${dateFrom}_to_${dateTo}.csv`;
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Cache-Control', 'no-store');
+        return res.status(200).send(buildTransactionCsv(rows));
+    } catch (error) {
+        console.error('Error exporting sales report transactions:', error);
+        return res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.statusCode ? error.message : 'Unable to export sales transactions. Please try again.',
+            details: error.message,
+        });
+    }
+};
+
 export const exportSalesAnalyticsCSV = async (req, res) => {
     try {
-        const { period, date, from_date, to_date, channel, payment_method } = req.query;
-        const reportData = await querySalesAnalytics({ period, date, from_date, to_date, channel, payment_method });
+        const {
+            period,
+            date,
+            from_date,
+            to_date,
+            channel,
+            payment_method,
+            payment_status,
+            transaction_status,
+            search,
+        } = req.query;
+        const reportData = await querySalesAnalytics({
+            period,
+            date,
+            from_date,
+            to_date,
+            channel,
+            payment_method,
+            payment_status,
+            transaction_status,
+            search,
+        });
         const csv = buildCsv(reportData);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="sales-analytics-report.csv"');

@@ -1,5 +1,6 @@
 import db from '../config/db.js';
 import bcrypt from 'bcryptjs';
+import { syncSwimmingCoachFromUser } from '../services/syncSwimmingCoachFromUser.js';
 
 /**
  * ============================================================
@@ -349,6 +350,8 @@ export const updateUser = async (req, res) => {
                     `UPDATE user SET ${updateFields.join(', ')} WHERE user_id = ?`,
                     [...updateParams, id]
                 );
+
+                await syncSwimmingCoachFromUser(id, connection);
             }
 
             // Update customer table if user is a customer and has customer data

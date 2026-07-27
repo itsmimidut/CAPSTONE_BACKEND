@@ -1,0 +1,36 @@
+-- Phase 10A: Bluetooth Bridge devices + job claim columns (safe to re-run)
+CREATE TABLE IF NOT EXISTS print_bridge_devices (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  device_name VARCHAR(150) NOT NULL,
+  device_code VARCHAR(100) UNIQUE NOT NULL,
+  pairing_token VARCHAR(255) DEFAULT NULL,
+  station_id INT DEFAULT NULL,
+  status ENUM('online', 'offline', 'unknown') DEFAULT 'unknown',
+  last_seen_at DATETIME DEFAULT NULL,
+  app_version VARCHAR(50) DEFAULT NULL,
+  is_active TINYINT DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+SET @db := DATABASE();
+
+SET @sql := IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=@db AND TABLE_NAME='pos_printers' AND COLUMN_NAME='bridge_device_id')=0,
+  'ALTER TABLE pos_printers ADD COLUMN bridge_device_id INT NULL', 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=@db AND TABLE_NAME='pos_printers' AND COLUMN_NAME='bluetooth_address')=0,
+  'ALTER TABLE pos_printers ADD COLUMN bluetooth_address VARCHAR(150) NULL', 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=@db AND TABLE_NAME='print_jobs' AND COLUMN_NAME='claimed_by_bridge_id')=0,
+  'ALTER TABLE print_jobs ADD COLUMN claimed_by_bridge_id INT NULL', 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=@db AND TABLE_NAME='print_jobs' AND COLUMN_NAME='claimed_at')=0,
+  'ALTER TABLE print_jobs ADD COLUMN claimed_at DATETIME NULL', 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := IF((SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=@db AND TABLE_NAME='print_jobs' AND COLUMN_NAME='delivered_at')=0,
+  'ALTER TABLE print_jobs ADD COLUMN delivered_at DATETIME NULL', 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;

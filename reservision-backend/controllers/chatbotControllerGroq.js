@@ -1,5 +1,12 @@
 import Groq from 'groq-sdk';
-import db from '../config/db.js';
+import {
+  CHAT_HISTORY_CONTENT_MAX_LENGTH,
+  CHAT_HISTORY_MAX_ITEMS,
+} from '../middleware/validators/chatbotValidators.js';
+import { getCachedResortContext } from '../services/chatbotResortContextService.js';
+import { logSystemEvent } from '../utils/logger.js';
+
+const isProduction = process.env.NODE_ENV === 'production';
 
 // Groq AI with Llama 3.3 - SUPER FAST and FREE!
 // Get API key: https://console.groq.com/keys
@@ -16,30 +23,28 @@ function getGroqClient() {
   return groq;
 }
 
-async function getResortContext() {
-  try {
-    const [rooms] = await db.query(
-      'SELECT item_id, category, category_type, room_number, name, description, max_guests, price, status FROM inventory_items WHERE category = "Room" ORDER BY price ASC'
-    );
-
-    const [cottages] = await db.query(
-      'SELECT item_id, category, category_type, room_number, name, description, max_guests, price, status FROM inventory_items WHERE category = "Cottage" ORDER BY price ASC'
-    );
-
-    const [entrancerates] = await db.query(
-      `SELECT id, name, day_type, price, age_min, age_max, start_time, end_time, status
-       FROM entrance_rates
-       ORDER BY FIELD(day_type, 'weekday', 'weekend', 'holiday'), price ASC`
-    );
-
-    const [menu] = await db.query('SELECT name, price, category, available, description FROM menu_items WHERE available = TRUE ORDER BY category, name');
-    const [coaches] = await db.query('SELECT name, specialization, experience_years, certification, availability FROM swimming_coaches WHERE status = "Active"');
-
-    return { rooms, cottages, entrancerates, menu, coaches };
-  } catch (error) {
-    console.error('Error fetching resort context:', error);
-    return null;
+function sanitizeConversationHistory(history) {
+  if (!Array.isArray(history)) {
+    return [];
   }
+
+  return history
+    .slice(-CHAT_HISTORY_MAX_ITEMS)
+    .filter((item) => item && ['user', 'assistant'].includes(item.role))
+    .map((item) => ({
+      role: item.role,
+      content: String(item.content || '').slice(0, CHAT_HISTORY_CONTENT_MAX_LENGTH),
+    }));
+}
+
+function respondServiceUnavailable(res, devMessage) {
+  return res.status(503).json({
+    success: false,
+    error: isProduction
+      ? 'The assistant is temporarily unavailable. Please try again later.'
+      : devMessage,
+    ...(isProduction ? {} : { code: 'GROQ_NOT_CONFIGURED' }),
+  });
 }
 
 // Groq AI Chat with Llama
@@ -47,21 +52,20 @@ export const chatWithGroq = async (req, res) => {
   try {
     const { message, conversationHistory = [] } = req.body;
 
-    if (!message || !message.trim()) {
-      return res.status(400).json({ error: 'Message is required' });
-    }
-
     if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({
-        error: 'Groq API key not configured. Please add GROQ_API_KEY to your .env file',
-        setup: 'Get your free API key at https://console.groq.com/keys'
-      });
+      return respondServiceUnavailable(
+        res,
+        'Groq API key not configured. Add GROQ_API_KEY to your .env file.',
+      );
     }
 
-    const resortData = await getResortContext();
+    const { data: resortData } = await getCachedResortContext();
 
     if (!resortData) {
-      return res.status(500).json({ error: 'Failed to fetch resort data' });
+      return res.status(503).json({
+        success: false,
+        error: 'The assistant is temporarily unavailable. Please try again later.',
+      });
     }
 
     // Build a concise human-readable rates summary to ensure the model sees rates
@@ -73,9 +77,6 @@ export const chatWithGroq = async (req, res) => {
       const status = r.status && r.status !== 'active' ? ` (${r.status})` : ''
       return `• ${r.name} (${day}) — ₱${price} — ${age} — ${time}${status}`
     }).join('\n')
-
-    console.log('Chatbot: entrance rates count =', resortData.entrancerates.length)
-    console.log('Chatbot: formattedRates:\n', formattedRates)
 
     // If the user explicitly asks about entrance/per-head rates, return deterministic answer
     const q = message.toString().toLowerCase()
@@ -102,6 +103,9 @@ export const chatWithGroq = async (req, res) => {
 
   🏊 SWIMMING COACHES:
   ${JSON.stringify(resortData.coaches, null, 2)}
+
+  🎉 ACTIVE PROMOS:
+  ${JSON.stringify(resortData.promos || [], null, 2)}
 
   SPECIAL BEHAVIOR FOR RATE QUERIES:
   When the user asks about "per head", "per person", "entrance", "rates", or any question about how much it costs to enter (including requests like "per head rates"), ALWAYS respond using the ENTRANCE RATES section above. Format each rate as a concise bullet with:
@@ -159,8 +163,8 @@ export const chatWithGroq = async (req, res) => {
       { role: 'system', content: systemPrompt }
     ];
 
-    // Add conversation history (last 5 messages to keep context manageable)
-    const recentHistory = conversationHistory.slice(-5);
+    // Add conversation history (last N messages to keep context manageable)
+    const recentHistory = sanitizeConversationHistory(conversationHistory);
     messages.push(...recentHistory);
 
     // Add current user message
@@ -188,35 +192,41 @@ export const chatWithGroq = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Groq API Error:', error);
+    logSystemEvent('CHATBOT_GROQ_ERROR', {
+      status: error?.status,
+      message: error?.message,
+    });
 
-    let errorMessage = 'Failed to process chat request';
     let statusCode = 500;
+    let errorMessage = isProduction
+      ? 'The assistant is temporarily unavailable. Please try again later.'
+      : 'Failed to process chat request';
 
-    if (error.status === 401) {
-      errorMessage = 'Invalid Groq API key. Please check your GROQ_API_KEY in .env file';
-      statusCode = 401;
-    } else if (error.status === 429) {
-      errorMessage = 'Rate limit exceeded. Please try again in a moment';
+    if (error?.status === 401) {
+      statusCode = 503;
+      errorMessage = 'The assistant is temporarily unavailable. Please try again later.';
+    } else if (error?.status === 429) {
       statusCode = 429;
+      errorMessage = 'Too many requests. Please try again in a moment.';
     }
 
     res.status(statusCode).json({
+      success: false,
       error: errorMessage,
-      details: error.message
     });
   }
 };
 
-// Test endpoint to verify Groq connection
+// Admin-only endpoint to verify Groq connection
 export const testGroq = async (req, res) => {
   try {
     if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({
-        error: 'Groq API key not configured',
-        setup: 'Get your free API key at https://console.groq.com/keys'
-      });
+      return respondServiceUnavailable(
+        res,
+        'Groq API key not configured. Add GROQ_API_KEY to your .env file.',
+      );
     }
+
     const groqClient = getGroqClient();
     const completion = await groqClient.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
@@ -234,10 +244,14 @@ export const testGroq = async (req, res) => {
       model: 'llama-3.3-70b-versatile'
     });
   } catch (error) {
-    console.error('Groq Test Error:', error);
+    logSystemEvent('CHATBOT_GROQ_TEST_ERROR', {
+      status: error?.status,
+      message: error?.message,
+    });
+
     res.status(500).json({
+      success: false,
       error: 'Groq API test failed',
-      details: error.message
     });
   }
 };

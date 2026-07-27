@@ -1,4 +1,12 @@
 import db from "../config/db.js";
+import { logAudit, AUDIT_ACTIONS } from "../utils/auditLogger.js";
+import { processApprovedRefundViaXendit, getXenditPaymentContextForBooking } from "../services/xenditRefundService.js";
+import {
+    getRefundNotificationTarget,
+    notifyRefundApproved,
+    notifyRefundRejected,
+} from "../services/customerNotificationService.js";
+import { BOOKING_STATUS, REFUND_STATUS } from "../utils/paymentStatuses.js";
 
 const ALLOWED_REFUND_TYPES = ["Full", "Partial", "No Refund"];
 const ALLOWED_REFUND_REASONS = [
@@ -28,6 +36,7 @@ const getAdminName = (req) => {
 const sendError = (res, status, message, code = "ERROR", errors = {}) => {
     return res.status(status).json({
         success: false,
+        error: message,
         message,
         code,
         errors
@@ -35,6 +44,31 @@ const sendError = (res, status, message, code = "ERROR", errors = {}) => {
 };
 
 const toNumber = (value) => Number(value || 0);
+
+const APPROVABLE_REFUND_STATUSES = [REFUND_STATUS.PENDING, REFUND_STATUS.FAILED];
+
+const getRefundableAmountForRefund = async (refund) => {
+    const storedAmount = toNumber(refund.original_amount);
+
+    const [paymentRows] = await db.query(
+        `SELECT amount, status
+         FROM payments
+         WHERE booking_id = ?
+           AND payment_gateway = 'xendit'
+         ORDER BY created_at DESC`,
+        [refund.booking_id],
+    );
+
+    const paidPayment = paymentRows.find((row) =>
+        /^(paid|settled|completed|success)$/i.test(String(row.status || '')),
+    );
+
+    if (paidPayment) {
+        return toNumber(paidPayment.amount) || storedAmount;
+    }
+
+    return storedAmount;
+};
 
 const getBookingPaidAmount = (booking) => {
     return toNumber(
@@ -182,9 +216,10 @@ export const getRefunds = async (req, res) => {
       SELECT
         COUNT(*) AS total_requests,
         SUM(CASE WHEN refund_status = 'Pending' THEN 1 ELSE 0 END) AS pending_count,
-        SUM(CASE WHEN refund_status = 'Approved' THEN 1 ELSE 0 END) AS approved_count,
-        SUM(CASE WHEN refund_status = 'Refunded' THEN 1 ELSE 0 END) AS refunded_count,
+        SUM(CASE WHEN refund_status = 'Processing' THEN 1 ELSE 0 END) AS processing_count,
+        SUM(CASE WHEN refund_status = 'Completed' THEN 1 ELSE 0 END) AS completed_count,
         SUM(CASE WHEN refund_status = 'Rejected' THEN 1 ELSE 0 END) AS rejected_count,
+        SUM(CASE WHEN refund_status = 'Failed' THEN 1 ELSE 0 END) AS failed_count,
         COALESCE(SUM(refund_amount), 0) AS total_refunded_amount
       FROM (
         SELECT DISTINCT
@@ -214,9 +249,10 @@ export const getRefunds = async (req, res) => {
             summary: summaryResult[0] || {
                 total_requests: 0,
                 pending_count: 0,
-                approved_count: 0,
-                refunded_count: 0,
+                processing_count: 0,
+                completed_count: 0,
                 rejected_count: 0,
+                failed_count: 0,
                 total_refunded_amount: 0
             }
         });
@@ -265,6 +301,7 @@ export const getRefundById = async (req, res) => {
         }
 
         const refund = rows[0];
+        const paymentContext = await getXenditPaymentContextForBooking(refund.booking_id);
 
         const response = {
             refund_id: refund.refund_id,
@@ -284,7 +321,10 @@ export const getRefundById = async (req, res) => {
                 payment_method: refund.payment_method,
                 payment_status: refund.payment_status,
                 original_amount: refund.original_amount,
-                paid_amount: toNumber(refund.paid_amount)
+                paid_amount: toNumber(refund.paid_amount),
+                xendit_refundable: paymentContext.refundable,
+                xendit_message: paymentContext.message,
+                payment_gateways: paymentContext.gateways,
             },
             refund: {
                 refund_type: refund.refund_type,
@@ -365,7 +405,7 @@ export const createRefund = async (req, res) => {
         }
 
         const [duplicateRows] = await db.query(
-            `SELECT COUNT(*) AS count FROM refunds WHERE booking_id = ? AND refund_status IN ('Pending', 'Approved')`,
+            `SELECT COUNT(*) AS count FROM refunds WHERE booking_id = ? AND refund_status IN ('Pending', 'Processing')`,
             [bookingId]
         );
 
@@ -376,7 +416,7 @@ export const createRefund = async (req, res) => {
         const refundReference = await generateRefundReference();
         const reason = refund_reason || "Waiting for admin review";
         const note = refund_note || "Waiting for admin to select refund type.";
-        const refundMethod = booking.resolved_payment_method || "";
+        const refundMethod = req.body.refund_method || booking.resolved_payment_method || "Same as payment method";
         const customerId = booking.customer_id || null;
 
         const [insertResult] = await db.query(
@@ -413,6 +453,19 @@ export const createRefund = async (req, res) => {
             [bookingId]
         );
 
+        await logAudit({
+            userId: req.user?.id || 0,
+            action: AUDIT_ACTIONS.REFUND_REQUESTED,
+            entityType: "refund",
+            entityId: insertResult.insertId,
+            newValue: {
+                booking_id: bookingId,
+                refund_reference: refundReference,
+                original_amount: originalAmount,
+            },
+            req,
+        });
+
         return res.json({
             success: true,
             message: "Refund request created successfully.",
@@ -446,8 +499,13 @@ export const approveRefund = async (req, res) => {
         }
 
         const refund = refundRows[0];
-        if (refund.refund_status !== 'Pending') {
-            return sendError(res, 400, "Only pending refunds can be approved.", "REFUND_NOT_PENDING");
+        if (!APPROVABLE_REFUND_STATUSES.includes(refund.refund_status)) {
+            return sendError(
+                res,
+                400,
+                `Only ${APPROVABLE_REFUND_STATUSES.join(' or ')} refunds can be approved. Current status: ${refund.refund_status}.`,
+                "REFUND_NOT_APPROVABLE",
+            );
         }
 
         const normalizedType = normalizeRefundType(refund_type);
@@ -463,7 +521,7 @@ export const approveRefund = async (req, res) => {
             return sendError(res, 400, "Refund reason is required.", "INVALID_REFUND_REASON");
         }
 
-        const originalAmount = toNumber(refund.original_amount);
+        const originalAmount = await getRefundableAmountForRefund(refund);
         const selectedAmount = toNumber(refund_amount);
 
         if (normalizedType === 'Full') {
@@ -488,35 +546,119 @@ export const approveRefund = async (req, res) => {
             return sendError(res, 400, "Refund amount cannot exceed original amount.", "INVALID_REFUND_AMOUNT");
         }
 
-        let bookingStatus = 'Cancelled';
-        if (normalizedType === 'Partial') {
-            bookingStatus = 'Partially Refunded';
+        if (normalizedType !== 'No Refund' && selectedAmount > 0) {
+            const paymentContext = await getXenditPaymentContextForBooking(refund.booking_id);
+            if (!paymentContext.refundable) {
+                return sendError(res, 400, paymentContext.message, "XENDIT_PAYMENT_NOT_FOUND");
+            }
         }
 
-        await db.query(
-            `UPDATE refunds SET
+        const processingRefund = {
+            ...refund,
+            refund_type: normalizedType,
+            refund_amount: selectedAmount,
+            refund_reason,
+            refund_note: refund_note || '',
+            refund_status: REFUND_STATUS.PROCESSING,
+        };
+
+        let gatewayResult = null;
+        try {
+            await db.query(
+                `UPDATE refunds SET
         refund_type = ?,
         refund_amount = ?,
         refund_reason = ?,
         refund_note = ?,
-        refund_status = 'Approved',
+        refund_status = ?,
+        original_amount = ?,
+        gateway_reference = NULL,
+        gateway_status = NULL,
         approved_by = ?,
         approved_at = NOW(),
         updated_at = NOW()
       WHERE refund_id = ?`,
-            [normalizedType, selectedAmount, refund_reason, refund_note || '', getAdminName(req), refundId]
-        );
+                [
+                    normalizedType,
+                    selectedAmount,
+                    refund_reason,
+                    refund_note || '',
+                    REFUND_STATUS.PROCESSING,
+                    originalAmount,
+                    getAdminName(req),
+                    refundId,
+                ],
+            );
 
-        await db.query(
-            `UPDATE bookings SET
+            const bookingStatus = normalizedType === 'Partial'
+                ? BOOKING_STATUS.PARTIALLY_REFUNDED
+                : BOOKING_STATUS.CANCELLED;
+
+            await db.query(
+                `UPDATE bookings SET
         booking_status = ?,
-        refund_status = 'Approved',
+        refund_status = ?,
         refund_amount = ?
       WHERE booking_id = ?`,
-            [bookingStatus, selectedAmount, refund.booking_id]
-        );
+                [bookingStatus, REFUND_STATUS.PROCESSING, selectedAmount, refund.booking_id]
+            );
 
-        return res.json({ success: true, message: "Refund approved successfully." });
+            await logAudit({
+                userId: req.user?.id || 0,
+                action: AUDIT_ACTIONS.REFUND_APPROVED,
+                entityType: "refund",
+                entityId: refundId,
+                oldValue: { refund_status: refund.refund_status },
+                newValue: {
+                    refund_status: REFUND_STATUS.PROCESSING,
+                    refund_type: normalizedType,
+                    refund_amount: selectedAmount,
+                },
+                req,
+            });
+
+            gatewayResult = await processApprovedRefundViaXendit({
+                refund: processingRefund,
+                req,
+                userId: req.user?.id || 0,
+            });
+        } catch (gatewayError) {
+            await db.query(
+                `UPDATE refunds SET refund_status = ?, gateway_status = 'FAILED', updated_at = NOW() WHERE refund_id = ?`,
+                [REFUND_STATUS.FAILED, refundId],
+            );
+            return sendError(
+                res,
+                502,
+                `Refund processing failed: ${gatewayError.message}`,
+                "XENDIT_REFUND_FAILED",
+            );
+        }
+
+        const message = gatewayResult?.completed
+            ? "Refund processed successfully via Xendit."
+            : gatewayResult?.skipped
+                ? "Refund request completed (no gateway refund required)."
+                : "Refund is processing via Xendit and will complete via webhook.";
+
+        try {
+            const target = await getRefundNotificationTarget(refundId);
+            if (target?.user_id) {
+                await notifyRefundApproved({
+                    userId: target.user_id,
+                    customerId: target.customer_id,
+                    bookingReference: target.booking_reference,
+                });
+            }
+        } catch (notifyError) {
+            console.warn('Refund approved notification failed:', notifyError.message);
+        }
+
+        return res.json({
+            success: true,
+            message,
+            gateway: gatewayResult,
+        });
     } catch (error) {
         console.error("approveRefund error", error);
         return sendError(res, 500, "Failed to approve refund.", "INTERNAL_SERVER_ERROR", { detail: error.message });
@@ -542,8 +684,8 @@ export const rejectRefund = async (req, res) => {
         }
 
         const refund = refundRows[0];
-        if (refund.refund_status === 'Refunded') {
-            return sendError(res, 400, "Refunded requests cannot be rejected.", "REFUND_NOT_APPROVED");
+        if (refund.refund_status === REFUND_STATUS.COMPLETED) {
+            return sendError(res, 400, "Completed refunds cannot be rejected.", "REFUND_NOT_REJECTABLE");
         }
 
         if (refund.refund_status === 'Rejected') {
@@ -569,66 +711,33 @@ export const rejectRefund = async (req, res) => {
             [refund.booking_id]
         );
 
+        await logAudit({
+            userId: req.user?.id || 0,
+            action: AUDIT_ACTIONS.REFUND_REJECTED,
+            entityType: "refund",
+            entityId: refundId,
+            oldValue: { refund_status: refund.refund_status },
+            newValue: { refund_status: 'Rejected', rejection_reason },
+            req,
+        });
+
+        try {
+            const target = await getRefundNotificationTarget(refundId);
+            if (target?.user_id) {
+                await notifyRefundRejected({
+                    userId: target.user_id,
+                    customerId: target.customer_id,
+                    bookingReference: target.booking_reference,
+                });
+            }
+        } catch (notifyError) {
+            console.warn('Refund rejected notification failed:', notifyError.message);
+        }
+
         return res.json({ success: true, message: "Refund rejected successfully." });
     } catch (error) {
         console.error("rejectRefund error", error);
         return sendError(res, 500, "Failed to reject refund.", "INTERNAL_SERVER_ERROR", { detail: error.message });
-    }
-};
-
-export const markRefunded = async (req, res) => {
-    try {
-        const refundId = Number(req.params.id);
-        const { gateway_reference, gateway_status } = req.body;
-
-        if (!refundId) {
-            return sendError(res, 400, "Refund ID is required.", "VALIDATION_ERROR");
-        }
-
-        const [refundRows] = await db.query(`SELECT * FROM refunds WHERE refund_id = ?`, [refundId]);
-        if (!refundRows || refundRows.length === 0) {
-            return sendError(res, 404, "Refund not found.", "REFUND_NOT_FOUND");
-        }
-
-        const refund = refundRows[0];
-        if (refund.refund_status !== 'Approved') {
-            return sendError(res, 400, "Only approved refunds can be marked as refunded.", "REFUND_NOT_APPROVED");
-        }
-
-        const nextStatus = refund.refund_type === 'Partial'
-            ? 'Partially Refunded'
-            : refund.refund_type === 'No Refund'
-                ? 'No Refund'
-                : 'Refunded';
-
-        const bookingStatus = refund.refund_type === 'Partial'
-            ? 'Partially Refunded'
-            : 'Cancelled';
-
-        await db.query(
-            `UPDATE refunds SET
-        refund_status = 'Refunded',
-        refunded_at = NOW(),
-        gateway_reference = ?,
-        gateway_status = ?,
-        updated_at = NOW()
-      WHERE refund_id = ?`,
-            [gateway_reference || null, gateway_status || null, refundId]
-        );
-
-        await db.query(
-            `UPDATE bookings SET
-        refund_status = ?,
-        booking_status = ?,
-        last_refunded_at = NOW()
-      WHERE booking_id = ?`,
-            [nextStatus, bookingStatus, refund.booking_id]
-        );
-
-        return res.json({ success: true, message: "Refund marked as refunded successfully." });
-    } catch (error) {
-        console.error("markRefunded error", error);
-        return sendError(res, 500, "Failed to mark refund as refunded.", "INTERNAL_SERVER_ERROR", { detail: error.message });
     }
 };
 

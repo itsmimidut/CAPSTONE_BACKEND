@@ -18,15 +18,36 @@ const formatCurrency = (value) => {
     return `₱${amount.toFixed(2)}`
 }
 
-const buildNotification = ({ id, type, title, message, created_at, link }) => ({
+const buildNotification = ({ id, type, title, message, created_at, link, is_read = false }) => ({
     id,
     type,
     title,
     message,
     created_at,
-    is_read: false,
+    is_read: Boolean(is_read),
     link
 })
+
+const getUserId = (req) => Number(req.user?.id ?? req.user?.user_id ?? 0)
+
+const getReadNotificationKeys = async (userId) => {
+    if (!userId) return new Set()
+
+    const rows = await safeQuery(
+        `SELECT notification_key
+         FROM staff_notification_reads
+         WHERE user_id = ?`,
+        [userId]
+    )
+
+    return new Set(rows.map((row) => String(row.notification_key)))
+}
+
+const applyReadState = (notifications, readKeys) =>
+    notifications.map((notification) => ({
+        ...notification,
+        is_read: readKeys.has(String(notification.id)) || Boolean(notification.is_read),
+    }))
 
 const getRefundNotifications = async (limit) => {
     const rows = await safeQuery(
@@ -60,7 +81,7 @@ const getRefundNotifications = async (limit) => {
 
 const getBookingNotifications = async (limit) => {
     const rows = await safeQuery(
-    `SELECT
+        `SELECT
         b.booking_id,
         b.booking_reference,
         b.booking_status,
@@ -71,7 +92,7 @@ const getBookingNotifications = async (limit) => {
         AND b.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
     ORDER BY created_at DESC
     LIMIT ?`,
-    [limit]
+        [limit]
     )
 
     return rows.map((row) =>
@@ -88,7 +109,7 @@ const getBookingNotifications = async (limit) => {
 
 const getEshopNotifications = async (limit) => {
     const rows = await safeQuery(
-    `SELECT
+        `SELECT
         pt.id,
         pt.receipt_no,
         pt.total_amount,
@@ -100,7 +121,7 @@ const getEshopNotifications = async (limit) => {
         AND COALESCE(pt.transaction_date, pt.created_at) >= DATE_SUB(NOW(), INTERVAL 7 DAY)
     ORDER BY created_at DESC
     LIMIT ?`,
-    [limit]
+        [limit]
     )
 
     return rows.map((row) =>
@@ -110,7 +131,7 @@ const getEshopNotifications = async (limit) => {
             title: 'New E-Shop order',
             message: `E-Shop order ${row.receipt_no || row.id} received. Total: ${formatCurrency(row.total_amount)}.`,
             created_at: row.created_at,
-            link: '/admin/pos'
+            link: '/admin/pos/eshop-orders?tab=received'
         })
     )
 }
@@ -208,9 +229,9 @@ const getRoleNotificationSources = async (role, limit) => {
     const normalizedRole = normalizeRole(role)
 
     const adminRoles = ['admin', 'manager', 'unknown']
-    const staffRoles = ['staff']
+    const staffRoles = ['staff', 'receptionist']
     const cashierRoles = ['cashier']
-    const restaurantRoles = ['restaurant_staff']
+    const restaurantRoles = ['restaurant_staff', 'restaurantstaff']
     const inventoryRoles = ['inventory_staff']
     const swimmingRoles = ['swimming_instructor']
 
@@ -269,30 +290,100 @@ const countTable = async (sql, params = []) => {
 
 export const getAdminNotifications = async (req, res) => {
     try {
-        const { role = 'admin', limit = 10 } = req.query
-        const limitValue = Math.max(Number(limit) || 10, 1)
+        // Security: always derive role from authenticated session, never from query input.
+        const role = req.user?.role || 'admin'
+        const requestedLimit = Number.parseInt(req.query?.limit, 10)
+        const limitValue = Number.isFinite(requestedLimit)
+            ? Math.min(Math.max(requestedLimit, 1), 50)
+            : 10
 
         const notificationsChunks = await getRoleNotificationSources(role, limitValue)
         const notifications = notificationsChunks.flat().filter(Boolean)
+        const readKeys = await getReadNotificationKeys(getUserId(req))
+        const notificationsWithReadState = applyReadState(notifications, readKeys)
 
-        const unreadCount = notifications.filter((notification) => !notification.is_read).length
+        const unreadCount = notificationsWithReadState.filter((notification) => !notification.is_read).length
 
-        const sortedNotifications = notifications
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-        .slice(0, limitValue)
+        const sortedNotifications = notificationsWithReadState
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+            .slice(0, limitValue)
 
         return res.json({
-        success: true,
-        unreadCount,
-        notifications: sortedNotifications
+            success: true,
+            unreadCount,
+            notifications: sortedNotifications
         })
     } catch (error) {
         console.error('getAdminNotifications error:', error)
         return res.status(500).json({
             success: false,
-            message: 'Failed to load admin notifications',
-            error: error.message
+            message: 'Failed to load admin notifications'
         })
+    }
+}
+
+export const getDashboardNotifications = async (req, res) => {
+    return getAdminNotifications(req, res)
+}
+
+export const markStaffNotificationRead = async (req, res) => {
+    try {
+        const userId = getUserId(req)
+        const notificationKey = String(req.params.notificationId || '').trim()
+
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' })
+        }
+
+        if (!notificationKey) {
+            return res.status(400).json({ success: false, message: 'Notification id is required' })
+        }
+
+        await db.query(
+            `INSERT INTO staff_notification_reads (user_id, notification_key)
+             VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE read_at = CURRENT_TIMESTAMP`,
+            [userId, notificationKey]
+        )
+
+        return res.json({ success: true })
+    } catch (error) {
+        console.error('markStaffNotificationRead error:', error)
+        return res.status(500).json({ success: false, message: 'Failed to mark notification as read' })
+    }
+}
+
+export const markAllStaffNotificationsRead = async (req, res) => {
+    try {
+        const userId = getUserId(req)
+        if (!userId) {
+            return res.status(401).json({ success: false, message: 'Unauthorized' })
+        }
+
+        const role = req.user?.role || 'admin'
+        const notificationsChunks = await getRoleNotificationSources(role, 50)
+        const notificationKeys = notificationsChunks
+            .flat()
+            .filter(Boolean)
+            .map((notification) => String(notification.id))
+            .filter(Boolean)
+
+        if (!notificationKeys.length) {
+            return res.json({ success: true, marked: 0 })
+        }
+
+        const values = notificationKeys.map((key) => [userId, key])
+        await db.query(
+            `INSERT INTO staff_notification_reads (user_id, notification_key)
+             VALUES ?
+             ON DUPLICATE KEY UPDATE read_at = CURRENT_TIMESTAMP`,
+            [values]
+        )
+
+        return res.json({ success: true, marked: notificationKeys.length })
+    } catch (error) {
+        console.error('markAllStaffNotificationsRead error:', error)
+        return res.status(500).json({ success: false, message: 'Failed to mark notifications as read' })
     }
 }
 
@@ -307,7 +398,10 @@ export const getPendingCounts = async (req, res) => {
         )
 
         const eshopOrders = await countTable(
-            `SELECT COUNT(*) AS count FROM pos_transactions WHERE LOWER(TRIM(COALESCE(type, ''))) IN ('e-shop', 'eshop', 'delivery')`
+            `SELECT COUNT(*) AS count
+             FROM pos_transactions
+             WHERE LOWER(TRIM(COALESCE(type, ''))) = 'e-shop'
+               AND fulfillment_status IN ('received', 'preparing', 'out_for_delivery', 'ready_for_pickup')`
         )
 
         const lowStock = await countTable(

@@ -2,7 +2,7 @@
 -- PAYMENTS TABLE SCHEMA
 -- ============================================================
 -- Purpose: Track all payment transactions for bookings
--- Supports multiple payment methods (PayMongo, GCash, Maya, Bank Transfer)
+-- Supports Xendit and manual/cash payment records
 
 CREATE TABLE IF NOT EXISTS payments (
   payment_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -10,9 +10,9 @@ CREATE TABLE IF NOT EXISTS payments (
   customer_id INT NOT NULL,
   
   -- Payment Details
-  payment_reference VARCHAR(100) UNIQUE NOT NULL COMMENT 'Unique payment reference (PayMongo ID, etc)',
+  payment_reference VARCHAR(100) UNIQUE NOT NULL COMMENT 'Unique payment reference (Xendit invoice ID, manual ref, etc)',
   payment_method ENUM('paymaya', 'gcash', 'bank', 'card', 'cash') NOT NULL,
-  payment_gateway VARCHAR(50) DEFAULT 'paymongo' COMMENT 'paymongo, xendit, manual',
+  payment_gateway VARCHAR(50) DEFAULT 'xendit' COMMENT 'xendit, manual',
   
   -- Amount Details
   amount DECIMAL(10,2) NOT NULL COMMENT 'Total payment amount',
@@ -21,9 +21,9 @@ CREATE TABLE IF NOT EXISTS payments (
   -- Status Tracking
   status ENUM('pending', 'paid', 'failed', 'refunded', 'expired') DEFAULT 'pending',
   
-  -- PayMongo/Gateway Specific
+  -- Gateway specific fields
   checkout_url TEXT COMMENT 'Payment link URL',
-  payment_intent_id VARCHAR(255) COMMENT 'PayMongo payment intent ID',
+  payment_intent_id VARCHAR(255) COMMENT 'Legacy payment intent ID (nullable)',
   
   -- Timestamps
   paid_at TIMESTAMP NULL COMMENT 'When payment was completed',

@@ -31,6 +31,42 @@
 
 import { db } from '../config/db.js';
 
+let inventoryColumnCache = null;
+
+const getInventoryColumnSet = async () => {
+    if (inventoryColumnCache) return inventoryColumnCache;
+    const [rows] = await db.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inventory'`
+    );
+    inventoryColumnCache = new Set(rows.map((row) => row.COLUMN_NAME));
+    return inventoryColumnCache;
+};
+
+const hasColumn = async (name) => {
+    const set = await getInventoryColumnSet();
+    return set.has(name);
+};
+
+const computeInventoryStatus = (quantity, reorderLevel) => {
+    const qty = Number(quantity || 0);
+    const reorder = Math.max(0, Number(reorderLevel || 0));
+    if (qty <= 0) return 'critical';
+    if (qty <= reorder) return 'low';
+    return 'good';
+};
+
+const getReorderLevelValue = (payload) => {
+    if (payload?.reorder_level !== undefined && payload?.reorder_level !== null) {
+        return Number(payload.reorder_level);
+    }
+    if (payload?.threshold !== undefined && payload?.threshold !== null) {
+        return Number(payload.threshold);
+    }
+    return 0;
+};
+
 // ============================================================
 // GET ALL INVENTORY ITEMS
 // ============================================================
@@ -67,9 +103,12 @@ import { db } from '../config/db.js';
  */
 export const getAllInventory = async (req, res) => {
     try {
+        const reorderExpr = (await hasColumn('reorder_level'))
+            ? 'COALESCE(reorder_level, threshold)'
+            : 'threshold';
         // Get optional filter parameters from query string
         const { status, search } = req.query;
-        let query = 'SELECT * FROM inventory WHERE 1=1';
+        let query = `SELECT *, ${reorderExpr} AS reorder_level FROM inventory WHERE 1=1`;
         const params = [];
 
         // Filter by status if provided
@@ -139,6 +178,9 @@ export const getAllInventory = async (req, res) => {
  */
 export const getInventoryItem = async (req, res) => {
     try {
+        const reorderExpr = (await hasColumn('reorder_level'))
+            ? 'COALESCE(reorder_level, threshold)'
+            : 'threshold';
         const { id } = req.params;
 
         // Validate ID format
@@ -149,7 +191,10 @@ export const getInventoryItem = async (req, res) => {
             });
         }
 
-        const [rows] = await db.query('SELECT * FROM inventory WHERE inventory_id = ?', [id]);
+        const [rows] = await db.query(
+            `SELECT *, ${reorderExpr} AS reorder_level FROM inventory WHERE inventory_id = ?`,
+            [id]
+        );
 
         // Return 404 if item not found
         if (rows.length === 0) {
@@ -234,23 +279,25 @@ export const getInventoryItem = async (req, res) => {
  */
 export const createInventoryItem = async (req, res) => {
     try {
-        const { item_name, quantity, unit, threshold } = req.body;
+        const { item_name, quantity, unit, category = '', supplier = '' } = req.body;
+        const reorderLevel = getReorderLevelValue(req.body);
+        const useReorderLevel = await hasColumn('reorder_level');
 
         // Validation: Check all required fields are provided
-        if (!item_name || quantity === undefined || !unit || !threshold) {
+        if (!item_name || quantity === undefined || !unit || reorderLevel === undefined || Number.isNaN(reorderLevel)) {
             return res.status(400).json({
                 success: false,
                 error: 'Validation failed',
-                message: 'item_name, quantity, unit, and threshold are required'
+                message: 'item_name, quantity, unit, and reorder_level (or threshold) are required'
             });
         }
 
-        // Validation: Ensure quantity and threshold are numbers
-        if (isNaN(quantity) || isNaN(threshold)) {
+        // Validation: Ensure quantity and reorder level are numbers
+        if (isNaN(quantity) || isNaN(reorderLevel)) {
             return res.status(400).json({
                 success: false,
                 error: 'Validation failed',
-                message: 'quantity and threshold must be numbers'
+                message: 'quantity and reorder_level must be numbers'
             });
         }
 
@@ -263,26 +310,33 @@ export const createInventoryItem = async (req, res) => {
             });
         }
 
-        // Validation: Ensure threshold is positive
-        if (parseFloat(threshold) <= 0) {
+        // Validation: Ensure reorder level is non-negative
+        if (parseFloat(reorderLevel) < 0) {
             return res.status(400).json({
                 success: false,
                 error: 'Validation failed',
-                message: 'threshold must be greater than 0'
+                message: 'reorder_level must be greater than or equal to 0'
             });
         }
 
-        // Calculate status based on quantity vs threshold
-        const status = parseFloat(quantity) <= parseFloat(threshold) ? 'low' : 'good';
+        // Calculate status based on quantity vs reorder level
+        const status = computeInventoryStatus(parseFloat(quantity), parseFloat(reorderLevel));
 
         // Insert into database with prepared statement (prevents SQL injection)
-        const [result] = await db.query(
-            'INSERT INTO inventory (item_name, quantity, unit, threshold, status) VALUES (?, ?, ?, ?, ?)',
-            [item_name.trim(), parseFloat(quantity), unit.trim(), parseFloat(threshold), status]
-        );
+        const insertSql = useReorderLevel
+            ? 'INSERT INTO inventory (item_name, category, supplier, quantity, unit, threshold, reorder_level, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            : 'INSERT INTO inventory (item_name, category, supplier, quantity, unit, threshold, status) VALUES (?, ?, ?, ?, ?, ?, ?)';
+        const insertParams = useReorderLevel
+            ? [item_name.trim(), String(category || '').trim() || null, String(supplier || '').trim() || null, parseFloat(quantity), unit.trim(), parseFloat(reorderLevel), parseFloat(reorderLevel), status]
+            : [item_name.trim(), String(category || '').trim() || null, String(supplier || '').trim() || null, parseFloat(quantity), unit.trim(), parseFloat(reorderLevel), status];
+        const [result] = await db.query(insertSql, insertParams);
 
         // Fetch the newly created item to return complete data
-        const [newItem] = await db.query('SELECT * FROM inventory WHERE inventory_id = ?', [result.insertId]);
+        const reorderExpr = useReorderLevel ? 'COALESCE(reorder_level, threshold)' : 'threshold';
+        const [newItem] = await db.query(
+            `SELECT *, ${reorderExpr} AS reorder_level FROM inventory WHERE inventory_id = ?`,
+            [result.insertId]
+        );
 
         res.status(201).json({
             success: true,
@@ -359,7 +413,8 @@ export const createInventoryItem = async (req, res) => {
 export const updateInventoryItem = async (req, res) => {
     try {
         const { id } = req.params;
-        const { item_name, quantity, unit, threshold } = req.body;
+        const { item_name, quantity, unit, category, supplier } = req.body;
+        const useReorderLevel = await hasColumn('reorder_level');
 
         // Validate ID format
         if (!id || isNaN(id)) {
@@ -382,7 +437,13 @@ export const updateInventoryItem = async (req, res) => {
         const updatedName = item_name || existingItem[0].item_name;
         const updatedQuantity = quantity !== undefined ? quantity : existingItem[0].quantity;
         const updatedUnit = unit || existingItem[0].unit;
-        const updatedThreshold = threshold !== undefined ? threshold : existingItem[0].threshold;
+        const incomingReorderLevel = getReorderLevelValue(req.body);
+        const existingReorderLevel = Number(existingItem[0].reorder_level ?? existingItem[0].threshold ?? 0);
+        const updatedReorderLevel = (req.body.reorder_level !== undefined || req.body.threshold !== undefined)
+            ? incomingReorderLevel
+            : existingReorderLevel;
+        const updatedCategory = category !== undefined ? String(category || '').trim() || null : (existingItem[0].category ?? null);
+        const updatedSupplier = supplier !== undefined ? String(supplier || '').trim() || null : (existingItem[0].supplier ?? null);
 
         // Validation: Ensure quantity is not negative
         if (parseFloat(updatedQuantity) < 0) {
@@ -393,31 +454,26 @@ export const updateInventoryItem = async (req, res) => {
             });
         }
 
-        // Validation: Ensure threshold is positive
-        if (parseFloat(updatedThreshold) <= 0) {
+        // Validation: Ensure reorder level is non-negative
+        if (parseFloat(updatedReorderLevel) < 0) {
             return res.status(400).json({
                 success: false,
                 error: 'Validation failed',
-                message: 'threshold must be greater than 0'
+                message: 'reorder_level must be greater than or equal to 0'
             });
         }
 
-        // Calculate new status based on updated quantity and threshold
-        const qtyNum = parseFloat(updatedQuantity);
-        const thresholdNum = parseFloat(updatedThreshold);
-        let newStatus = 'good';
-
-        if (qtyNum <= thresholdNum / 2) {
-            newStatus = 'critical';
-        } else if (qtyNum <= thresholdNum) {
-            newStatus = 'low';
-        }
+        // Calculate new status based on updated quantity and reorder level
+        const newStatus = computeInventoryStatus(updatedQuantity, updatedReorderLevel);
 
         // Update database record
-        const [result] = await db.query(
-            'UPDATE inventory SET item_name = ?, quantity = ?, unit = ?, threshold = ?, status = ?, updated_at = NOW() WHERE inventory_id = ?',
-            [updatedName.trim(), updatedQuantity, updatedUnit.trim(), updatedThreshold, newStatus, id]
-        );
+        const updateSql = useReorderLevel
+            ? 'UPDATE inventory SET item_name = ?, category = ?, supplier = ?, quantity = ?, unit = ?, threshold = ?, reorder_level = ?, status = ?, updated_at = NOW() WHERE inventory_id = ?'
+            : 'UPDATE inventory SET item_name = ?, category = ?, supplier = ?, quantity = ?, unit = ?, threshold = ?, status = ?, updated_at = NOW() WHERE inventory_id = ?';
+        const updateParams = useReorderLevel
+            ? [updatedName.trim(), updatedCategory, updatedSupplier, updatedQuantity, updatedUnit.trim(), updatedReorderLevel, updatedReorderLevel, newStatus, id]
+            : [updatedName.trim(), updatedCategory, updatedSupplier, updatedQuantity, updatedUnit.trim(), updatedReorderLevel, newStatus, id];
+        const [result] = await db.query(updateSql, updateParams);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({
@@ -427,7 +483,11 @@ export const updateInventoryItem = async (req, res) => {
         }
 
         // Fetch updated item to return complete data
-        const [updatedItem] = await db.query('SELECT * FROM inventory WHERE inventory_id = ?', [id]);
+        const reorderExpr = useReorderLevel ? 'COALESCE(reorder_level, threshold)' : 'threshold';
+        const [updatedItem] = await db.query(
+            `SELECT *, ${reorderExpr} AS reorder_level FROM inventory WHERE inventory_id = ?`,
+            [id]
+        );
 
         res.status(200).json({
             success: true,
@@ -521,6 +581,7 @@ export const updateInventoryItem = async (req, res) => {
  */
 export const updateInventoryQuantity = async (req, res) => {
     try {
+        const useReorderLevel = await hasColumn('reorder_level');
         const { id } = req.params;
         const { quantity, operation = 'set' } = req.body;
 
@@ -559,7 +620,7 @@ export const updateInventoryQuantity = async (req, res) => {
 
         const currentItem = item[0];
         const currentQuantity = parseFloat(currentItem.quantity);
-        const thresholdNum = parseFloat(currentItem.threshold);
+        const reorderLevelNum = Number(currentItem.reorder_level ?? currentItem.threshold ?? 0);
         let newQuantity;
 
         // Calculate new quantity based on operation
@@ -583,12 +644,7 @@ export const updateInventoryQuantity = async (req, res) => {
         }
 
         // Calculate status based on new quantity
-        let newStatus = 'good';
-        if (newQuantity <= thresholdNum / 2) {
-            newStatus = 'critical';
-        } else if (newQuantity <= thresholdNum) {
-            newStatus = 'low';
-        }
+        const newStatus = computeInventoryStatus(newQuantity, reorderLevelNum);
 
         // Update quantity and status, also update last_restocked timestamp
         // (even on removals, to track last inventory change)
@@ -598,7 +654,11 @@ export const updateInventoryQuantity = async (req, res) => {
         );
 
         // Fetch updated item to return complete data
-        const [updatedItem] = await db.query('SELECT * FROM inventory WHERE inventory_id = ?', [id]);
+        const reorderExpr = useReorderLevel ? 'COALESCE(reorder_level, threshold)' : 'threshold';
+        const [updatedItem] = await db.query(
+            `SELECT *, ${reorderExpr} AS reorder_level FROM inventory WHERE inventory_id = ?`,
+            [id]
+        );
 
         res.status(200).json({
             success: true,
@@ -708,6 +768,41 @@ export const getLowStockItems = async (req, res) => {
             success: false,
             error: 'Failed to fetch low stock items',
             details: error.message
+        });
+    }
+};
+
+// ============================================================
+// GET INVENTORY ALERTS
+// ============================================================
+export const getInventoryAlerts = async (req, res) => {
+    try {
+        const reorderExpr = (await hasColumn('reorder_level'))
+            ? 'COALESCE(reorder_level, threshold)'
+            : 'threshold';
+        const [rows] = await db.query(
+            `SELECT *, ${reorderExpr} AS reorder_level
+             FROM inventory
+             WHERE status IN ('low', 'critical')
+             ORDER BY CASE WHEN status = 'critical' THEN 0 ELSE 1 END, quantity ASC`
+        );
+
+        const criticalCount = rows.filter((row) => row.status === 'critical').length;
+        const lowCount = rows.filter((row) => row.status === 'low').length;
+
+        return res.status(200).json({
+            success: true,
+            low_count: lowCount,
+            critical_count: criticalCount,
+            total_alert_count: lowCount + criticalCount,
+            items: rows,
+        });
+    } catch (error) {
+        console.error('Error fetching inventory alerts:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to fetch inventory alerts',
+            details: error.message,
         });
     }
 };

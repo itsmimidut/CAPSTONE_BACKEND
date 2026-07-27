@@ -1,33 +1,35 @@
-/**
- * ============================================================
- * Analytics Routes
- * ============================================================
- * 
- * Purpose: Define API endpoints for analytics data
- * Base Path: /api/analytics
- * 
- * Endpoints:
- * - GET /stats - Dashboard statistics
- * - GET /revenue-chart - Revenue trend chart data  
- * - GET /bookings-by-type - Bookings breakdown by type
- */
-
 import express from 'express';
 import {
-    getStats,
-    getRevenueChart,
-    getBookingsByType
+  getStats,
+  getRevenueChart,
+  getBookingsByType,
+  getOverview,
+  getRevenue,
+  getBookingsAnalytics,
+  getGuests,
+  getSwimming,
+  getPos,
+  getShop,
+  getPromos,
+  getOccupancy,
 } from '../controllers/analyticsController.js';
 
 const router = express.Router();
 
-// Get dashboard statistics
+// Phase 7A system-wide analytics
+router.get('/overview', getOverview);
+router.get('/revenue', getRevenue);
+router.get('/bookings', getBookingsAnalytics);
+router.get('/guests', getGuests);
+router.get('/swimming', getSwimming);
+router.get('/pos', getPos);
+router.get('/shop', getShop);
+router.get('/promos', getPromos);
+router.get('/occupancy', getOccupancy);
+
+// Legacy dashboard analytics (AdminDashboard)
 router.get('/stats', getStats);
-
-// Get revenue chart data
 router.get('/revenue-chart', getRevenueChart);
-
-// Get bookings by type chart data
 router.get('/bookings-by-type', getBookingsByType);
 
 export default router;

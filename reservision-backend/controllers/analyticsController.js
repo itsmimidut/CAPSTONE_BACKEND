@@ -18,6 +18,42 @@
  */
 
 import db from "../config/db.js";
+import {
+  parseAnalyticsFilters,
+  getAnalyticsOverview,
+  getRevenueAnalytics,
+  getBookingAnalytics,
+  getGuestAnalytics,
+  getSwimmingAnalytics,
+  getPosAnalytics,
+  getShopAnalytics,
+  getPromoAnalytics,
+  getOccupancyAnalytics,
+} from '../services/analyticsService.js';
+
+const sendAnalytics = async (req, res, loader) => {
+  try {
+    const filters = parseAnalyticsFilters(req.query || {});
+    const data = await loader(filters);
+    return res.json({ success: true, data });
+  } catch (error) {
+    console.error('Analytics error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to load analytics data.',
+    });
+  }
+};
+
+export const getOverview = (req, res) => sendAnalytics(req, res, getAnalyticsOverview);
+export const getRevenue = (req, res) => sendAnalytics(req, res, getRevenueAnalytics);
+export const getBookingsAnalytics = (req, res) => sendAnalytics(req, res, getBookingAnalytics);
+export const getGuests = (req, res) => sendAnalytics(req, res, getGuestAnalytics);
+export const getSwimming = (req, res) => sendAnalytics(req, res, getSwimmingAnalytics);
+export const getPos = (req, res) => sendAnalytics(req, res, getPosAnalytics);
+export const getShop = (req, res) => sendAnalytics(req, res, getShopAnalytics);
+export const getPromos = (req, res) => sendAnalytics(req, res, getPromoAnalytics);
+export const getOccupancy = (req, res) => sendAnalytics(req, res, getOccupancyAnalytics);
 
 /**
  * Calculate date range based on period
