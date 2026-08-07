@@ -9,7 +9,9 @@ export const getInitialBookingPaymentState = (paymentMethod) => ({
 });
 
 export const getPaidBookingPaymentState = () => ({
-  bookingStatus: BOOKING_STATUS.CONFIRMED,
+  // Payment settlement is not reservation approval. The booking remains
+  // pending until an authorized admin explicitly confirms it.
+  bookingStatus: BOOKING_STATUS.PENDING,
   paymentStatus: PAYMENT_STATUS.PAID,
 });
 

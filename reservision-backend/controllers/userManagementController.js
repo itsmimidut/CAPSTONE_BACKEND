@@ -505,6 +505,14 @@ export const changeUserRole = async (req, res) => {
         const { id } = req.params;
         const { role } = req.body;
 
+        if (String(req.user?.id ?? '') === String(id)) {
+            return res.status(409).json({
+                success: false,
+                code: 'SELF_ROLE_CHANGE_FORBIDDEN',
+                error: 'You cannot change your own role while signed in'
+            });
+        }
+
         if (!role) {
             return res.status(400).json({
                 success: false,

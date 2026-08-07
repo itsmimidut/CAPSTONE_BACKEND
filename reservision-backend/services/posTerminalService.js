@@ -9,7 +9,7 @@ export const getTerminalSettings = async (terminalId) => {
 
     const [rows] = await db.query(
         `SELECT pts.id, pts.terminal_id, pts.station_id, pts.created_at,
-                ps.station_code, ps.station_name, ps.location
+                ps.station_code, ps.station_name, ps.location, ps.active AS station_active
          FROM pos_terminal_settings pts
          LEFT JOIN pos_stations ps ON ps.id = pts.station_id
          WHERE pts.terminal_id = ?
@@ -22,6 +22,7 @@ export const getTerminalSettings = async (terminalId) => {
             terminalId: normalized,
             stationId: null,
             station: null,
+            registered: false,
         };
     }
 
@@ -29,12 +30,14 @@ export const getTerminalSettings = async (terminalId) => {
     return {
         terminalId: row.terminal_id,
         stationId: row.station_id,
+        registered: true,
         station: row.station_id
             ? {
                   id: row.station_id,
                   stationCode: row.station_code,
                   stationName: row.station_name,
                   location: row.location || '',
+                  active: Boolean(row.station_active),
               }
             : null,
         createdAt: row.created_at,
@@ -53,6 +56,12 @@ export const upsertTerminalSettings = async (terminalId, stationId) => {
 
     if (parsedStationId !== null && (!Number.isFinite(parsedStationId) || parsedStationId <= 0)) {
         throw Object.assign(new Error('Invalid station ID'), { statusCode: 400 });
+    }
+    if (parsedStationId !== null) {
+        const [stations] = await db.query('SELECT id FROM pos_stations WHERE id = ? AND active = 1 LIMIT 1', [parsedStationId]);
+        if (!stations.length) {
+            throw Object.assign(new Error('The selected station is inactive or does not exist.'), { statusCode: 400, code: 'STATION_INACTIVE' });
+        }
     }
 
     if (parsedStationId) {

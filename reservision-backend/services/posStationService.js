@@ -23,7 +23,7 @@ export const seedDefaultStations = async () => {
 export const listStations = async ({ activeOnly = false } = {}) => {
     const conditions = activeOnly ? 'WHERE active = 1' : '';
     const [rows] = await db.query(
-        `SELECT id, station_code, station_name, location, active, created_at
+        `SELECT id, station_code, station_name, description, location, active, created_at, updated_at
          FROM pos_stations
          ${conditions}
          ORDER BY station_name ASC`
@@ -33,15 +33,17 @@ export const listStations = async ({ activeOnly = false } = {}) => {
         id: row.id,
         stationCode: row.station_code,
         stationName: row.station_name,
+        description: row.description || '',
         location: row.location || '',
         active: Boolean(row.active),
         createdAt: row.created_at,
+        updatedAt: row.updated_at,
     }));
 };
 
 export const getStationById = async (id) => {
     const [rows] = await db.query(
-        `SELECT id, station_code, station_name, location, active, created_at
+        `SELECT id, station_code, station_name, description, location, active, created_at, updated_at
          FROM pos_stations WHERE id = ? LIMIT 1`,
         [id]
     );
@@ -51,13 +53,15 @@ export const getStationById = async (id) => {
         id: row.id,
         stationCode: row.station_code,
         stationName: row.station_name,
+        description: row.description || '',
         location: row.location || '',
         active: Boolean(row.active),
         createdAt: row.created_at,
+        updatedAt: row.updated_at,
     };
 };
 
-export const createStation = async ({ stationCode, stationName, location = null, active = true }) => {
+export const createStation = async ({ stationCode, stationName, description = null, location = null, active = true }) => {
     const code = String(stationCode || '').trim().toUpperCase();
     const name = String(stationName || '').trim();
     if (!code || !name) {
@@ -65,25 +69,33 @@ export const createStation = async ({ stationCode, stationName, location = null,
     }
 
     const [result] = await db.query(
-        `INSERT INTO pos_stations (station_code, station_name, location, active)
-         VALUES (?, ?, ?, ?)`,
-        [code, name, location ? String(location).trim() : null, active ? 1 : 0]
+        `INSERT INTO pos_stations (station_code, station_name, description, location, active)
+         VALUES (?, ?, ?, ?, ?)`,
+        [code, name, description ? String(description).trim() : null, location ? String(location).trim() : null, active ? 1 : 0]
     );
 
     return getStationById(result.insertId);
 };
 
-export const updateStation = async (id, { stationCode, stationName, location, active }) => {
+export const updateStation = async (id, { stationCode, stationName, description, location, active }) => {
     const updates = [];
     const values = [];
 
     if (stationCode !== undefined) {
-        updates.push('station_code = ?');
-        values.push(String(stationCode).trim().toUpperCase());
+        const current = await getStationById(id);
+        if (!current) throw Object.assign(new Error('Station not found'), { statusCode: 404 });
+        const nextCode = String(stationCode).trim().toUpperCase();
+        if (nextCode !== current.stationCode) {
+            throw Object.assign(new Error('Station code cannot be changed after creation.'), { statusCode: 409, code: 'STATION_CODE_IMMUTABLE' });
+        }
     }
     if (stationName !== undefined) {
         updates.push('station_name = ?');
         values.push(String(stationName).trim());
+    }
+    if (description !== undefined) {
+        updates.push('description = ?');
+        values.push(description ? String(description).trim() : null);
     }
     if (location !== undefined) {
         updates.push('location = ?');
@@ -110,21 +122,25 @@ export const updateStation = async (id, { stationCode, stationName, location, ac
 };
 
 export const deleteStation = async (id) => {
-    const [assigned] = await db.query(
-        `SELECT COUNT(*) AS total FROM customer_display_devices WHERE station_id = ?`,
-        [id]
-    );
-    if (Number(assigned[0]?.total || 0) > 0) {
+    const station = await getStationById(id);
+    if (!station) throw Object.assign(new Error('Station not found'), { statusCode: 404 });
+    const dependencyQueries = {
+        terminals: 'SELECT COUNT(*) AS total FROM pos_terminal_settings WHERE station_id = ?',
+        connectors: 'SELECT COUNT(*) AS total FROM print_bridge_devices WHERE station_id = ? AND is_active = 1',
+        printers: 'SELECT COUNT(*) AS total FROM pos_printers WHERE station_id = ? AND is_active = 1',
+        displays: 'SELECT COUNT(*) AS total FROM customer_display_devices WHERE station_id = ?',
+    };
+    const dependencies = {};
+    for (const [name, sql] of Object.entries(dependencyQueries)) {
+        const [rows] = await db.query(sql, [id]);
+        dependencies[name] = Number(rows[0]?.total || 0);
+    }
+    if (Object.values(dependencies).some((count) => count > 0)) {
         throw Object.assign(
-            new Error('Cannot delete station with assigned display devices'),
-            { statusCode: 400, code: 'STATION_HAS_DEVICES' }
+            new Error('Reassign or deactivate the station dependencies before deactivation.'),
+            { statusCode: 409, code: 'STATION_HAS_DEPENDENCIES', dependencies }
         );
     }
-
-    await db.query('UPDATE pos_terminal_settings SET station_id = NULL WHERE station_id = ?', [id]);
-    const [result] = await db.query('DELETE FROM pos_stations WHERE id = ?', [id]);
-    if (!result.affectedRows) {
-        throw Object.assign(new Error('Station not found'), { statusCode: 404 });
-    }
-    return { success: true };
+    await db.query('UPDATE pos_stations SET active = 0 WHERE id = ?', [id]);
+    return { success: true, deactivated: true, station: await getStationById(id), dependencies };
 };

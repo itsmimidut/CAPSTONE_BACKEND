@@ -1,4 +1,5 @@
 import db from '../config/db.js';
+import { requireBookingItemType } from '../utils/bookingItemType.js';
 import { generateQRCode, formatBookingDataForQR } from '../services/qrCodeService.js';
 import { sendBookingConfirmationWithQR } from '../services/emailService.js';
 import { isCashPaymentMethod } from '../services/paymentRecordService.js';
@@ -622,7 +623,7 @@ export const createBookingConfirmation = async (req, res) => {
       }
 
       // Determine item type
-      const itemType = item.swimmingDetails
+      const rawItemType = item.swimmingDetails
         ? 'Swimming'
         : isEvent
           ? 'Event'
@@ -632,6 +633,11 @@ export const createBookingConfirmation = async (req, res) => {
       const itemName = item.swimmingDetails
         ? (item.name || 'Swimming Lesson Package')
         : (item.name || 'Item')
+      const itemType = requireBookingItemType(rawItemType, {
+        bookingType,
+        itemName,
+        fallback: isRoom ? 'Room' : null,
+      });
 
       console.log(`📦 Adding booking item: ${itemType} - ${itemName} [${bookingType}]`)
 

@@ -17,6 +17,11 @@
     "verify:phase5-final": "node scripts/verify-phase5-final.mjs",
     "verify:room-auto-assign": "node scripts/verify-room-auto-assign.mjs",
     "verify:booking-demand-dataset": "node scripts/verify-booking-demand-dataset.mjs",
+    "verify:feedback-phase7": "node scripts/verify-feedback-phase7.mjs",
+    "backfill:eshop-items": "node scripts/backfillPosTransactionItems.js",
+    "verify:eshop-items": "node scripts/verifyPosTransactionItems.js",
+    "verify:eshop-feedback-phase-c": "node scripts/verifyEshopFeedbackPhaseC.js",
+    "verify:eshop-feedback-phase-e": "node scripts/verifyEshopFeedbackPhaseE.js",
     "sync:booking-demand-dataset": "node scripts/sync-booking-demand-dataset.mjs"
   },
   "keywords": [],

@@ -139,14 +139,6 @@ const processPaidInvoiceWebhook = async (payment) => {
       acceptedPaymentReference
       && String(acceptedPaymentReference) !== String(payment.id || '')
     );
-    await db.query(
-      `UPDATE bookings
-       SET booking_status = ?,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE booking_id = ?
-         AND booking_status = ?`,
-      [paidState.bookingStatus, booking.booking_id, BOOKING_STATUS.PENDING],
-    );
     await markXenditPaymentPaid({
       bookingId: booking.booking_id,
       customerId: booking.customer_id,
@@ -187,13 +179,11 @@ const processPaidInvoiceWebhook = async (payment) => {
   await db.query(
     `UPDATE bookings SET
       payment_status = ?,
-      booking_status = ?,
       updated_at = CURRENT_TIMESTAMP
     WHERE booking_id = ?
       AND payment_status IN (?, ?, ?, ?)`,
     [
       paidState.paymentStatus,
-      paidState.bookingStatus,
       booking.booking_id,
       PAYMENT_STATUS.UNPAID,
       PAYMENT_STATUS.PENDING,
@@ -784,13 +774,11 @@ export const confirmPaymentFromXendit = async (req, res) => {
       await db.query(
         `UPDATE bookings SET
           payment_status = ?,
-          booking_status = ?,
           updated_at = CURRENT_TIMESTAMP
         WHERE booking_id = ?
           AND payment_status IN (?, ?, ?, ?)`,
         [
           paidState.paymentStatus,
-          paidState.bookingStatus,
           booking.booking_id,
           PAYMENT_STATUS.UNPAID,
           PAYMENT_STATUS.PENDING,

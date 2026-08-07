@@ -54,6 +54,11 @@ export async function ensurePrintBridgeSchema() {
 
 async function ensureBridgeDeviceExtraColumns() {
   const columns = [
+    { name: 'installation_id', definition: 'VARCHAR(100) NULL' },
+    { name: 'hostname', definition: 'VARCHAR(255) NULL' },
+    { name: 'operating_system', definition: 'VARCHAR(150) NULL' },
+    { name: 'registered_at', definition: 'DATETIME NULL' },
+    { name: 'is_revoked', definition: 'TINYINT DEFAULT 0' },
     { name: 'device_type', definition: "ENUM('windows', 'android', 'unknown') DEFAULT 'unknown'" },
     { name: 'capabilities', definition: 'JSON NULL' },
     { name: 'reported_printers', definition: 'JSON NULL' },
@@ -73,6 +78,16 @@ async function ensureBridgeDeviceExtraColumns() {
         `ALTER TABLE print_bridge_devices ADD COLUMN ${column.name} ${column.definition}`
       );
     }
+  }
+  const [indexes] = await db.query(
+    `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'print_bridge_devices'
+       AND INDEX_NAME = 'uq_print_bridge_installation_id' LIMIT 1`
+  );
+  if (!indexes.length) {
+    await db.query(
+      'CREATE UNIQUE INDEX uq_print_bridge_installation_id ON print_bridge_devices (installation_id)'
+    );
   }
 }
 
@@ -143,6 +158,28 @@ function generatePairingToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
+function secureEquals(left, right) {
+  const a = Buffer.from(String(left || ''));
+  const b = Buffer.from(String(right || ''));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireRegistrationCredential(value) {
+  const expected = process.env.PRINT_CONNECTOR_REGISTRATION_CREDENTIAL;
+  if (!expected) {
+    const err = new Error('Automatic connector registration is not configured.');
+    err.status = 503;
+    err.code = 'CONNECTOR_REGISTRATION_NOT_CONFIGURED';
+    throw err;
+  }
+  if (!secureEquals(value, expected)) {
+    const err = new Error('Invalid connector registration credential.');
+    err.status = 401;
+    err.code = 'INVALID_REGISTRATION_CREDENTIAL';
+    throw err;
+  }
+}
+
 function computeLiveStatus(row) {
   if (!row?.is_active) return 'offline';
   if (!row.last_seen_at) return row.status || 'unknown';
@@ -179,6 +216,14 @@ function normalizeDeviceType(value) {
 }
 
 function normalizeCapabilities(input, deviceType) {
+  if (Array.isArray(input)) {
+    const values = new Set(input.map((value) => String(value).toLowerCase()));
+    return {
+      windows_printers: values.has('windows_printer') || values.has('windows_printers'),
+      com_ports: values.has('bluetooth_serial') || values.has('com_ports'),
+      android_bluetooth: values.has('android_bluetooth'),
+    };
+  }
   if (input && typeof input === 'object' && !Array.isArray(input)) {
     return {
       windows_printers: Boolean(input.windows_printers ?? input.windowsPrinters),
@@ -196,6 +241,9 @@ function mapBridgeDeviceRow(row, { includeToken = false } = {}) {
     id: row.id,
     deviceName: row.device_name,
     deviceCode: row.device_code,
+    installationId: row.installation_id || null,
+    hostname: row.hostname || null,
+    operatingSystem: row.operating_system || null,
     deviceType,
     capabilities: parseJsonField(row.capabilities, defaultCapabilitiesForType(deviceType)),
     reportedPrinters: parseJsonField(row.reported_printers, []),
@@ -206,6 +254,8 @@ function mapBridgeDeviceRow(row, { includeToken = false } = {}) {
     lastSeenAt: row.last_seen_at,
     appVersion: row.app_version || null,
     isActive: Boolean(row.is_active),
+    isRevoked: Boolean(row.is_revoked),
+    state: row.is_revoked ? 'REVOKED' : !row.is_active ? 'DISABLED' : row.station_id ? (computeLiveStatus(row) === 'online' ? 'ACTIVE' : 'OFFLINE') : (computeLiveStatus(row) === 'online' ? 'UNASSIGNED' : 'OFFLINE'),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -322,6 +372,15 @@ export async function registerBridgeDevice(data = {}) {
 
   const pairingToken = generatePairingToken();
   const stationId = data.stationId ?? data.station_id ?? null;
+  if (stationId != null && stationId !== '') {
+    const [stations] = await db.query('SELECT id FROM pos_stations WHERE id = ? AND active = 1 LIMIT 1', [stationId]);
+    if (!stations.length) {
+      const err = new Error('The selected station is inactive or does not exist.');
+      err.status = 400;
+      err.code = 'STATION_INACTIVE';
+      throw err;
+    }
+  }
   const appVersion = data.appVersion || data.app_version || null;
   const deviceType = normalizeDeviceType(data.deviceType || data.device_type);
   const capabilities = normalizeCapabilities(data.capabilities, deviceType);
@@ -356,6 +415,65 @@ export async function registerBridgeDevice(data = {}) {
     }
     throw error;
   }
+}
+
+/** First-start registration for an installed background connector. */
+export async function automaticallyRegisterConnector(data = {}) {
+  await ensurePrintBridgeSchema();
+  requireRegistrationCredential(data.registrationCredential || data.registration_credential);
+  const installationId = String(data.installationId || data.installation_id || '').trim();
+  if (!installationId) {
+    const err = new Error('installationId is required.');
+    err.status = 400;
+    err.code = 'INSTALLATION_ID_REQUIRED';
+    throw err;
+  }
+
+  const [rows] = await db.query('SELECT * FROM print_bridge_devices WHERE installation_id = ? LIMIT 1', [installationId]);
+  const existing = rows[0];
+  if (existing?.is_revoked) {
+    const err = new Error('This connector installation has been revoked.');
+    err.status = 403;
+    err.code = 'CONNECTOR_REVOKED';
+    throw err;
+  }
+
+  const deviceName = String(data.deviceName || data.device_name || data.hostname || 'POS Device').trim();
+  const deviceCode = String(data.deviceCode || data.device_code || '').trim() || generateDeviceCode();
+  const appVersion = data.connectorVersion || data.connector_version || data.appVersion || null;
+  const hostname = String(data.hostname || '').trim() || null;
+  const operatingSystem = String(data.operatingSystem || data.operating_system || '').trim() || null;
+  const deviceType = normalizeDeviceType(data.deviceType || (/windows/i.test(operatingSystem || '') ? 'windows' : 'unknown'));
+  const capabilities = normalizeCapabilities(data.capabilities, deviceType);
+
+  if (existing) {
+    const providedToken = data.connectorToken || data.connector_token || data.pairingToken;
+    if (!secureEquals(providedToken, existing.pairing_token)) {
+      const err = new Error('The permanent connector credential is required to restore this installation.');
+      err.status = 401;
+      err.code = 'INVALID_CONNECTOR_CREDENTIAL';
+      throw err;
+    }
+    await db.query(
+      `UPDATE print_bridge_devices SET device_name = ?, hostname = ?, operating_system = ?,
+       app_version = ?, device_type = ?, capabilities = ?, last_seen_at = NOW(), status = 'online'
+       WHERE id = ?`,
+      [deviceName, hostname, operatingSystem, appVersion, deviceType, JSON.stringify(capabilities), existing.id]
+    );
+    const device = await getBridgeDeviceById(existing.id);
+    return { ...device, connectorToken: null, heartbeatIntervalSeconds: 20, configuredPrinterCount: 0 };
+  }
+
+  const connectorToken = generatePairingToken();
+  const [result] = await db.query(
+    `INSERT INTO print_bridge_devices
+     (installation_id, device_name, device_code, pairing_token, status, last_seen_at, app_version,
+      device_type, capabilities, hostname, operating_system, registered_at, is_active, is_revoked)
+     VALUES (?, ?, ?, ?, 'online', NOW(), ?, ?, ?, ?, ?, NOW(), 1, 0)`,
+    [installationId, deviceName, deviceCode, connectorToken, appVersion, deviceType, JSON.stringify(capabilities), hostname, operatingSystem]
+  );
+  const device = await getBridgeDeviceById(result.insertId);
+  return { ...device, connectorToken, heartbeatIntervalSeconds: 20, configuredPrinterCount: 0 };
 }
 
 export async function heartbeat(deviceCode, data = {}) {
@@ -432,6 +550,15 @@ export async function updateBridgeDevice(id, data = {}) {
   }
 
   const stationId = data.stationId !== undefined ? data.stationId : existing.stationId;
+  if (stationId != null && stationId !== '') {
+    const [stations] = await db.query('SELECT id FROM pos_stations WHERE id = ? AND active = 1 LIMIT 1', [stationId]);
+    if (!stations.length) {
+      const err = new Error('The selected station is inactive or does not exist.');
+      err.status = 400;
+      err.code = 'STATION_INACTIVE';
+      throw err;
+    }
+  }
   const isActive = data.isActive !== undefined ? (data.isActive ? 1 : 0) : (existing.isActive ? 1 : 0);
   const deviceType = data.deviceType !== undefined
     ? normalizeDeviceType(data.deviceType)
@@ -524,14 +651,23 @@ export async function reportConnectorPrinters(deviceCode, printers = []) {
   }
 
   const list = Array.isArray(printers) ? printers : [];
-  const normalized = list.map((item) => ({
-    type: String(item.type || item.connection_method || 'unknown').toLowerCase(),
-    name: item.name || item.printer_name || null,
-    com_port: item.com_port || item.comPort || null,
-    baud_rate: item.baud_rate ?? item.baudRate ?? null,
-    bluetooth_address: item.bluetooth_address || item.bluetoothAddress || null,
-    windows_printer_name: item.windows_printer_name || item.windowsPrinterName || item.name || null,
-  })).filter((item) => item.name || item.com_port || item.bluetooth_address);
+  const normalized = list.map((item) => {
+    const type = String(item.type || item.connection_method || 'unknown').toLowerCase();
+    const name = item.name || item.printer_name || null;
+    const comPort = item.com_port || item.comPort || null;
+    const address = item.bluetooth_address || item.bluetoothAddress || null;
+    const windowsName = item.windows_printer_name || item.windowsPrinterName || item.name || null;
+    const identity = type === 'bluetooth_serial' ? comPort : type === 'android_bluetooth' ? address : windowsName;
+    return {
+      printer_key: String(item.printer_key || item.printerKey || `${type}:${identity || name || 'unknown'}`),
+      type,
+      name,
+      com_port: comPort,
+      baud_rate: item.baud_rate ?? item.baudRate ?? null,
+      bluetooth_address: address,
+      windows_printer_name: windowsName,
+    };
+  }).filter((item) => item.name || item.com_port || item.bluetooth_address);
 
   await db.query(
     `UPDATE print_bridge_devices

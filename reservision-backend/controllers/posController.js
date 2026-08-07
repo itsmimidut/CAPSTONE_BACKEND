@@ -47,6 +47,12 @@ import {
     PosOrderSessionError,
 } from '../services/posOrderSessionService.js';
 import { logSystemEvent } from '../utils/logger.js';
+import { getTerminalSettings } from '../services/posTerminalService.js';
+import {
+    insertNormalizedPosTransactionItems,
+    normalizePosTransactionItems,
+    PosTransactionItemValidationError,
+} from '../services/posTransactionItemService.js';
 
 const getAuthenticatedUserId = (req) => Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
 
@@ -666,26 +672,11 @@ export const createTransaction = async (req, res) => {
         );
 
         if (detailTableRows[0]?.total > 0) {
-            for (const item of pricedItems) {
-                const quantity = Number(item.quantity ?? item.qty ?? 1);
-                const lineTotal = Number(item.price ?? 0);
-                const unitPrice = Number(item.unitPrice ?? (quantity > 0 ? lineTotal / quantity : lineTotal));
-
-                await connection.query(
-                    `INSERT INTO pos_transaction_items
-                    (transaction_id, receipt_no, item_name, quantity, unit_price, line_total, booking_reference)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                    [
-                        result.insertId,
-                        normalizedReceiptNo,
-                        item.name ?? null,
-                        quantity,
-                        unitPrice,
-                        lineTotal,
-                        item.bookingReference ?? null
-                    ]
-                );
-            }
+            await insertNormalizedPosTransactionItems(connection, {
+                transactionId: result.insertId,
+                receiptNo: normalizedReceiptNo,
+                items: pricedItems,
+            });
         }
 
         if (orderSession) {
@@ -1016,11 +1007,12 @@ export const createEshopOrder = async (req, res) => {
             menu_id: item.menu_id || item.id || null,
             name: item.name,
             price: parseFloat(item.price),
-            quantity: item.qty,
-            subtotal: parseFloat(item.price) * item.qty,
+            quantity: item.qty ?? item.quantity ?? 1,
+            subtotal: parseFloat(item.price) * (item.qty ?? item.quantity ?? 1),
             image_url: String(item.image_url || item.image || '').trim(),
             customization: item.customization || null,
         }));
+        normalizePosTransactionItems(itemsFormatted);
 
         const itemsJson = JSON.stringify(itemsFormatted);
         const transactionDate = now.toISOString().split('T')[0];
@@ -1096,6 +1088,12 @@ export const createEshopOrder = async (req, res) => {
         const transactionId = result.insertId;
         let invoicePayload = null;
 
+        await insertNormalizedPosTransactionItems(connection, {
+            transactionId,
+            receiptNo,
+            items: itemsFormatted,
+        });
+
         if (columnSet.has('fulfillment_status')) {
             await connection.query(
                 `INSERT INTO pos_fulfillment_history (
@@ -1161,6 +1159,14 @@ export const createEshopOrder = async (req, res) => {
     } catch (error) {
         await connection.rollback();
         console.error('Error creating e-shop order:', error);
+        if (error instanceof PosTransactionItemValidationError) {
+            return res.status(400).json({
+                success: false,
+                error: error.message,
+                code: error.code,
+                lineNumber: error.lineNumber,
+            });
+        }
         res.status(500).json({
             error: 'Failed to create order',
             details: error.message
@@ -1194,7 +1200,36 @@ const fetchEshopOrdersForCustomer = async (customerId) => {
         items: parseJsonArray(order.items),
     }));
 
+    const normalizedByTransaction = new Map();
+    if (orders.length) {
+        const placeholders = orders.map(() => '?').join(', ');
+        const [normalizedRows] = await db.query(
+            `SELECT
+                line_id,
+                transaction_id,
+                line_number,
+                menu_id,
+                product_name_snapshot,
+                unit_price_snapshot,
+                quantity,
+                modifiers_snapshot,
+                line_total_snapshot,
+                image_url_snapshot
+             FROM pos_transaction_items
+             WHERE transaction_id IN (${placeholders})
+             ORDER BY transaction_id, line_number`,
+            orders.map((order) => order.id),
+        );
+
+        normalizedRows.forEach((line) => {
+            const current = normalizedByTransaction.get(line.transaction_id) || [];
+            current.push(line);
+            normalizedByTransaction.set(line.transaction_id, current);
+        });
+    }
+
     const itemNames = [...new Set(parsedOrders
+        .filter((order) => !normalizedByTransaction.has(order.id))
         .flatMap((order) => order.items)
         .map((item) => String(item?.name || item?.item_name || '').trim())
         .filter(Boolean))];
@@ -1213,7 +1248,33 @@ const fetchEshopOrdersForCustomer = async (customerId) => {
 
     return parsedOrders.map((order) => ({
         ...order,
-        items: order.items.map((item) => {
+        items: normalizedByTransaction.has(order.id)
+            ? normalizedByTransaction.get(order.id).map((line) => {
+                const modifiers = line.modifiers_snapshot === null
+                    ? null
+                    : typeof line.modifiers_snapshot === 'string'
+                        ? JSON.parse(line.modifiers_snapshot)
+                        : line.modifiers_snapshot;
+                return {
+                    transactionItemId: line.line_id,
+                    lineNumber: line.line_number,
+                    menuId: line.menu_id,
+                    productName: line.product_name_snapshot,
+                    unitPrice: Number(line.unit_price_snapshot),
+                    quantity: Number(line.quantity),
+                    lineTotal: line.line_total_snapshot === null ? null : Number(line.line_total_snapshot),
+                    modifiers,
+                    imageUrl: line.image_url_snapshot || '',
+                    // Compatibility aliases used by the existing OrderHistory component.
+                    menu_id: line.menu_id,
+                    name: line.product_name_snapshot,
+                    price: Number(line.unit_price_snapshot),
+                    subtotal: line.line_total_snapshot === null ? null : Number(line.line_total_snapshot),
+                    customization: modifiers,
+                    image_url: line.image_url_snapshot || '',
+                };
+            })
+            : order.items.map((item) => {
             const menuItem = menuByName.get(String(item?.name || item?.item_name || '').trim().toLowerCase());
             return {
                 ...item,
@@ -1300,9 +1361,11 @@ export const getAllItems = async (req, res) => {
         // Get rooms and cottages from inventory_items table
         try {
             const [inventoryItems] = await db.query(
-                `SELECT name, price, category, category_type 
+                `SELECT item_id, name, description, price, category, category_type,
+                        room_number, max_guests
                  FROM inventory_items 
-                 WHERE status = 'Available' AND (category LIKE '%Room%' OR category = 'Cottage')`
+                 WHERE status = 'Available'
+                   AND (LOWER(category) LIKE '%room%' OR LOWER(category) LIKE '%cottage%')`
             );
 
             console.log('🏨 Found', inventoryItems.length, 'inventory items (rooms/cottages)');
@@ -1312,10 +1375,16 @@ export const getAllItems = async (req, res) => {
             const rooms = inventoryItems
                 .filter(item => item.category && item.category.toLowerCase().includes('room'))
                 .map(item => ({
+                    id: item.item_id,
+                    item_id: item.item_id,
+                    inventory_item_id: item.item_id,
                     category: 'rooms',
                     name: item.name,
                     price: parseFloat(item.price),
-                    description: item.category_type,
+                    description: item.description || item.category_type,
+                    category_type: item.category_type,
+                    room_number: item.room_number,
+                    max_guests: Number(item.max_guests || 0),
                     available: 1
                 }));
 
@@ -1325,10 +1394,16 @@ export const getAllItems = async (req, res) => {
             const cottages = inventoryItems
                 .filter(item => item.category && item.category.toLowerCase().includes('cottage'))
                 .map(item => ({
+                    id: item.item_id,
+                    item_id: item.item_id,
+                    inventory_item_id: item.item_id,
                     category: 'cottage',
                     name: item.name,
                     price: parseFloat(item.price),
-                    description: item.category_type,
+                    description: item.description || item.category_type,
+                    category_type: item.category_type,
+                    room_number: item.room_number,
+                    max_guests: Number(item.max_guests || 0),
                     available: 1
                 }));
 
@@ -1342,16 +1417,23 @@ export const getAllItems = async (req, res) => {
 
         // Get event items from inventory_items
         const [eventItems] = await db.query(
-            `SELECT name, price, category, category_type 
+            `SELECT item_id, name, description, price, category, category_type,
+                    room_number, max_guests
              FROM inventory_items 
-             WHERE status = 'Available' AND category = 'Event'`
+             WHERE status = 'Available' AND LOWER(category) LIKE '%event%'`
         );
 
         const formattedEventItems = eventItems.map(item => ({
+            id: item.item_id,
+            item_id: item.item_id,
+            inventory_item_id: item.item_id,
             category: 'event',
             name: item.name,
             price: parseFloat(item.price),
-            description: item.category_type,
+            description: item.description || item.category_type,
+            category_type: item.category_type,
+            room_number: item.room_number,
+            max_guests: Number(item.max_guests || 0),
             available: 1
         }));
 
@@ -1483,7 +1565,22 @@ export const printReceiptSecure = async (req, res) => {
     try {
         const receiptNo = String(req.params.receiptNo || '').trim();
         const { type, bookingReference, source } = req.body || {};
-        const stationId = req.body?.stationId ?? req.body?.station_id ?? null;
+        const terminalId = String(req.body?.terminalId ?? req.body?.terminal_id ?? '').trim();
+        if (!terminalId) {
+            return res.status(400).json({ success: false, message: 'This POS terminal is not registered.', code: 'TERMINAL_NOT_REGISTERED' });
+        }
+        const terminal = await getTerminalSettings(terminalId);
+        if (!terminal?.registered || !terminal?.stationId) {
+            return res.status(400).json({
+                success: false,
+                message: terminal?.registered ? 'This POS terminal has not been assigned to a station.' : 'This POS terminal is not registered.',
+                code: terminal?.registered ? 'STATION_NOT_ASSIGNED' : 'TERMINAL_NOT_REGISTERED',
+            });
+        }
+        if (!terminal.station?.active) {
+            return res.status(409).json({ success: false, message: 'The assigned POS station is inactive.', code: 'STATION_INACTIVE' });
+        }
+        const stationId = terminal.stationId;
         const requestedBy = Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
         const printSource = String(source || 'manual').trim().toLowerCase() === 'auto'
             ? 'auto'
@@ -1672,7 +1769,9 @@ export const retryPrintJob = async (req, res) => {
         }
 
         const requestedBy = Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
-        const result = await retryFailedPrintJob(jobId, requestedBy);
+        const result = await retryFailedPrintJob(jobId, requestedBy, {
+            routing: req.body?.routing || 'current',
+        });
 
         logSystemEvent('POS_PRINT_JOB_RETRY', {
             original_job_id: jobId,

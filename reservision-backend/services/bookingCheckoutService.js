@@ -15,28 +15,17 @@ export const finalizeBookingsForPaidTransaction = async (connection, pricedItems
         const [result] = await connection.query(
             `UPDATE bookings
              SET payment_status = ?,
-                 booking_status = 'Confirmed',
                  updated_at = CURRENT_TIMESTAMP
              WHERE booking_id = ?
                AND payment_status != ?`,
             [PAYMENT_STATUS.PAID, bookingId, PAYMENT_STATUS.PAID]
         );
 
-        const [checkInResult] = await connection.query(
-            `UPDATE bookings
-             SET booking_status = 'Checked-In',
-                 actual_check_in_time = COALESCE(actual_check_in_time, NOW())
-             WHERE booking_id = ?
-               AND payment_status = ?
-               AND booking_status IN ('Confirmed', 'Paid', 'Pending')`,
-            [bookingId, PAYMENT_STATUS.PAID]
-        );
-
-        if ((result.affectedRows || 0) > 0 || (checkInResult.affectedRows || 0) > 0) {
+        if ((result.affectedRows || 0) > 0) {
             updated += 1;
             await connection.query(
                 'INSERT INTO booking_logs (booking_id, action, description) VALUES (?, ?, ?)',
-                [bookingId, 'checked_in', `POS checkout finalized by ${staffUserId}`]
+                [bookingId, 'payment_received', `POS payment recorded by ${staffUserId}; pending admin approval`]
             ).catch(() => {});
         }
     }

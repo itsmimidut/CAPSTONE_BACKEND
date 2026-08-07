@@ -2,7 +2,6 @@ export const ALLOWED_CHANNELS = [
   'all',
   'reservation',
   'restaurant_pos',
-  'restaurant_online',
   'eshop'
 ]
 
@@ -38,6 +37,7 @@ export const ALLOWED_PAYMENT_METHODS = [
 ]
 
 export const MAX_REPORT_RANGE_DAYS = 366
+export const MAX_REPORT_SEARCH_LENGTH = 150
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
 
@@ -76,6 +76,10 @@ export const validateSalesReportQuery = (query = {}) => {
   const paymentStatus = (query.payment_status || query.paymentStatus || 'revenue').toLowerCase()
   const paymentMethod = (query.payment_method || query.paymentMethod || 'all').toLowerCase()
   const search = typeof query.search === 'string' ? query.search.trim() : ''
+
+  if (search.length > MAX_REPORT_SEARCH_LENGTH) {
+    return { valid: false, message: `Search must not exceed ${MAX_REPORT_SEARCH_LENGTH} characters.` }
+  }
 
   if (!dateFrom || !dateTo) {
     return { valid: false, message: 'Both date_from and date_to are required.' }

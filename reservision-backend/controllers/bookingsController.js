@@ -31,6 +31,8 @@ import {
 } from "../middleware/ownership.js";
 import { sendBookingApprovalEmail } from "../services/emailService.js";
 import {
+  createCustomerNotification,
+  emitPersistedCustomerNotification,
   getBookingNotificationTarget,
   notifyBookingCancelled,
   notifyBookingConfirmed,
@@ -47,6 +49,7 @@ import {
   validateBookingDates,
   generateBookingReference as generateRef
 } from "../services/roomAssignmentService.js";
+import { requireBookingItemType } from "../utils/bookingItemType.js";
 
 /**
  * Generate unique booking reference
@@ -586,7 +589,11 @@ export const createBooking = async (req, res) => {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
-          item.item.category || 'Room',
+          requireBookingItemType(item.item.category, {
+            bookingType: item.item.booking_type || item.item.bookingType,
+            itemName: item.item.name,
+            fallback: 'Room',
+          }),
           item.item.name,
           item.item.desc || item.item.description,
           item.item.item_id || null,
@@ -2020,11 +2027,14 @@ export const processCheckIn = async (req, res) => {
  * Process guest check-out
  */
 export const processCheckOut = async (req, res) => {
+  const connection = await db.getConnection();
   try {
+    await connection.beginTransaction();
     const { bookingId } = req.params;
     const { checked_out_by } = req.body;
 
     if (!bookingId) {
+      await connection.rollback();
       return res.status(400).json({
         success: false,
         error: 'Booking ID is required'
@@ -2032,12 +2042,18 @@ export const processCheckOut = async (req, res) => {
     }
 
     // Verify booking exists and get current status
-    const [existingBooking] = await db.query(
-      'SELECT booking_id, booking_status FROM bookings WHERE booking_id = ?',
+    const [existingBooking] = await connection.query(
+      `SELECT b.booking_id, b.booking_status, b.customer_id, c.user_id
+       FROM bookings b
+       LEFT JOIN customers c ON c.customer_id = b.customer_id
+       WHERE b.booking_id = ?
+       LIMIT 1
+       FOR UPDATE`,
       [bookingId]
     );
 
     if (!existingBooking || existingBooking.length === 0) {
+      await connection.rollback();
       return res.status(404).json({
         success: false,
         error: 'Booking not found'
@@ -2048,6 +2064,7 @@ export const processCheckOut = async (req, res) => {
 
     // Only allow check-out from Checked-In status
     if (currentStatus !== 'checkedin') {
+      await connection.rollback();
       return res.status(400).json({
         success: false,
         error: `Cannot check out booking with status: ${existingBooking[0].booking_status}. Guest must be Checked-In.`
@@ -2055,7 +2072,7 @@ export const processCheckOut = async (req, res) => {
     }
 
     // Update booking status to Checked-Out with actual check-out time
-    const [result] = await db.query(
+    const [result] = await connection.query(
       `UPDATE bookings 
        SET 
         booking_status = 'Checked-Out',
@@ -2065,10 +2082,36 @@ export const processCheckOut = async (req, res) => {
     );
 
     if (result.affectedRows === 0) {
+      await connection.rollback();
       return res.status(400).json({
         success: false,
         error: 'Failed to update booking status'
       });
+    }
+
+    const notificationTarget = existingBooking[0];
+    let feedbackInvitationNotificationId = null;
+    if (notificationTarget.customer_id && notificationTarget.user_id) {
+      feedbackInvitationNotificationId = await createCustomerNotification({
+        userId: notificationTarget.user_id,
+        customerId: notificationTarget.customer_id,
+        title: 'Tell us about your stay',
+        message: 'Your stay is complete. You can now leave feedback.',
+        type: 'feedback_invitation',
+        link: '/customer/reservations',
+        eventKey: `feedback_invitation:booking:${bookingId}`,
+        connection,
+      });
+    }
+
+    await connection.commit();
+
+    if (feedbackInvitationNotificationId) {
+      try {
+        await emitPersistedCustomerNotification(feedbackInvitationNotificationId);
+      } catch (notificationError) {
+        console.warn('Feedback invitation realtime notification failed:', notificationError.message);
+      }
     }
 
     try {
@@ -2089,12 +2132,15 @@ export const processCheckOut = async (req, res) => {
     });
 
   } catch (error) {
+    await connection.rollback();
     console.error('Error processing check-out:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to process check-out',
       details: error.message
     });
+  } finally {
+    connection.release();
   }
 };
 

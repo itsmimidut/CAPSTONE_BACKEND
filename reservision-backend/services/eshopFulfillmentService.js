@@ -1,7 +1,10 @@
 import db from '../config/db.js';
 import { getDisplayIo } from './displayWebSocketService.js';
 import { voidTransaction } from './transactionVoidService.js';
-import { createCustomerNotification } from './customerNotificationService.js';
+import {
+    createCustomerNotification,
+    emitPersistedCustomerNotification,
+} from './customerNotificationService.js';
 import {
     DELIVERY_TRANSITIONS,
     FULFILLMENT_LABELS,
@@ -260,6 +263,7 @@ export const updateFulfillmentStatus = async ({
     reason = null,
 }) => {
     const connection = await db.getConnection();
+    let invitationNotificationId = null;
     try {
         await connection.beginTransaction();
         const order = await loadOrderForUpdate(connection, transactionId);
@@ -284,7 +288,29 @@ export const updateFulfillmentStatus = async ({
 
         const updatedOrder = await loadUpdatedOrder(connection, transactionId);
         const timeline = await getFulfillmentTimeline(transactionId, connection);
+        if (
+            [FULFILLMENT_STATUS.DELIVERED, FULFILLMENT_STATUS.PICKED_UP].includes(transition.nextStatus)
+            && updatedOrder?.customer_user_id
+            && updatedOrder?.customer_id
+            && normalize(updatedOrder?.type) === 'e-shop'
+            && normalize(updatedOrder?.status) !== 'voided'
+            && !updatedOrder?.voided_at
+        ) {
+            invitationNotificationId = await createCustomerNotification({
+                userId: updatedOrder.customer_user_id,
+                customerId: updatedOrder.customer_id,
+                title: 'Tell us what you thought',
+                message: 'Your order has been completed. You can now review the products you purchased.',
+                type: 'product_feedback_invitation',
+                link: '/customer/orders',
+                eventKey: `product_feedback_invitation:transaction:${transactionId}`,
+                connection,
+            });
+        }
         await connection.commit();
+        if (invitationNotificationId) {
+            await emitPersistedCustomerNotification(invitationNotificationId);
+        }
         emitFulfillmentUpdated(updatedOrder);
         await notifyCustomerOfFulfillment(updatedOrder);
         return { order: updatedOrder, timeline };

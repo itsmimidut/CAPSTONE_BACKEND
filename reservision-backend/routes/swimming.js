@@ -2578,7 +2578,7 @@ router.post("/class-bookings", async (req, res) => {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 bookingId,
-                'Event',
+                'Swimming',
                 `Swimming Lesson - ${lessonType}`,
                 `Lesson Type: ${lessonType} | Skill: ${skillLevel || 'N/A'} | Time: ${preferredTime}`,
                 unitPrice,

@@ -17,6 +17,8 @@ import db from '../config/db.js';
 import { validateSalesReportQuery, inferChartPeriod } from '../utils/salesReportQueryValidation.js';
 import { getSalesReportTransactions } from '../services/salesReportTransactionService.js';
 import { buildTransactionCsv } from '../services/salesReportCsvService.js';
+import { buildSalesReportLedger } from '../services/salesReportLedgerService.js';
+import { SUCCESSFUL_REFUND_STATUSES } from '../utils/salesReportConstants.js';
 
 const formatDate = (value) => {
     if (!value) return null;
@@ -132,7 +134,6 @@ const normalizeReportChannel = (channel) => {
     const normalized = (channel || 'all').toLowerCase();
     if (normalized === 'reservations' || normalized === 'reservation') return 'reservation';
     if (normalized === 'pos' || normalized === 'restaurant' || normalized === 'restaurant_pos') return 'restaurant_pos';
-    if (normalized === 'restaurant_online') return 'restaurant_online';
     if (normalized === 'e-shop' || normalized === 'eshop') return 'eshop';
     return normalized || 'all';
 };
@@ -209,23 +210,23 @@ const buildPosTransactionStatusClause = (transaction_status) => {
     if (normalized === 'all') return null;
 
     if (normalized === 'voided') {
-        return "UPPER(COALESCE(pt.transaction_status, '')) = 'VOIDED' OR UPPER(COALESCE(pt.payment_status, '')) = 'VOIDED'";
+        return "UPPER(COALESCE(pt.status, '')) = 'VOIDED' OR UPPER(COALESCE(pt.payment_status, '')) = 'VOIDED'";
     }
 
     if (normalized === 'cancelled') {
-        return "UPPER(COALESCE(pt.transaction_status, '')) = 'VOIDED'";
+        return "UPPER(COALESCE(pt.status, '')) IN ('CANCELLED','CANCELED','VOIDED')";
     }
 
     if (normalized === 'pending') {
-        return "UPPER(COALESCE(pt.transaction_status, 'ACTIVE')) = 'ACTIVE' AND UPPER(COALESCE(pt.payment_status, 'PENDING')) = 'PENDING'";
+        return "UPPER(COALESCE(pt.status, 'ACTIVE')) = 'ACTIVE' AND UPPER(COALESCE(pt.payment_status, 'PENDING')) IN ('PENDING','UNPAID')";
     }
 
     if (normalized === 'completed') {
-        return "UPPER(COALESCE(pt.transaction_status, 'ACTIVE')) = 'ACTIVE' AND UPPER(COALESCE(pt.payment_status, 'PAID')) = 'PAID'";
+        return "UPPER(COALESCE(pt.status, 'ACTIVE')) = 'ACTIVE' AND UPPER(COALESCE(pt.payment_status, '')) IN ('PAID','REFUNDED','PARTIALLY_REFUNDED','PARTIAL_REFUND')";
     }
 
     if (normalized === 'in_progress') {
-        return "UPPER(COALESCE(pt.transaction_status, 'ACTIVE')) = 'ACTIVE'";
+        return "UPPER(COALESCE(pt.fulfillment_status, '')) IN ('IN_PROGRESS','PREPARING','PROCESSING')";
     }
 
     return null;
@@ -270,7 +271,6 @@ const buildBookingSearchClause = (search, params) => {
         OR COALESCE(c.first_name, '') LIKE ?
         OR COALESCE(c.last_name, '') LIKE ?
         OR COALESCE(c.email, '') LIKE ?
-        OR COALESCE(u.email, '') LIKE ?
         OR EXISTS (
             SELECT 1
             FROM booking_items bi_search
@@ -492,6 +492,7 @@ const buildSalesAnalyticsFilters = ({
 
     if (type === 'restaurant') {
         where.push('pti.menu_id IS NOT NULL');
+        where.push("LOWER(TRIM(COALESCE(pt.type, ''))) NOT IN ('e-shop','eshop','delivery')");
 
         if (normalizedChannel !== 'restaurant_pos' && normalizedChannel !== 'all') {
             where.push('0');
@@ -579,11 +580,10 @@ const querySalesAnalytics = async ({
 
     const bookingJoins = [
         bookingFilter.requiresCustomerJoin ? 'LEFT JOIN customers c ON c.customer_id = b.customer_id' : '',
-        bookingFilter.requiresUserJoin ? 'LEFT JOIN users u ON u.user_id = b.user_id' : '',
     ].filter(Boolean).join('\n');
 
     const posJoins = posFilter.requiresUserJoin || restaurantFilter.requiresUserJoin || eshopFilter.requiresUserJoin
-        ? 'LEFT JOIN users u ON u.user_id = pt.user_id'
+        ? 'LEFT JOIN user u ON u.user_id = pt.user_id'
         : '';
 
     const dateParams = [dateRange.start, dateRange.end];
@@ -684,9 +684,9 @@ const querySalesAnalytics = async ({
         `SELECT COUNT(*) AS refund_count,
                 COALESCE(SUM(r.refund_amount), 0) AS refunded_amount
        FROM refunds r
-       WHERE r.refund_status IN ('Approved', 'Refunded')
+       WHERE UPPER(TRIM(COALESCE(r.refund_status, ''))) IN (${SUCCESSFUL_REFUND_STATUSES.map(() => '?').join(',')})
          AND DATE(COALESCE(r.refunded_at, r.approved_at, r.updated_at)) BETWEEN ? AND ?`,
-        dateParams
+        [...SUCCESSFUL_REFUND_STATUSES, ...dateParams]
     );
 
     const refundCount = Number(refundRows[0]?.refund_count || 0);
@@ -865,15 +865,20 @@ const querySalesAnalytics = async ({
         [...posFilter.params, ...dateParams]
     );
 
+    const restaurantPaymentFilterClause = restaurantFilter.clause.replace(
+        'pti.menu_id IS NOT NULL',
+        `EXISTS (
+            SELECT 1 FROM pos_transaction_items pti_payment
+            WHERE pti_payment.transaction_id = pt.id AND pti_payment.menu_id IS NOT NULL
+        )`
+    );
     const [restaurantPaymentRows] = await db.query(
         `SELECT pt.payment_method AS payment_method,
                 COALESCE(SUM(pt.total_amount), 0) AS amount,
-                COUNT(*) AS count
+                COUNT(DISTINCT pt.id) AS count
              FROM pos_transactions pt
-             JOIN pos_transaction_items pti ON pti.transaction_id = pt.id
-             JOIN menu_items mi ON mi.menu_id = pti.menu_id
              ${posJoins}
-             WHERE ${restaurantFilter.clause}
+             WHERE ${restaurantPaymentFilterClause}
                  AND ${transactionDateClause}
              GROUP BY pt.payment_method`,
         [...restaurantFilter.params, ...dateParams]
@@ -997,23 +1002,32 @@ const querySalesAnalytics = async ({
         item.percent = Number(((item.revenue / totalChannelRevenue) * 100).toFixed(1));
     });
 
-    console.log('Sales analytics summary:', {
-        grossSales,
-        refundedAmount,
-        netSales,
-        reservationSales,
-        posSales,
-        restaurantSales,
-        eshopSales,
-        reservationCount,
-        totalPosTransactions,
-        restaurantOrders,
-        eshopOrders,
-        refundCount
+    const knownBookingItemTypes = new Set(['room', 'rooms', 'cottage', 'cottages', 'event', 'events', 'swimming']);
+    const unclassifiedBookingItems = categoryRows.reduce((totals, row) => {
+        const type = String(row.category || '').trim().toLowerCase();
+        if (!knownBookingItemTypes.has(type)) {
+            totals.amount += Number(row.revenue || 0);
+            totals.count += Number(row.count || 0);
+        }
+        return totals;
+    }, { amount: 0, count: 0 });
+    const categoryItemRevenue = categoryBreakdown.reduce((sum, row) => sum + Number(row.revenue || 0), 0);
+    const canonical = await buildSalesReportLedger({
+        dateFrom: dateRange.start,
+        dateTo: dateRange.end,
+        channel: normalizedChannel,
+        transactionStatus: transaction_status,
+        paymentStatus: payment_status,
+        paymentMethod: payment_method,
+        search,
+        period: dateRange.period,
+    }, {
+        categoryItemRevenue,
+        unclassifiedItemAmount: unclassifiedBookingItems.amount,
+        unclassifiedItemCount: unclassifiedBookingItems.count,
     });
-
-    console.log('TOP MENU ROWS:', topMenuRows);
-    console.log('TOP POS ROWS:', topPosRows);
+    const channelRevenue = Object.fromEntries(canonical.channelSummary.map((row) => [row.channel, row.revenue]));
+    const channelCounts = canonical.transactionCounts;
 
     return {
         filter: {
@@ -1027,29 +1041,26 @@ const querySalesAnalytics = async ({
             search: search || null,
         },
         summary: {
-            grossSales,
-            refundedAmount,
-            netSales,
-            reservationSales,
-            posSales,
-            restaurantSales,
-            eshopSales,
+            ...canonical.summary,
+            reservationSales: channelRevenue.reservation || 0,
+            restaurantSales: channelRevenue.restaurant_pos || 0,
+            eshopSales: channelRevenue.eshop || 0,
             restaurantSalesTrend: calcPercentTrend(restaurantSales, prevRestaurantSales),
             posSalesTrend: calcPercentTrend(posSales, prevPosSales),
             eshopSalesTrend: calcPercentTrend(eshopSales, prevEshopSales),
-            totalTransactions: reservationCount + totalPosTransactions + eshopOrders,
-            refundCount,
-            reservationCount,
-            totalPosTransactions,
-            eshopOrders
+            reservationCount: channelCounts.reservation || 0,
+            restaurantOrders: channelCounts.restaurant_pos || 0,
+            eshopOrders: channelCounts.eshop || 0
         },
-        salesOverTime,
+        transactionCounts: canonical.transactionCounts,
+        salesOverTime: canonical.salesOverTime,
         categoryBreakdown,
-        paymentSummary,
+        paymentSummary: canonical.paymentSummary,
         topBookedItems: topBookedRows,
         topPosItems: topPosRows,
         topMenuItems: topMenuRows,
-        channelSummary
+        channelSummary: canonical.channelSummary,
+        reconciliation: canonical.reconciliation,
     };
 };
 
@@ -1199,6 +1210,7 @@ export const getSalesAnalytics = async (req, res) => {
 
 export const getSalesReports = async (req, res) => {
     try {
+        res.setHeader('Cache-Control', 'no-store');
         const validation = validateSalesReportQuery(req.query);
         if (!validation.valid) {
             return res.status(400).json({
@@ -1236,7 +1248,6 @@ export const getSalesReports = async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Unable to load the sales report. Please check your connection and try again.',
-            details: error.message,
         });
     }
 };
@@ -1261,6 +1272,116 @@ export const exportSalesReportTransactionsCsv = async (req, res) => {
             success: false,
             message: error.statusCode ? error.message : 'Unable to export sales transactions. Please try again.',
             details: error.message,
+        });
+    }
+};
+
+export const getSalesReportExportData = async (req, res) => {
+    try {
+        res.setHeader('Cache-Control', 'no-store');
+        const validation = validateSalesReportQuery(req.query);
+        if (!validation.valid) {
+            return res.status(400).json({ success: false, message: validation.message });
+        }
+
+        const { filters } = validation;
+        const [report, transactions] = await Promise.all([
+            querySalesAnalytics({
+                period: filters.period,
+                from_date: filters.dateFrom,
+                to_date: filters.dateTo,
+                channel: filters.channel,
+                payment_method: filters.paymentMethod,
+                transaction_status: filters.transactionStatus,
+                payment_status: filters.paymentStatus,
+                search: filters.search,
+                legacy: false,
+            }),
+            getSalesReportTransactions(filters),
+        ]);
+
+        const refundDetails = transactions
+            .filter((row) => Number(row.refunded_amount || 0) > 0)
+            .map((row) => ({
+                transactionDate: row.transaction_date,
+                referenceNumber: row.reference_number,
+                channel: row.sales_channel,
+                customerName: row.customer_name,
+                description: row.description,
+                paymentMethod: row.payment_method,
+                paymentStatus: row.payment_status,
+                grossRevenue: Number(row.gross_revenue || 0),
+                refundedAmount: Number(row.refunded_amount || 0),
+                netRevenue: Number(row.net_revenue || 0),
+            }));
+
+        return res.json({
+            success: true,
+            data: {
+                report,
+                transactions,
+                refundDetails,
+                metadata: {
+                    appliedFilters: filters,
+                    generatedAt: new Date().toISOString(),
+                    generatedBy: req.user?.name || req.user?.email || 'Admin',
+                    timezone: 'Asia/Manila',
+                    accountingBasis: 'Transaction date; successful refunds are deducted once.',
+                },
+            },
+        });
+    } catch (error) {
+        console.error('Error preparing sales report export data:', error);
+        return res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.statusCode ? error.message : 'Unable to prepare the sales report export. Please try again.',
+        });
+    }
+};
+
+export const getSalesReportDetails = async (req, res) => {
+    try {
+        res.setHeader('Cache-Control', 'no-store');
+        const validation = validateSalesReportQuery(req.query);
+        if (!validation.valid) {
+            return res.status(400).json({ success: false, message: validation.message });
+        }
+
+        const parsePage = (value, name) => {
+            const parsed = Number(value || 1);
+            if (!Number.isInteger(parsed) || parsed < 1) {
+                const error = new Error(`${name} must be a positive integer.`);
+                error.statusCode = 400;
+                throw error;
+            }
+            return parsed;
+        };
+
+        const transactionPage = parsePage(req.query.transactionPage, 'Transaction page');
+        const refundPage = parsePage(req.query.refundPage, 'Refund page');
+        const pageSize = 10;
+        const rows = (await getSalesReportTransactions(validation.filters)).reverse();
+        const refunds = rows.filter((row) => Number(row.refunded_amount || 0) > 0);
+        const paginate = (items, page) => {
+            const total = items.length;
+            const totalPages = Math.max(1, Math.ceil(total / pageSize));
+            const safePage = Math.min(page, totalPages);
+            const start = (safePage - 1) * pageSize;
+            return { rows: items.slice(start, start + pageSize), page: safePage, pageSize, total, totalPages };
+        };
+
+        return res.json({
+            success: true,
+            data: {
+                transactions: paginate(rows, transactionPage),
+                refunds: paginate(refunds, refundPage),
+            },
+        });
+    } catch (error) {
+        console.error('Error fetching paginated sales report details:', error);
+        return res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.statusCode ? error.message : 'Unable to load sales report details. Please try again.',
         });
     }
 };

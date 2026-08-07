@@ -93,6 +93,8 @@ import adminDashboardRoutes from "./routes/adminDashboardRoutes.js";
 import adminNotificationRoutes from "./routes/adminNotificationRoutes.js";
 import notificationsRoutes from "./routes/notifications.js";
 import customerNotificationsRoutes from "./routes/customerNotifications.js";
+import feedbackRoutes from "./routes/feedback.js";
+import eshopFeedbackRoutes from "./routes/eshopFeedback.js";
 import inventoryLegacyConversionRoutes from "./routes/inventoryLegacyConversionRoutes.js";
 import db from "./config/db.js";
 import {
@@ -116,7 +118,7 @@ import {
   requireUsersAuth,
   requireWebsiteConfigAuth,
 } from "./middleware/authenticateToken.js";
-import { requireCustomer } from "./middleware/authorize.js";
+import { requireCustomer, requireStaff, requireAdmin } from "./middleware/authorize.js";
 import customerRefundRoutes from "./routes/customerRefundRoutes.js";
 import customerSwimmingEnrollmentRoutes from "./routes/customerSwimmingEnrollment.js";
 import customerDashboardRoutes from "./routes/customerDashboardRoutes.js";
@@ -282,9 +284,11 @@ app.use("/api/users", userManagementRoutes);
 app.use("/api/customer/refunds", ...requireCustomerRefundAuth);
 app.use("/api/customer/refunds", customerRefundRoutes);
 
-// Admin routes (refunds, reports, notifications)
+// Front-desk + admin refund queue (list/export/create). Approve/reject stay admin-only in the router.
+app.use("/api/admin/refunds", authenticateToken, requireStaff, adminRefundRoutes);
+
+// Admin routes (reports, notifications, etc.)
 app.use("/api/admin", ...requireAdminAuth);
-app.use("/api/admin/refunds", adminRefundRoutes);
 app.use("/api/admin/reports", adminSalesReportRoutes);
 app.use("/api/admin/sales-reports", adminSalesReportsQueryRoutes);
 app.use("/api/admin/dashboard", adminDashboardRoutes);
@@ -298,6 +302,10 @@ app.use('/api/notifications', notificationsRoutes);
 // Customer notifications feed
 app.use('/api/customer-notifications', requireProfileAuth);
 app.use('/api/customer-notifications', customerNotificationsRoutes);
+
+// Authenticated customer feedback
+app.use('/api/feedback', feedbackRoutes);
+app.use('/api/eshop-feedback', eshopFeedbackRoutes);
 
 // Website Content Configuration
 app.use('/api/website-config', requireWebsiteConfigAuth);

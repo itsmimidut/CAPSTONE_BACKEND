@@ -20,8 +20,8 @@ const mapNotificationRow = (row) => ({
     created_at: row.created_at,
 });
 
-const fetchNotificationById = async (notificationId) => {
-    const [rows] = await db.query(
+const fetchNotificationById = async (notificationId, connection = db) => {
+    const [rows] = await connection.query(
         `SELECT id, user_id, customer_id, title, message, type, link, is_read, created_at
          FROM customer_notifications
          WHERE id = ?
@@ -63,20 +63,26 @@ export const createCustomerNotification = async ({
     message,
     type = 'general',
     link = null,
+    eventKey = null,
+    connection = db,
 }) => {
     if (!userId || !title || !message) {
         return null;
     }
 
-    const [result] = await db.query(
+    const [result] = await connection.query(
         `INSERT INTO customer_notifications (
-            user_id, customer_id, title, message, type, link
-        ) VALUES (?, ?, ?, ?, ?, ?)`,
-        [userId, customerId, title, message, type, link],
+            user_id, customer_id, title, message, type, event_key, link
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE event_key = event_key`,
+        [userId, customerId, title, message, type, eventKey, link],
     );
 
-    const notification = await fetchNotificationById(result.insertId);
-    if (notification) {
+    const notificationId = Number(result.insertId || 0);
+    const notification = notificationId
+        ? await fetchNotificationById(notificationId, connection)
+        : null;
+    if (notification && connection === db) {
         try {
             emitCustomerNotification(userId, notification);
         } catch (error) {
@@ -84,7 +90,15 @@ export const createCustomerNotification = async ({
         }
     }
 
-    return result.insertId;
+    return notificationId || null;
+};
+
+export const emitPersistedCustomerNotification = async (notificationId) => {
+    if (!notificationId) return null;
+    const notification = await fetchNotificationById(notificationId, db);
+    if (!notification) return null;
+    emitCustomerNotification(notification.user_id, notification);
+    return notification;
 };
 
 export const notifyBookingConfirmed = async ({ userId, customerId, bookingReference }) => {
