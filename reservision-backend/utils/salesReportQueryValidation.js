@@ -36,6 +36,8 @@ export const ALLOWED_PAYMENT_METHODS = [
   'other'
 ]
 
+export const ALLOWED_BOOKING_SOURCES = ['all', 'direct', 'legacy_import']
+
 export const MAX_REPORT_RANGE_DAYS = 366
 export const MAX_REPORT_SEARCH_LENGTH = 150
 
@@ -75,6 +77,7 @@ export const validateSalesReportQuery = (query = {}) => {
   const transactionStatus = (query.transaction_status || query.transactionStatus || 'all').toLowerCase()
   const paymentStatus = (query.payment_status || query.paymentStatus || 'revenue').toLowerCase()
   const paymentMethod = (query.payment_method || query.paymentMethod || 'all').toLowerCase()
+  const bookingSource = (query.booking_source || query.bookingSource || 'all').toLowerCase()
   const search = typeof query.search === 'string' ? query.search.trim() : ''
 
   if (search.length > MAX_REPORT_SEARCH_LENGTH) {
@@ -117,6 +120,10 @@ export const validateSalesReportQuery = (query = {}) => {
     return { valid: false, message: 'Invalid payment method filter.' }
   }
 
+  if (!ALLOWED_BOOKING_SOURCES.includes(bookingSource)) {
+    return { valid: false, message: 'Invalid reservation source filter.' }
+  }
+
   return {
     valid: true,
     filters: {
@@ -126,6 +133,7 @@ export const validateSalesReportQuery = (query = {}) => {
       transactionStatus,
       paymentStatus,
       paymentMethod,
+      bookingSource,
       search,
       period: inferChartPeriod(dateFrom, dateTo)
     }

@@ -8,26 +8,12 @@ export const ensureStationRoutingSchema = async () => {
             id INT AUTO_INCREMENT PRIMARY KEY,
             station_code VARCHAR(50) UNIQUE,
             station_name VARCHAR(100) NOT NULL,
-            description TEXT NULL,
             location VARCHAR(255) NULL,
             active TINYINT(1) DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             INDEX idx_pos_stations_active (active)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
-
-    for (const column of [
-        { name: 'description', definition: 'TEXT NULL' },
-        { name: 'updated_at', definition: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP' },
-    ]) {
-        const [rows] = await db.query(
-            `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pos_stations' AND COLUMN_NAME = ?`,
-            [column.name]
-        );
-        if (!rows.length) await db.query(`ALTER TABLE pos_stations ADD COLUMN ${column.name} ${column.definition}`);
-    }
 
     await db.query(`
         CREATE TABLE IF NOT EXISTS pos_terminal_settings (

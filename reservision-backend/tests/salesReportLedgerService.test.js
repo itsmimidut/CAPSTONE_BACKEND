@@ -40,6 +40,23 @@ test('sales ledger reconciles mutually exclusive channel, payment, and transacti
   assert.equal(report.reconciliation.isGrossReconciled, true);
   assert.equal(report.reconciliation.isPaymentReconciled, true);
   assert.equal(report.reconciliation.isTransactionCountReconciled, true);
+  assert.equal(report.reconciliation.isNetReconciled, true);
+});
+
+test('sales ledger exposes source totals and detects a mismatched stored net amount', () => {
+  const report = summarizeSalesLedger([
+    row({ record_source: 'direct' }),
+    row({ source_key: 'booking:2', record_source: 'legacy_import', gross_revenue: 500, refunded_amount: 100, net_revenue: 350 }),
+  ]);
+
+  assert.deepEqual(report.sourceSummary, [
+    { source: 'direct', amount: 1000, count: 1 },
+    { source: 'legacy_import', amount: 500, count: 1 },
+  ]);
+  assert.equal(report.summary.netSales, 1400);
+  assert.equal(report.reconciliation.ledgerNet, 1350);
+  assert.equal(report.reconciliation.netDifference, 50);
+  assert.equal(report.reconciliation.isNetReconciled, false);
 });
 
 test('sales ledger subtracts full and partial refunds exactly once', () => {

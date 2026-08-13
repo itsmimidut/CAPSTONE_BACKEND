@@ -33,13 +33,13 @@ test('online bookings start pending and can reuse the booking for payment', () =
   }), true);
 });
 
-test('verified payment marks the booking paid but keeps approval pending', () => {
+test('verified payment confirms the same booking', () => {
   assert.deepEqual(getPaidBookingPaymentState(), {
-    bookingStatus: 'Pending',
+    bookingStatus: 'Confirmed',
     paymentStatus: 'Paid',
   });
   assert.equal(canCreatePaymentForBooking({
-    booking_status: 'Pending',
+    booking_status: 'Confirmed',
     payment_status: 'Paid',
   }), false);
 });

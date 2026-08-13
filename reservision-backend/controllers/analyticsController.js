@@ -38,9 +38,10 @@ const sendAnalytics = async (req, res, loader) => {
     return res.json({ success: true, data });
   } catch (error) {
     console.error('Analytics error:', error);
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       success: false,
-      message: 'Failed to load analytics data.',
+      message: error.statusCode ? error.message : 'Failed to load analytics data.',
+      ...(error.code ? { code: error.code } : {}),
     });
   }
 };

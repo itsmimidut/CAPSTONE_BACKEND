@@ -241,16 +241,19 @@ export const completeRefundInDatabase = async ({
       ? 'No Refund'
       : REFUND_STATUS.COMPLETED;
 
-  await db.query(
+  const [completionResult] = await db.query(
     `UPDATE refunds SET
       refund_status = ?,
       refunded_at = NOW(),
       gateway_reference = COALESCE(?, gateway_reference),
       gateway_status = COALESCE(?, gateway_status),
       updated_at = NOW()
-    WHERE refund_id = ?`,
-    [REFUND_STATUS.COMPLETED, gatewayReference || null, gatewayStatus || null, refundId],
+    WHERE refund_id = ? AND refund_status <> ?`,
+    [REFUND_STATUS.COMPLETED, gatewayReference || null, gatewayStatus || null, refundId, REFUND_STATUS.COMPLETED],
   );
+  if (completionResult.affectedRows !== 1) {
+    return { alreadyCompleted: true, refund };
+  }
 
   await db.query(
     `UPDATE bookings SET

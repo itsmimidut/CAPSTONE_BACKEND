@@ -18,8 +18,6 @@ function mapPrinterRow(row) {
     model: row.model,
     interfaceType: row.interface_type,
     connectionMethod,
-    deliveryMode: row.delivery_mode || (connectorDeviceId ? 'connector' : connectionMethod === 'ethernet' ? 'direct_network' : 'direct'),
-    connectorPrinterKey: row.connector_printer_key || null,
     windowsPrinterName: row.windows_printer_name,
     ipAddress: row.ip_address,
     port: row.port,

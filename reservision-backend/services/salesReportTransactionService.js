@@ -67,6 +67,8 @@ const bookingQuery = async (filters) => {
   if (!['all', 'reservation'].includes(filters.channel)) return [];
   const where = ['DATE(b.created_at) BETWEEN ? AND ?'];
   const params = [filters.dateFrom, filters.dateTo];
+  if (filters.bookingSource === 'direct') where.push("COALESCE(b.booking_source, 'DIRECT') = 'DIRECT'");
+  if (filters.bookingSource === 'legacy_import') where.push("COALESCE(b.booking_source, 'DIRECT') = 'LEGACY_IMPORT'");
   const clauses = [bookingStatusClause(filters.transactionStatus), bookingPaymentClause(filters.paymentStatus)];
   const method = paymentMethodClause('b.payment_method', filters.paymentMethod, params);
   if (method) clauses.push(method);
@@ -79,6 +81,7 @@ const bookingQuery = async (filters) => {
   const [rows] = await db.query(`
     SELECT CONCAT('booking:', b.booking_id) source_key, b.created_at transaction_date,
       b.booking_reference reference_number, 'reservation' sales_channel,
+      CASE WHEN COALESCE(b.booking_source, 'DIRECT') = 'LEGACY_IMPORT' THEN 'legacy_import' ELSE 'direct' END record_source,
       COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.first_name, c.last_name)), ''), NULLIF(c.full_name, ''), NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), NULLIF(TRIM(CONCAT_WS(' ', b.first_name, b.last_name)), ''), NULLIF(b.email, ''), 'Guest') customer_name,
       COALESCE(items.description, 'Reservation') description, b.payment_method,
       b.booking_status transaction_status, b.payment_status, COALESCE(b.total, 0) transaction_amount,
@@ -97,6 +100,7 @@ const bookingQuery = async (filters) => {
 
 const posQuery = async (filters) => {
   if (filters.channel === 'reservation') return [];
+  if (filters.bookingSource && filters.bookingSource !== 'all') return [];
   const where = ['DATE(COALESCE(pt.transaction_date, pt.created_at)) BETWEEN ? AND ?'];
   const params = [filters.dateFrom, filters.dateTo];
   const channelExpr = `CASE
@@ -129,6 +133,7 @@ const posQuery = async (filters) => {
   const [rows] = await db.query(`
     SELECT CONCAT('pos:', pt.id) source_key, COALESCE(pt.transaction_date, pt.created_at) transaction_date,
       COALESCE(NULLIF(pt.receipt_no, ''), CONCAT('POS-', pt.id)) reference_number, ${channelExpr} sales_channel,
+      'pos' record_source,
       COALESCE(NULLIF(c.full_name,''), NULLIF(TRIM(CONCAT_WS(' ', c.first_name, c.last_name)), ''), NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), NULLIF(pt.pickup_name,''), NULLIF(pt.recipient_name,''), 'Walk-in Customer') customer_name,
       COALESCE(items.description, 'POS Transaction') description, pt.payment_method,
       COALESCE(pt.fulfillment_status, pt.status, 'ACTIVE') transaction_status, pt.payment_status,
@@ -160,6 +165,6 @@ export const getSalesReportTransactions = async (filters) => {
     transaction_amount: Number(row.transaction_amount || 0),
     gross_revenue: Number(row.gross_revenue || 0),
     refunded_amount: Number(row.refunded_amount || 0),
-    net_revenue: Math.max(0, Number(row.gross_revenue || 0) - Number(row.refunded_amount || 0)),
+    net_revenue: Number(row.gross_revenue || 0) - Number(row.refunded_amount || 0),
   }));
 };

@@ -113,13 +113,6 @@ function parsePrinterConfig(value) {
 
 function mapPrintJobRow(row) {
     if (!row) return null;
-    const operationalStatus = row.status === PRINT_JOB_STATUS.SENT
-        ? 'SENT_TO_OS'
-        : row.status === PRINT_JOB_STATUS.FAILED
-            ? 'FAILED'
-            : row.claimed_at
-                ? 'CLAIMED'
-                : 'WAITING_FOR_CONNECTOR';
     return {
         id: row.id,
         receiptNo: row.receipt_no,
@@ -127,7 +120,6 @@ function mapPrintJobRow(row) {
         printType: row.print_type,
         bookingReference: row.booking_reference,
         status: row.status,
-        operationalStatus,
         source: row.source,
         requestedBy: row.requested_by,
         jobFile: row.job_file,

@@ -13,7 +13,6 @@ import {
   getBridgeDeviceByCode,
   reportConnectorPrinters,
   regenerateBridgeDeviceToken,
-  automaticallyRegisterConnector,
 } from '../services/printBridgeService.js';
 
 function extractBridgeCredentials(req) {
@@ -32,7 +31,6 @@ function extractBridgeCredentials(req) {
     query.pairingToken ||
     query.pairing_token ||
     req.headers['x-bridge-token'] ||
-    (String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]) ||
     null;
   return {
     deviceCode: deviceCode ? String(deviceCode).trim() : '',
@@ -68,24 +66,6 @@ export async function registerBridgeDeviceHandler(req, res) {
     });
   } catch (error) {
     return sendError(res, error, 'Failed to register bridge device.');
-  }
-}
-
-export async function automaticallyRegisterConnectorHandler(req, res) {
-  try {
-    const device = await automaticallyRegisterConnector(req.body || {});
-    return res.status(device.connectorToken ? 201 : 200).json({
-      success: true,
-      connectorId: device.id,
-      deviceCode: device.deviceCode,
-      state: device.state,
-      connectorToken: device.connectorToken || undefined,
-      heartbeatIntervalSeconds: device.heartbeatIntervalSeconds,
-      assignedStationId: device.stationId,
-      configuredPrinterCount: device.configuredPrinterCount,
-    });
-  } catch (error) {
-    return sendError(res, error, 'Automatic connector registration failed.');
   }
 }
 
@@ -199,12 +179,7 @@ export async function listBridgeDevicesHandler(req, res) {
 
 export async function updateBridgeDeviceHandler(req, res) {
   try {
-    const body = req.body || {};
-    const device = await updateBridgeDevice(req.params.id, {
-      deviceName: body.deviceName,
-      stationId: body.stationId,
-      isActive: body.isActive,
-    });
+    const device = await updateBridgeDevice(req.params.id, req.body || {});
     return res.json({ success: true, device });
   } catch (error) {
     return sendError(res, error, 'Failed to update bridge device.');

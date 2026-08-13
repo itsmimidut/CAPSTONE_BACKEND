@@ -5,7 +5,6 @@ const router = express.Router();
 
 // Android bridge device routes (auth via deviceCode + pairingToken)
 router.post('/register', printBridgeController.registerBridgeDeviceHandler);
-router.post('/connectors/register', printBridgeController.automaticallyRegisterConnectorHandler);
 router.post('/heartbeat', printBridgeController.heartbeatHandler);
 router.post('/printers/report', printBridgeController.reportConnectorPrintersHandler);
 router.get('/jobs', printBridgeController.listBridgeJobsHandler);
@@ -16,7 +15,9 @@ router.post('/jobs/:id/failed', printBridgeController.failBridgeJobHandler);
 
 // Admin routes (staff JWT via requirePosAuth on /api/pos)
 router.get('/devices', printBridgeController.listBridgeDevicesHandler);
+router.post('/devices', printBridgeController.createAdminBridgeDeviceHandler);
 router.patch('/devices/:id', printBridgeController.updateBridgeDeviceHandler);
 router.post('/devices/:id/deactivate', printBridgeController.deactivateBridgeDeviceHandler);
+router.post('/devices/:id/regenerate-token', printBridgeController.regenerateBridgeDeviceTokenHandler);
 
 export default router;

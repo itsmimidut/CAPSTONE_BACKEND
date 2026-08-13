@@ -27,3 +27,10 @@ test('sales report rejects removed aggregate POS channels', () => {
     assert.equal(result.valid, false);
   }
 });
+
+test('sales report validates and normalizes reservation source', () => {
+  const valid = validateSalesReportQuery({ ...baseQuery, bookingSource: 'LEGACY_IMPORT' });
+  assert.equal(valid.valid, true);
+  assert.equal(valid.filters.bookingSource, 'legacy_import');
+  assert.equal(validateSalesReportQuery({ ...baseQuery, bookingSource: 'spreadsheet' }).valid, false);
+});

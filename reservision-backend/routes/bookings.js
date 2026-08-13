@@ -50,8 +50,16 @@ import {
   bookingConfirmValidators,
   bookingUpdateValidators,
 } from "../middleware/validators/bookingValidators.js";
+import { requireAdmin } from '../middleware/authorize.js';
+import { confirmImport, downloadImportTemplate, listImports, previewImport, rollbackImport } from '../controllers/reservationImportController.js';
 
 const router = express.Router();
+
+router.get('/admin/imports', requireAdmin, listImports);
+router.get('/admin/imports/template', requireAdmin, downloadImportTemplate);
+router.post('/admin/imports/preview', requireAdmin, express.json({ limit: '5mb' }), previewImport);
+router.post('/admin/imports/confirm', requireAdmin, express.json({ limit: '5mb' }), confirmImport);
+router.post('/admin/imports/:id/rollback', requireAdmin, rollbackImport);
 
 // Admin reservations endpoint (must be before /:id routes)
 // ⚠️  Staff/Admin only (auth applied globally, admin check in middleware)

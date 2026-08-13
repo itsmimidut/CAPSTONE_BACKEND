@@ -308,6 +308,7 @@ export const forecastRange = async (req, res) => {
       },
       baseline_metrics: metadata.targets?.bookings?.baseline_metrics || null,
       baseline_note: result.model?.baseline_note || metadata.baseline_note || null,
+      freshness: readinessState.model?.freshness || null,
     };
     const limitations = [
       ...(model.baseline_note
@@ -501,7 +502,6 @@ export const predictionPing = async (req, res) => {
     ok: true,
     message: "prediction routes working",
     min_allowed_date: minAllowedDateYMD(),
-    python_script: PY_SCRIPT,
   });
 };
 

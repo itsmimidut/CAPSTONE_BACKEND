@@ -1,5 +1,5 @@
 const HEADERS = [
-  'Transaction Date', 'Reference Number', 'Sales Channel', 'Customer Name', 'Description',
+  'Transaction Date', 'Reference Number', 'Sales Channel', 'Record Source', 'Customer Name', 'Description',
   'Payment Method', 'Transaction Status', 'Payment Status', 'Transaction Amount',
   'Gross Revenue', 'Refunded Amount', 'Net Revenue',
 ];
@@ -22,7 +22,7 @@ const money = (value) => Number(value || 0).toFixed(2);
 
 export const buildTransactionCsv = (rows) => {
   const records = rows.map((row) => [
-    formatDateTime(row.transaction_date), row.reference_number, row.sales_channel, row.customer_name,
+    formatDateTime(row.transaction_date), row.reference_number, row.sales_channel, row.record_source, row.customer_name,
     row.description, row.payment_method, row.transaction_status, row.payment_status,
     money(row.transaction_amount), money(row.gross_revenue), money(row.refunded_amount), money(row.net_revenue),
   ]);

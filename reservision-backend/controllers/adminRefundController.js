@@ -7,6 +7,7 @@ import {
     notifyRefundRejected,
 } from "../services/customerNotificationService.js";
 import { BOOKING_STATUS, REFUND_STATUS } from "../utils/paymentStatuses.js";
+import { calculateRemainingRefundableAmount, canRejectRefundStatus, sanitizeSpreadsheetCell } from "../utils/refundPolicy.js";
 
 const ALLOWED_REFUND_TYPES = ["Full", "Partial", "No Refund"];
 const ALLOWED_REFUND_REASONS = [
@@ -47,27 +48,31 @@ const toNumber = (value) => Number(value || 0);
 
 const APPROVABLE_REFUND_STATUSES = [REFUND_STATUS.PENDING, REFUND_STATUS.FAILED];
 
+const getRemainingRefundableAmount = async (bookingId, connection = db) => {
+    const [rows] = await connection.query(
+        `SELECT
+           COALESCE((
+             SELECT SUM(p.amount) FROM payments p
+             WHERE p.booking_id = b.booking_id
+               AND LOWER(COALESCE(p.status, '')) IN ('paid','settled','completed','success')
+           ), b.total, 0) AS paid_amount,
+           COALESCE((
+             SELECT SUM(r.refund_amount) FROM refunds r
+             WHERE r.booking_id = b.booking_id
+               AND LOWER(COALESCE(r.refund_status, '')) IN ('completed','refunded','approved')
+           ), 0) AS completed_refund_amount
+         FROM bookings b WHERE b.booking_id = ? LIMIT 1`,
+        [bookingId],
+    );
+    const row = rows[0] || {};
+    return calculateRemainingRefundableAmount({
+        paidAmount: row.paid_amount,
+        completedRefundAmount: row.completed_refund_amount,
+    });
+};
+
 const getRefundableAmountForRefund = async (refund) => {
-    const storedAmount = toNumber(refund.original_amount);
-
-    const [paymentRows] = await db.query(
-        `SELECT amount, status
-         FROM payments
-         WHERE booking_id = ?
-           AND payment_gateway = 'xendit'
-         ORDER BY created_at DESC`,
-        [refund.booking_id],
-    );
-
-    const paidPayment = paymentRows.find((row) =>
-        /^(paid|settled|completed|success)$/i.test(String(row.status || '')),
-    );
-
-    if (paidPayment) {
-        return toNumber(paidPayment.amount) || storedAmount;
-    }
-
-    return storedAmount;
+    return getRemainingRefundableAmount(refund.booking_id);
 };
 
 const getBookingPaidAmount = (booking) => {
@@ -144,7 +149,7 @@ const serializeCsvRow = (row) => {
             return "";
         }
 
-        const stringValue = String(value);
+        const stringValue = sanitizeSpreadsheetCell(value);
         if (/[",\r\n]/.test(stringValue)) {
             return `"${stringValue.replace(/"/g, '""')}"`;
         }
@@ -155,7 +160,7 @@ const serializeCsvRow = (row) => {
 export const getRefunds = async (req, res) => {
     try {
         const page = Math.max(Number(req.query.page) || 1, 1);
-        const perPage = Math.max(Number(req.query.per_page) || 15, 1);
+        const perPage = Math.min(Math.max(Number(req.query.per_page) || 15, 1), 100);
         const offset = (page - 1) * perPage;
 
         const { whereSql, params } = buildRefundFilters(req.query);
@@ -220,7 +225,7 @@ export const getRefunds = async (req, res) => {
         SUM(CASE WHEN refund_status = 'Completed' THEN 1 ELSE 0 END) AS completed_count,
         SUM(CASE WHEN refund_status = 'Rejected' THEN 1 ELSE 0 END) AS rejected_count,
         SUM(CASE WHEN refund_status = 'Failed' THEN 1 ELSE 0 END) AS failed_count,
-        COALESCE(SUM(refund_amount), 0) AS total_refunded_amount
+        COALESCE(SUM(CASE WHEN refund_status IN ('Completed','Refunded','Approved') THEN refund_amount ELSE 0 END), 0) AS total_refunded_amount
       FROM (
         SELECT DISTINCT
           r.refund_id,
@@ -355,8 +360,9 @@ export const getRefundById = async (req, res) => {
 };
 
 export const createRefund = async (req, res) => {
+    let connection;
     try {
-        console.log("Refund request body:", req.body);
+        connection = await db.getConnection();
         const { booking_id, refund_reason, refund_note } = req.body;
         const bookingId = Number(booking_id);
 
@@ -364,7 +370,7 @@ export const createRefund = async (req, res) => {
             return sendError(res, 400, "Booking ID is required.", "VALIDATION_ERROR");
         }
 
-        const [bookingRows] = await db.query(
+        const [bookingRows] = await connection.query(
             `
       SELECT b.*, 
         b.payment_status AS booking_payment_status,
@@ -392,11 +398,6 @@ export const createRefund = async (req, res) => {
             .filter(Boolean)
             .join(" ");
 
-        console.log("Booking row:", booking);
-        console.log("Payment status candidates:", paymentStatusCandidates);
-        console.log("Resolved paid amount:", paidAmount);
-        console.log("Original booking amount:", originalAmount);
-
         const hasPositivePaidAmount = paidAmount > 0;
         const isPaid = /(paid|completed|success|settled)/i.test(paymentStatusCandidates);
 
@@ -404,13 +405,23 @@ export const createRefund = async (req, res) => {
             return sendError(res, 400, "Booking is not paid. Only paid bookings can be refunded.", "BOOKING_NOT_PAID");
         }
 
-        const [duplicateRows] = await db.query(
+        await connection.beginTransaction();
+        await connection.query(`SELECT booking_id FROM bookings WHERE booking_id = ? FOR UPDATE`, [bookingId]);
+
+        const [duplicateRows] = await connection.query(
             `SELECT COUNT(*) AS count FROM refunds WHERE booking_id = ? AND refund_status IN ('Pending', 'Processing')`,
             [bookingId]
         );
 
         if (Number(duplicateRows[0]?.count || 0) > 0) {
+            await connection.rollback();
             return sendError(res, 400, "An active refund already exists for this booking.", "DUPLICATE_REFUND");
+        }
+
+        const remainingRefundable = await getRemainingRefundableAmount(bookingId, connection);
+        if (remainingRefundable <= 0) {
+            await connection.rollback();
+            return sendError(res, 409, "No refundable balance remains for this booking.", "NO_REFUNDABLE_BALANCE");
         }
 
         const refundReference = await generateRefundReference();
@@ -419,7 +430,7 @@ export const createRefund = async (req, res) => {
         const refundMethod = req.body.refund_method || booking.resolved_payment_method || "Same as payment method";
         const customerId = booking.customer_id || null;
 
-        const [insertResult] = await db.query(
+        const [insertResult] = await connection.query(
             `INSERT INTO refunds (
         booking_id,
         payment_id,
@@ -441,14 +452,14 @@ export const createRefund = async (req, res) => {
                 refundReference,
                 reason,
                 note,
-                originalAmount,
+                remainingRefundable,
                 0,
                 refundMethod,
                 getAdminName(req)
             ]
         );
 
-        await db.query(
+        await connection.query(
             `UPDATE bookings SET refund_status = 'Pending', refund_amount = 0 WHERE booking_id = ?`,
             [bookingId]
         );
@@ -464,7 +475,10 @@ export const createRefund = async (req, res) => {
                 original_amount: originalAmount,
             },
             req,
+            connection,
         });
+
+        await connection.commit();
 
         return res.json({
             success: true,
@@ -476,8 +490,11 @@ export const createRefund = async (req, res) => {
             }
         });
     } catch (error) {
+        if (connection) await connection.rollback();
         console.error("createRefund error", error);
         return sendError(res, 500, "Failed to create refund request.", "INTERNAL_SERVER_ERROR", { detail: error.message });
+    } finally {
+        connection?.release();
     }
 };
 
@@ -564,7 +581,7 @@ export const approveRefund = async (req, res) => {
 
         let gatewayResult = null;
         try {
-            await db.query(
+            const [claimResult] = await db.query(
                 `UPDATE refunds SET
         refund_type = ?,
         refund_amount = ?,
@@ -577,7 +594,7 @@ export const approveRefund = async (req, res) => {
         approved_by = ?,
         approved_at = NOW(),
         updated_at = NOW()
-      WHERE refund_id = ?`,
+      WHERE refund_id = ? AND refund_status IN (?, ?)`,
                 [
                     normalizedType,
                     selectedAmount,
@@ -587,8 +604,13 @@ export const approveRefund = async (req, res) => {
                     originalAmount,
                     getAdminName(req),
                     refundId,
+                    REFUND_STATUS.PENDING,
+                    REFUND_STATUS.FAILED,
                 ],
             );
+            if (claimResult.affectedRows !== 1) {
+                return sendError(res, 409, "Refund status changed while it was being processed. Refresh and try again.", "REFUND_STATE_CONFLICT");
+            }
 
             const bookingStatus = normalizedType === 'Partial'
                 ? BOOKING_STATUS.PARTIALLY_REFUNDED
@@ -684,30 +706,40 @@ export const rejectRefund = async (req, res) => {
         }
 
         const refund = refundRows[0];
-        if (refund.refund_status === REFUND_STATUS.COMPLETED) {
-            return sendError(res, 400, "Completed refunds cannot be rejected.", "REFUND_NOT_REJECTABLE");
-        }
-
-        if (refund.refund_status === 'Rejected') {
-            return sendError(res, 400, "Refund has already been rejected.", "VALIDATION_ERROR");
+        if (!canRejectRefundStatus(refund.refund_status)) {
+            return sendError(res, 409, `Only pending refunds can be rejected. Current status: ${refund.refund_status}.`, "REFUND_NOT_REJECTABLE");
         }
 
         const existingNote = refund.refund_note ? `${refund.refund_note} ` : "";
         const updatedNote = `${existingNote}Rejection reason: ${rejection_reason}`.trim();
 
-        await db.query(
+        const [rejectResult] = await db.query(
             `UPDATE refunds SET
         refund_status = 'Rejected',
         rejected_by = ?,
         rejected_at = NOW(),
         refund_note = ?,
         updated_at = NOW()
-      WHERE refund_id = ?`,
-            [getAdminName(req), updatedNote, refundId]
+      WHERE refund_id = ? AND refund_status = ?`,
+            [getAdminName(req), updatedNote, refundId, REFUND_STATUS.PENDING]
         );
+        if (rejectResult.affectedRows !== 1) {
+            return sendError(res, 409, "Refund status changed while it was being rejected. Refresh and try again.", "REFUND_STATE_CONFLICT");
+        }
 
         await db.query(
-            `UPDATE bookings SET refund_status = 'Rejected', refund_amount = 0 WHERE booking_id = ?`,
+            `UPDATE bookings b SET
+               refund_status = CASE WHEN EXISTS (
+                 SELECT 1 FROM refunds completed_r
+                 WHERE completed_r.booking_id = b.booking_id
+                   AND LOWER(COALESCE(completed_r.refund_status, '')) IN ('completed','refunded','approved')
+               ) THEN 'Completed' ELSE 'Rejected' END,
+               refund_amount = COALESCE((
+                 SELECT SUM(completed_r.refund_amount) FROM refunds completed_r
+                 WHERE completed_r.booking_id = b.booking_id
+                   AND LOWER(COALESCE(completed_r.refund_status, '')) IN ('completed','refunded','approved')
+               ), 0)
+             WHERE b.booking_id = ?`,
             [refund.booking_id]
         );
 

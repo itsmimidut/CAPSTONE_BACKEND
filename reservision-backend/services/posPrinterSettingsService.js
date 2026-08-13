@@ -49,8 +49,6 @@ function mapPrinterRow(row) {
     model: row.model,
     interfaceType: row.interface_type || interfaceTypeFromConnectionMethod(connectionMethod),
     connectionMethod,
-    deliveryMode: row.delivery_mode || (connectorDeviceId ? 'connector' : connectionMethod === 'ethernet' ? 'direct_network' : 'direct'),
-    connectorPrinterKey: row.connector_printer_key || null,
     windowsPrinterName: row.windows_printer_name,
     ipAddress: row.ip_address,
     port: row.port,
@@ -178,69 +176,10 @@ function validatePrinterPayload(data, { partial = false } = {}) {
   }
 }
 
-function resolveDeliveryMode(data, connectionMethod, connectorId) {
-  const explicit = data.deliveryMode ?? data.delivery_mode;
-  if (explicit) return String(explicit).trim().toLowerCase();
-  if (connectorId) return 'connector';
-  return connectionMethod === 'ethernet' ? 'direct_network' : 'direct';
-}
-
-async function validatePrinterRelationships(payload) {
-  if (!['direct', 'connector', 'direct_network'].includes(payload.delivery_mode)) {
-    throw Object.assign(new Error('Invalid printer delivery mode.'), { statusCode: 400, code: 'INVALID_DELIVERY_MODE' });
-  }
-  if (payload.station_id != null) {
-    const [stations] = await db.query('SELECT id, active FROM pos_stations WHERE id = ? LIMIT 1', [payload.station_id]);
-    if (!stations[0] || !Boolean(stations[0].active)) {
-      throw Object.assign(new Error('The selected station is inactive or does not exist.'), { statusCode: 400, code: 'STATION_INACTIVE' });
-    }
-  }
-  if (payload.delivery_mode === 'connector') {
-    if (!payload.connector_device_id) {
-      throw Object.assign(new Error('Print Connector is required.'), { statusCode: 400, code: 'CONNECTOR_REQUIRED' });
-    }
-    if (!payload.connector_printer_key) {
-      throw Object.assign(new Error('A printer reported by the connector must be selected.'), { statusCode: 400, code: 'CONNECTOR_PRINTER_REQUIRED' });
-    }
-    const [connectors] = await db.query(
-      'SELECT id, station_id, is_active, is_revoked, last_seen_at, reported_printers FROM print_bridge_devices WHERE id = ? LIMIT 1',
-      [payload.connector_device_id]
-    );
-    const connector = connectors[0];
-    if (!connector || !Boolean(connector.is_active)) {
-      throw Object.assign(new Error('The selected Print Connector is inactive or does not exist.'), { statusCode: 400, code: 'CONNECTOR_INACTIVE' });
-    }
-    if (Boolean(connector.is_revoked)) {
-      throw Object.assign(new Error('The selected printing device has been revoked.'), { statusCode: 400, code: 'CONNECTOR_REVOKED' });
-    }
-    const lastSeen = new Date(connector.last_seen_at).getTime();
-    if (!Number.isFinite(lastSeen) || Date.now() - lastSeen >= 60000) {
-      throw Object.assign(new Error('The selected printing device is offline.'), { statusCode: 400, code: 'CONNECTOR_OFFLINE' });
-    }
-    const reported = typeof connector.reported_printers === 'string'
-      ? JSON.parse(connector.reported_printers || '[]')
-      : (connector.reported_printers || []);
-    if (!reported.some((printer) => String(printer.printer_key || printer.printerKey) === String(payload.connector_printer_key))) {
-      throw Object.assign(new Error('The selected printer is no longer reported by this device.'), { statusCode: 400, code: 'PRINTER_NOT_REPORTED' });
-    }
-    if (payload.station_id == null || connector.station_id == null || Number(payload.station_id) !== Number(connector.station_id)) {
-      throw Object.assign(new Error('The printer and Print Connector must belong to the same station.'), { statusCode: 400, code: 'CONNECTOR_STATION_MISMATCH' });
-    }
-  } else {
-    payload.connector_device_id = null;
-    payload.bridge_device_id = null;
-    payload.connector_printer_key = null;
-  }
-  if (payload.delivery_mode === 'direct_network' && !String(payload.ip_address || '').trim()) {
-    throw Object.assign(new Error('Network host is required for a direct network printer.'), { statusCode: 400, code: 'NETWORK_HOST_REQUIRED' });
-  }
-}
-
 function toDbPayload(data = {}) {
   const connectionMethod = resolveConnectionMethod(data);
   const interfaceType = interfaceTypeFromConnectionMethod(connectionMethod);
   const connectorId = resolveConnectorDeviceId(data);
-  const deliveryMode = resolveDeliveryMode(data, connectionMethod, connectorId);
 
   return {
     name: data.name,
@@ -255,8 +194,6 @@ function toDbPayload(data = {}) {
     bluetooth_address: data.bluetoothAddress ?? data.bluetooth_address ?? data.bluetoothDeviceId ?? data.bluetooth_device_id ?? null,
     bridge_device_id: connectorId,
     connector_device_id: connectorId,
-    delivery_mode: deliveryMode,
-    connector_printer_key: data.connectorPrinterKey ?? data.connector_printer_key ?? null,
     com_port: data.comPort ?? data.com_port ?? null,
     baud_rate: Number(data.baudRate ?? data.baud_rate ?? 9600) || 9600,
     paper_width: data.paperWidth ?? data.paper_width ?? '58',
@@ -325,8 +262,6 @@ export async function ensurePosPrinterSchema() {
       group_identical_items TINYINT DEFAULT 1,
       usage_type ENUM('receipt', 'kitchen', 'bar', 'general') DEFAULT 'receipt',
       station_id INT DEFAULT NULL,
-      delivery_mode VARCHAR(30) DEFAULT 'direct',
-      connector_printer_key VARCHAR(255) DEFAULT NULL,
       is_default TINYINT DEFAULT 0,
       is_active TINYINT DEFAULT 1,
       last_test_at DATETIME DEFAULT NULL,
@@ -346,8 +281,6 @@ async function ensurePrinterBridgeColumns() {
     { name: 'bridge_device_id', definition: 'INT NULL' },
     { name: 'bluetooth_address', definition: 'VARCHAR(150) NULL' },
     { name: 'connector_device_id', definition: 'INT NULL' },
-    { name: 'delivery_mode', definition: "VARCHAR(30) DEFAULT 'direct'" },
-    { name: 'connector_printer_key', definition: 'VARCHAR(255) NULL' },
     {
       name: 'connection_method',
       definition:
@@ -371,13 +304,6 @@ async function ensurePrinterBridgeColumns() {
       );
     }
   }
-  await db.query(
-    `UPDATE pos_printers SET delivery_mode = CASE
-       WHEN COALESCE(connector_device_id, bridge_device_id) IS NOT NULL THEN 'connector'
-       WHEN connection_method = 'ethernet' THEN 'direct_network'
-       ELSE COALESCE(NULLIF(delivery_mode, ''), 'direct')
-     END`
-  );
 }
 
 export async function seedDefaultPrinterFromEnv() {
@@ -451,18 +377,17 @@ export async function getDefaultPrinter() {
 export async function createPrinter(data) {
   validatePrinterPayload(data);
   const payload = toDbPayload(data);
-  await validatePrinterRelationships(payload);
 
   const [result] = await db.query(
     `INSERT INTO pos_printers (
       name, model, interface_type, windows_printer_name, ip_address, port,
       bluetooth_device_name, bluetooth_device_id, bluetooth_address, bridge_device_id,
-      connector_device_id, delivery_mode, connector_printer_key, connection_method, com_port, baud_rate,
+      connector_device_id, connection_method, com_port, baud_rate,
       paper_width, print_mode, print_resolution,
       initial_commands, cutter_commands, drawer_commands,
       print_receipts, print_orders, auto_print_receipt, single_item_per_order_ticket,
       group_identical_items, usage_type, station_id, is_default, is_active
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       payload.name,
       payload.model,
@@ -475,8 +400,6 @@ export async function createPrinter(data) {
       payload.bluetooth_address,
       payload.bridge_device_id,
       payload.connector_device_id,
-      payload.delivery_mode,
-      payload.connector_printer_key,
       payload.connection_method,
       payload.com_port,
       payload.baud_rate,
@@ -513,13 +436,12 @@ export async function updatePrinter(id, data) {
 
   validatePrinterPayload({ ...existing, ...data }, { partial: true });
   const payload = toDbPayload({ ...existing, ...data });
-  await validatePrinterRelationships(payload);
 
   await db.query(
     `UPDATE pos_printers SET
       name = ?, model = ?, interface_type = ?, windows_printer_name = ?, ip_address = ?, port = ?,
       bluetooth_device_name = ?, bluetooth_device_id = ?, bluetooth_address = ?, bridge_device_id = ?,
-      connector_device_id = ?, delivery_mode = ?, connector_printer_key = ?, connection_method = ?, com_port = ?, baud_rate = ?,
+      connector_device_id = ?, connection_method = ?, com_port = ?, baud_rate = ?,
       paper_width = ?, print_mode = ?, print_resolution = ?,
       initial_commands = ?, cutter_commands = ?, drawer_commands = ?,
       print_receipts = ?, print_orders = ?, auto_print_receipt = ?, single_item_per_order_ticket = ?,
@@ -537,8 +459,6 @@ export async function updatePrinter(id, data) {
       payload.bluetooth_address,
       payload.bridge_device_id,
       payload.connector_device_id,
-      payload.delivery_mode,
-      payload.connector_printer_key,
       payload.connection_method,
       payload.com_port,
       payload.baud_rate,
@@ -592,28 +512,9 @@ export async function deletePrinter(id) {
 export async function setDefaultPrinter(id) {
   const printer = await getPrinterById(id);
   if (!printer || !printer.isActive) throw new Error('Printer not found.');
-  const connection = await db.getConnection();
-  try {
-    await connection.beginTransaction();
-    if (printer.stationId == null) {
-      await connection.query(
-        'UPDATE pos_printers SET is_default = 0 WHERE is_active = 1 AND station_id IS NULL AND usage_type = ?',
-        [printer.usageType]
-      );
-    } else {
-      await connection.query(
-        'UPDATE pos_printers SET is_default = 0 WHERE is_active = 1 AND station_id = ? AND usage_type = ?',
-        [printer.stationId, printer.usageType]
-      );
-    }
-    await connection.query('UPDATE pos_printers SET is_default = 1 WHERE id = ?', [id]);
-    await connection.commit();
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
+
+  await db.query('UPDATE pos_printers SET is_default = 0 WHERE is_active = 1');
+  await db.query('UPDATE pos_printers SET is_default = 1 WHERE id = ?', [id]);
   return getPrinterById(id);
 }
 
@@ -670,10 +571,6 @@ export function buildPrinterJobSnapshot(printer) {
     printerConfig: {
       paper_width: printer.paperWidth || printer.paper_width || '58',
       usage_type: printer.usageType || printer.usage_type || 'receipt',
-      station_id: printer.stationId ?? printer.station_id ?? null,
-      station_name: printer.stationName || printer.station_name || null,
-      delivery_mode: printer.deliveryMode || printer.delivery_mode || (connectorDeviceId ? 'connector' : connectionMethod === 'ethernet' ? 'direct_network' : 'direct'),
-      connector_printer_key: printer.connectorPrinterKey || printer.connector_printer_key || null,
       connection_method: connectionMethod,
       connector_device_id: connectorDeviceId,
       bridge_device_id: connectorDeviceId,

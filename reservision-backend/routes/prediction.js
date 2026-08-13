@@ -19,7 +19,7 @@ import {
 const router = express.Router();
 
 router.get("/ping", predictionPing);
-router.get("/readiness", getPredictionReadiness);
+router.get("/readiness", requireAdmin, getPredictionReadiness);
 // Descriptive 7-day rolling average — not a Prophet forecast (kept for backward compatibility)
 router.get("/tomorrow-bookings", predictTomorrowBookings);
 router.get("/predict-date", requireAdmin, predictDate);

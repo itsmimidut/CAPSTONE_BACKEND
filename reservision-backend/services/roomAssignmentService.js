@@ -247,7 +247,7 @@ export const insertOccupiedDatesForBooking = async (connection, {
 
   for (const date of dates) {
     await connection.query(
-      `INSERT IGNORE INTO occupied_dates (inventory_item_id, booking_id, occupied_date, created_at)
+      `INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date, created_at)
        VALUES (?, ?, ?, NOW())`,
       [itemId, bid, date]
     )

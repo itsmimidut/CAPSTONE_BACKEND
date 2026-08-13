@@ -8,6 +8,7 @@
     "start": "node server.js",
     "dev:all": "concurrently -k -n backend,frontend,ngrok -c blue,green,magenta \"npm start\" \"npm --prefix ../../CAPSTONE_FRONTEND/reservision run dev\" \".\\ngrok.exe http 8000\"",
     "test": "node --test tests/*.test.js",
+    "verify:operational-readiness": "node scripts/verifyOperationalReadiness.mjs",
     "verify:booking-guard": "node scripts/verify-booking-guard.mjs",
     "verify:structured-inventory-details": "node scripts/verify-structured-inventory-details.mjs",
     "migrate:phase3-structured": "node scripts/run-phase3-structured-migration.mjs",
@@ -22,7 +23,9 @@
     "verify:eshop-items": "node scripts/verifyPosTransactionItems.js",
     "verify:eshop-feedback-phase-c": "node scripts/verifyEshopFeedbackPhaseC.js",
     "verify:eshop-feedback-phase-e": "node scripts/verifyEshopFeedbackPhaseE.js",
-    "sync:booking-demand-dataset": "node scripts/sync-booking-demand-dataset.mjs"
+    "sync:booking-demand-dataset": "node scripts/sync-booking-demand-dataset.mjs",
+    "audit:reservation-occupancy": "node scripts/auditReservationOccupancy.mjs",
+    "repair:reservation-occupancy": "node scripts/auditReservationOccupancy.mjs --apply"
   },
   "keywords": [],
   "author": "",
@@ -37,6 +40,7 @@
     "dotenv": "^17.2.3",
     "escpos": "^3.0.0-alpha.6",
     "escpos-usb": "^3.0.0-alpha.4",
+    "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "express-rate-limit": "^8.5.2",
     "express-validator": "^7.3.2",

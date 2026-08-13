@@ -5,9 +5,9 @@ import {
     deleteStation,
 } from '../services/posStationService.js';
 
-export const getPosStations = async (req, res) => {
+export const getPosStations = async (_req, res) => {
     try {
-        const stations = await listStations({ activeOnly: ['1', 'true'].includes(String(req.query?.activeOnly || '').toLowerCase()) });
+        const stations = await listStations();
         return res.json({ success: true, data: stations });
     } catch (error) {
         console.error('getPosStations error:', error);
@@ -20,7 +20,6 @@ export const postPosStation = async (req, res) => {
         const station = await createStation({
             stationCode: req.body?.stationCode || req.body?.station_code,
             stationName: req.body?.stationName || req.body?.station_name,
-            description: req.body?.description,
             location: req.body?.location,
             active: req.body?.active,
         });
@@ -43,7 +42,6 @@ export const patchPosStation = async (req, res) => {
         const station = await updateStation(id, {
             stationCode: req.body?.stationCode ?? req.body?.station_code,
             stationName: req.body?.stationName ?? req.body?.station_name,
-            description: req.body?.description,
             location: req.body?.location,
             active: req.body?.active,
         });
@@ -53,7 +51,7 @@ export const patchPosStation = async (req, res) => {
         return res.json({ success: true, data: station });
     } catch (error) {
         if (error.statusCode) {
-            return res.status(error.statusCode).json({ success: false, error: error.message, code: error.code, dependencies: error.dependencies });
+            return res.status(error.statusCode).json({ success: false, error: error.message, code: error.code });
         }
         if (error.code === 'ER_DUP_ENTRY') {
             return res.status(409).json({ success: false, error: 'Station code already exists' });
@@ -70,7 +68,7 @@ export const deletePosStation = async (req, res) => {
         return res.json({ success: true, data: result });
     } catch (error) {
         if (error.statusCode) {
-            return res.status(error.statusCode).json({ success: false, error: error.message, code: error.code, dependencies: error.dependencies });
+            return res.status(error.statusCode).json({ success: false, error: error.message, code: error.code });
         }
         console.error('deletePosStation error:', error);
         return res.status(500).json({ success: false, error: 'Failed to delete station' });

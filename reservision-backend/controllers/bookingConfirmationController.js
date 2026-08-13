@@ -1,5 +1,4 @@
 import db from '../config/db.js';
-import { requireBookingItemType } from '../utils/bookingItemType.js';
 import { generateQRCode, formatBookingDataForQR } from '../services/qrCodeService.js';
 import { sendBookingConfirmationWithQR } from '../services/emailService.js';
 import { isCashPaymentMethod } from '../services/paymentRecordService.js';
@@ -22,6 +21,7 @@ import {
 import { computeEntranceFeeForBookingItems } from '../services/entranceFeeService.js';
 import { computeExtraPersonFeeForBookingItems } from '../services/extraPersonFeeService.js';
 import { getInitialBookingPaymentState } from '../services/bookingPaymentLifecycle.js';
+import { reserveInventoryDateRange, sendReservationWriteError } from '../services/reservationConflictService.js';
 
 const roundMoney = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
@@ -623,7 +623,7 @@ export const createBookingConfirmation = async (req, res) => {
       }
 
       // Determine item type
-      const rawItemType = item.swimmingDetails
+      const itemType = item.swimmingDetails
         ? 'Swimming'
         : isEvent
           ? 'Event'
@@ -633,11 +633,6 @@ export const createBookingConfirmation = async (req, res) => {
       const itemName = item.swimmingDetails
         ? (item.name || 'Swimming Lesson Package')
         : (item.name || 'Item')
-      const itemType = requireBookingItemType(rawItemType, {
-        bookingType,
-        itemName,
-        fallback: isRoom ? 'Room' : null,
-      });
 
       console.log(`📦 Adding booking item: ${itemType} - ${itemName} [${bookingType}]`)
 
@@ -1048,6 +1043,13 @@ export const createBookingConfirmation = async (req, res) => {
           console.warn(`⚠️ No numeric item ID found for swimming, skipping occupied_dates`)
         }
       } else if (isRoom && itemCheckIn && itemCheckOut) {
+        await reserveInventoryDateRange(connection, {
+          inventoryItemId: item.item_id || item.id,
+          bookingId,
+          startDate: itemCheckIn,
+          endDate: itemCheckOut,
+          itemName,
+        })
         // Room: use item-level dates for availability check
         const roomCheckIn = itemCheckIn
         const roomCheckOut = itemCheckOut
@@ -1059,6 +1061,7 @@ export const createBookingConfirmation = async (req, res) => {
            FROM bookings b
            INNER JOIN booking_items bi ON b.booking_id = bi.booking_id
            WHERE bi.inventory_item_id = ? 
+           AND b.booking_id <> ?
            AND b.booking_status IN ('Confirmed', 'Pending')
            AND b.payment_status IN ('Paid', 'pending')
            AND (
@@ -1066,7 +1069,7 @@ export const createBookingConfirmation = async (req, res) => {
              OR (b.check_in_date >= ? AND b.check_in_date < ?)
              OR (b.check_out_date > ? AND b.check_out_date <= ?)
            )`,
-          [itemId, roomCheckOut, roomCheckIn, roomCheckIn, roomCheckOut, roomCheckIn, roomCheckOut]
+          [itemId, bookingId, roomCheckOut, roomCheckIn, roomCheckIn, roomCheckOut, roomCheckIn, roomCheckOut]
         )
 
         if (conflicts.length > 0) {
@@ -1193,11 +1196,7 @@ export const createBookingConfirmation = async (req, res) => {
       }
     }
     console.error('Booking confirmation error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to create booking',
-      details: error.message
-    });
+    return sendReservationWriteError(res, error, 'Failed to create booking');
   } finally {
     connection.release();
   }

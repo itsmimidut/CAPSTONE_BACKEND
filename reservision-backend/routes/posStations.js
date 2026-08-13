@@ -1,6 +1,6 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/authenticateToken.js';
-import { requireAdmin, requireStaff } from '../middleware/authorize.js';
+import { requireStaff } from '../middleware/authorize.js';
 import {
     getPosStations,
     postPosStation,
@@ -11,8 +11,8 @@ import {
 const router = express.Router();
 
 router.get('/', authenticateToken, requireStaff, getPosStations);
-router.post('/', authenticateToken, requireAdmin, postPosStation);
-router.patch('/:id', authenticateToken, requireAdmin, patchPosStation);
-router.delete('/:id', authenticateToken, requireAdmin, deletePosStation);
+router.post('/', authenticateToken, requireStaff, postPosStation);
+router.patch('/:id', authenticateToken, requireStaff, patchPosStation);
+router.delete('/:id', authenticateToken, requireStaff, deletePosStation);
 
 export default router;

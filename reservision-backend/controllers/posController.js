@@ -47,7 +47,6 @@ import {
     PosOrderSessionError,
 } from '../services/posOrderSessionService.js';
 import { logSystemEvent } from '../utils/logger.js';
-import { getTerminalSettings } from '../services/posTerminalService.js';
 import {
     insertNormalizedPosTransactionItems,
     normalizePosTransactionItems,
@@ -1565,22 +1564,7 @@ export const printReceiptSecure = async (req, res) => {
     try {
         const receiptNo = String(req.params.receiptNo || '').trim();
         const { type, bookingReference, source } = req.body || {};
-        const terminalId = String(req.body?.terminalId ?? req.body?.terminal_id ?? '').trim();
-        if (!terminalId) {
-            return res.status(400).json({ success: false, message: 'This POS terminal is not registered.', code: 'TERMINAL_NOT_REGISTERED' });
-        }
-        const terminal = await getTerminalSettings(terminalId);
-        if (!terminal?.registered || !terminal?.stationId) {
-            return res.status(400).json({
-                success: false,
-                message: terminal?.registered ? 'This POS terminal has not been assigned to a station.' : 'This POS terminal is not registered.',
-                code: terminal?.registered ? 'STATION_NOT_ASSIGNED' : 'TERMINAL_NOT_REGISTERED',
-            });
-        }
-        if (!terminal.station?.active) {
-            return res.status(409).json({ success: false, message: 'The assigned POS station is inactive.', code: 'STATION_INACTIVE' });
-        }
-        const stationId = terminal.stationId;
+        const stationId = req.body?.stationId ?? req.body?.station_id ?? null;
         const requestedBy = Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
         const printSource = String(source || 'manual').trim().toLowerCase() === 'auto'
             ? 'auto'
@@ -1769,9 +1753,7 @@ export const retryPrintJob = async (req, res) => {
         }
 
         const requestedBy = Number(req.user?.id ?? req.user?.user_id ?? 0) || null;
-        const result = await retryFailedPrintJob(jobId, requestedBy, {
-            routing: req.body?.routing || 'current',
-        });
+        const result = await retryFailedPrintJob(jobId, requestedBy);
 
         logSystemEvent('POS_PRINT_JOB_RETRY', {
             original_job_id: jobId,

@@ -610,7 +610,7 @@ export async function prepareAndQueuePrint({
     }
 }
 
-export async function retryFailedPrintJob(jobId, requestedBy = null, { routing = 'current' } = {}) {
+export async function retryFailedPrintJob(jobId, requestedBy = null) {
     const job = await getPrintJobById(jobId);
     if (!job) {
         throw new PosReceiptPrintError('Print job not found', 404, 'JOB_NOT_FOUND');
@@ -624,30 +624,13 @@ export async function retryFailedPrintJob(jobId, requestedBy = null, { routing =
         );
     }
 
-    const config = job.printerConfig || {};
-    const stationId = config.station_id ?? config.stationId ?? null;
-    const usageType = config.usage_type ?? config.usageType ?? null;
-    const useCurrentRouting = String(routing || 'current').toLowerCase() === 'current';
-    if (useCurrentRouting && stationId != null) {
-        const station = await getStationById(stationId);
-        if (!station?.active) {
-            throw new PosReceiptPrintError(
-                'The original station is inactive. Select an explicit replacement route.',
-                409,
-                'STATION_INACTIVE'
-            );
-        }
-    }
-
     return prepareAndQueuePrint({
         receiptNo: job.receiptNo,
         type: job.printType,
         bookingReference: job.bookingReference,
         source: 'manual',
         requestedBy,
-        stationId: useCurrentRouting ? stationId : null,
-        usageType: useCurrentRouting ? usageType : null,
-        printerSnapshot: !useCurrentRouting && (job.printerId || job.printerName)
+        printerSnapshot: job.printerId || job.printerName
             ? {
                 printerId: job.printerId,
                 printerName: job.printerName,

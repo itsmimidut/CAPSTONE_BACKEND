@@ -49,7 +49,7 @@ import {
   validateBookingDates,
   generateBookingReference as generateRef
 } from "../services/roomAssignmentService.js";
-import { requireBookingItemType } from "../utils/bookingItemType.js";
+import { reserveInventoryDateRange, sendReservationWriteError } from '../services/reservationConflictService.js';
 
 /**
  * Generate unique booking reference
@@ -114,7 +114,7 @@ const setCachedReservationResponse = (key, payload) => {
   });
 };
 
-const invalidateReservationCache = () => {
+export const invalidateReservationCache = () => {
   // Invalidation: clear all reservation-related cache entries after any data mutation.
   reservationResponseCache.clear();
 };
@@ -503,20 +503,8 @@ export const createBooking = async (req, res) => {
             throw new Error(`Quantity greater than 1 is not allowed for room/cottage inventory item "${item.item.name || item.item.item_id}".`)
           }
 
-          // Query occupied_dates for any date in [checkIn, checkOut) for this inventory item
-          const [rows] = await connection.query(
-            `SELECT COUNT(*) as cnt FROM occupied_dates
-             WHERE inventory_item_id = ?
-             AND occupied_date >= ?
-             AND occupied_date < ?`,
-            [item.item.item_id, startIso, endIso]
-          );
-
-          const occupiedCount = rows[0].cnt || 0;
-
-          if (occupiedCount > 0) {
-            throw new Error(`Item \"${item.item.name || item.item.title || item.item.room_number || item.item.item_id}\" is not available for the selected dates (${startIso} to ${endIso}).`);
-          }
+          // Inventory rows are already locked above. Occupancy is atomically
+          // checked and persisted after the booking receives its ID.
         }
       }
     }
@@ -589,11 +577,7 @@ export const createBooking = async (req, res) => {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
-          requireBookingItemType(item.item.category, {
-            bookingType: item.item.booking_type || item.item.bookingType,
-            itemName: item.item.name,
-            fallback: 'Room',
-          }),
+          item.item.category || 'Room',
           item.item.name,
           item.item.desc || item.item.description,
           item.item.item_id || null,
@@ -610,17 +594,13 @@ export const createBooking = async (req, res) => {
 
       // If item is a room/cottage and has check-in/out dates, create occupied dates
       if (item.item.perNight && checkIn && checkOut && item.item.item_id) {
-        const start = new Date(checkIn);
-        const end = new Date(checkOut);
-
-        // Generate occupied dates for each day
-        for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
-          await connection.query(
-            `INSERT INTO occupied_dates (inventory_item_id, booking_id, occupied_date)
-             VALUES (?, ?, ?)`,
-            [item.item.item_id, bookingId, d.toISOString().slice(0, 10)]
-          );
-        }
+        await reserveInventoryDateRange(connection, {
+          inventoryItemId: item.item.item_id,
+          bookingId,
+          startDate: checkIn,
+          endDate: checkOut,
+          itemName: item.item.name || item.item.title || 'Accommodation',
+        });
       }
     }
 
@@ -658,11 +638,7 @@ export const createBooking = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error creating booking:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create booking',
-      error: error.message
-    });
+    return sendReservationWriteError(res, error, 'Failed to create booking');
   } finally {
     connection.release();
   }
@@ -985,6 +961,9 @@ export const getAdminReservations = async (req, res) => {
         ${extraPersonFeeSelect}
         b.total,
         b.created_at,
+        b.booking_source,
+        b.is_historical_import,
+        b.legacy_reference,
           COALESCE(r.refund_status, b.refund_status, '') AS refund_status,
           COALESCE(r.refund_amount, b.refund_amount, 0) AS refund_amount,
           r.refunded_at,

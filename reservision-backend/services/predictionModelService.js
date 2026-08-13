@@ -15,6 +15,21 @@ export const UNVERIFIED_MODEL_PATH = path.join(MODEL_DIR, 'bookings_model.unveri
 export const UNVERIFIED_GUESTS_MODEL_PATH = path.join(MODEL_DIR, 'guests_model.unverified.joblib');
 
 export const MINIMUM_TRAINING_DAYS = Number(process.env.PREDICTION_MINIMUM_DEMAND_DAYS || 120);
+export const MAX_MODEL_AGE_DAYS = Number(process.env.PREDICTION_MAX_MODEL_AGE_DAYS || 30);
+
+export function assessModelFreshness({ trainedAt, modelDateTo, historyDateTo, now = new Date(), maxAgeDays = MAX_MODEL_AGE_DAYS } = {}) {
+  const trained = trainedAt ? new Date(trainedAt) : null;
+  const ageDays = trained && !Number.isNaN(trained.getTime())
+    ? Math.max(0, Math.floor((now.getTime() - trained.getTime()) / 86_400_000))
+    : null;
+  const newerHistoryAvailable = Boolean(modelDateTo && historyDateTo && historyDateTo > modelDateTo);
+  return {
+    fresh: ageDays !== null && ageDays <= maxAgeDays && !newerHistoryAvailable,
+    age_days: ageDays,
+    maximum_age_days: maxAgeDays,
+    newer_history_available: newerHistoryAvailable,
+  };
+}
 
 /** Normalize MySQL DATE / Date / ISO strings to YYYY-MM-DD (no UTC day-shift). */
 export function toDateOnly(value) {
@@ -173,6 +188,11 @@ export async function getForecastReadiness() {
   let model_source = 'none';
 
   const metadataReady = metadata?.ready === true || metadata?.safe_for_live_use === true;
+  const freshness = assessModelFreshness({
+    trainedAt: metadata?.trained_at,
+    modelDateTo: metadata?.date_to || metadata?.training_end,
+    historyDateTo: history.date_to,
+  });
   const metadataSourceOk = (
     !metadata
     || metadata.data_source === 'live_bookings'
@@ -213,6 +233,12 @@ export async function getForecastReadiness() {
     code = 'MODEL_NOT_READY';
     message = 'Trained models are missing a positive readiness flag.';
     model_source = 'live_bookings';
+  } else if (!freshness.fresh) {
+    code = 'MODEL_STALE';
+    message = freshness.newer_history_available
+      ? `New booking-demand history is available through ${history.date_to}; retrain the model before operational use.`
+      : `Forecast model is ${freshness.age_days ?? 'an unknown number of'} days old; maximum allowed age is ${freshness.maximum_age_days} days.`;
+    model_source = 'live_bookings';
   } else {
     safe_for_live_use = true;
     model_source = 'live_bookings';
@@ -241,6 +267,7 @@ export async function getForecastReadiness() {
       trained_at: metadata?.trained_at || null,
       model_version: metadata?.model_version || null,
       baseline_note: deriveBaselineNote(metadata),
+      freshness,
     },
     training: {
       status: safe_for_live_use ? 'ready' : code === 'NOT_ENOUGH_HISTORY' ? 'skipped' : 'unavailable',

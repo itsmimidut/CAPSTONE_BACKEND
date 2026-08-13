@@ -134,12 +134,23 @@ import { ensureEshopFulfillmentSchema } from "./services/eshopFulfillmentService
 import { ensurePosOrderSessionSchema } from "./services/posOrderSessionService.js";
 import { initDisplayWebSocket } from "./services/displayWebSocketService.js";
 import { ensureLegacyConversionSchema } from "./services/inventoryLegacyConversionService.js";
+import { getOperationalReadiness } from "./services/operationalReadinessService.js";
 
 // ============================================================
 // EXPRESS APP INITIALIZATION
 // ============================================================
 // Create Express application instance
 const app = express();
+
+app.get('/health/live', (req, res) => res.json({ status: 'alive', uptime_seconds: Math.floor(process.uptime()) }));
+app.get('/health/ready', async (req, res) => {
+  const readiness = await getOperationalReadiness();
+  return res.status(readiness.ready ? 200 : 503).json({
+    status: readiness.status,
+    checked_at: readiness.checked_at,
+    components: Object.fromEntries(Object.entries(readiness.components).map(([key, value]) => [key, { ready: value.ready }])),
+  });
+});
 
 // ============================================================
 // MIDDLEWARE CONFIGURATION
@@ -289,6 +300,10 @@ app.use("/api/admin/refunds", authenticateToken, requireStaff, adminRefundRoutes
 
 // Admin routes (reports, notifications, etc.)
 app.use("/api/admin", ...requireAdminAuth);
+app.get('/api/admin/operational-readiness', async (req, res) => {
+  const readiness = await getOperationalReadiness();
+  return res.status(readiness.ready ? 200 : 503).json({ success: readiness.ready, data: readiness });
+});
 app.use("/api/admin/reports", adminSalesReportRoutes);
 app.use("/api/admin/sales-reports", adminSalesReportsQueryRoutes);
 app.use("/api/admin/dashboard", adminDashboardRoutes);
@@ -1028,21 +1043,28 @@ const httpServer = createServer(app);
 initDisplayWebSocket(httpServer);
 startPrinterDaemon();
 
-httpServer.listen(8000, () => console.log("Server running at http://localhost:8000"));
+const port = Number(process.env.PORT || 8000);
+httpServer.listen(port, () => console.log(`Server running on port ${port}`));
 
 function stopPrinterDaemon() {
   if (!printerDaemonProcess || printerDaemonProcess.killed) return;
   printerDaemonProcess.kill('SIGTERM');
 }
 
-process.on('SIGINT', () => {
+let shuttingDown = false;
+const shutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; draining HTTP and database connections.`);
   stopPrinterDaemon();
-  process.exit(0);
-});
+  httpServer.close(async () => {
+    try { await db.end(); } catch {}
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 10_000).unref();
+};
 
-process.on('SIGTERM', () => {
-  stopPrinterDaemon();
-  process.exit(0);
-});
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // npm run dev:all to run all backend and frontend servers concurrently

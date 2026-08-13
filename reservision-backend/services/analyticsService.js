@@ -59,20 +59,92 @@ async function getColumns(tableName) {
   }
 }
 
+const ANALYTICS_MODULES = new Set([
+  'overview', 'bookings', 'guests', 'swimming', 'pos', 'shop', 'promos', 'revenue', 'occupancy',
+]);
+const ANALYTICS_CATEGORIES = new Set([
+  ...ANALYTICS_MODULES,
+  'room', 'cottage', 'event',
+]);
+const ANALYTICS_STATUS_ALIASES = new Map([
+  ['pending', 'pending'],
+  ['confirmed', 'confirmed'],
+  ['checked-in', 'in_progress'],
+  ['checked_in', 'in_progress'],
+  ['in-progress', 'in_progress'],
+  ['in_progress', 'in_progress'],
+  ['checked-out', 'completed'],
+  ['checked_out', 'completed'],
+  ['completed', 'completed'],
+  ['cancelled', 'cancelled'],
+  ['canceled', 'cancelled'],
+  ['no-show', 'no_show'],
+  ['no_show', 'no_show'],
+  ['voided', 'voided'],
+]);
+const MAX_ANALYTICS_RANGE_DAYS = 366;
+
+function analyticsFilterError(message, code) {
+  return Object.assign(new Error(message), { statusCode: 400, code });
+}
+
+function parseAnalyticsDate(value, fieldName) {
+  const normalized = toDateString(value);
+  if (!normalized || !/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw analyticsFilterError(`Invalid ${fieldName}.`, 'INVALID_DATE_RANGE');
+  }
+  const date = new Date(`${normalized}T00:00:00Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== normalized) {
+    throw analyticsFilterError(`Invalid ${fieldName}.`, 'INVALID_DATE_RANGE');
+  }
+  return { normalized, date };
+}
+
 export function parseAnalyticsFilters(query = {}) {
   const today = new Date();
-  const dateTo = toDateString(query.date_to || query.dateTo || today);
-  let dateFrom = toDateString(query.date_from || query.dateFrom);
-  if (!dateFrom) {
+  let rawDateFrom = query.date_from || query.dateFrom;
+  const rawDateTo = query.date_to || query.dateTo || today;
+  if (!rawDateFrom) {
     const start = new Date(today.getFullYear(), today.getMonth(), 1);
-    dateFrom = toDateString(start);
+    rawDateFrom = start;
   }
+
+  const { normalized: dateFrom, date: startDate } = parseAnalyticsDate(rawDateFrom, 'start date');
+  const { normalized: dateTo, date: endDate } = parseAnalyticsDate(rawDateTo, 'end date');
+  const rangeDays = Math.floor((endDate - startDate) / 86400000) + 1;
+  if (rangeDays < 1) {
+    throw analyticsFilterError('The start date cannot be later than the end date.', 'INVALID_DATE_RANGE');
+  }
+  if (rangeDays > MAX_ANALYTICS_RANGE_DAYS) {
+    throw analyticsFilterError(`Date range cannot exceed ${MAX_ANALYTICS_RANGE_DAYS} days.`, 'DATE_RANGE_TOO_LARGE');
+  }
+
+  const rawStatus = query.status ? String(query.status).trim().toLowerCase() : '';
+  const status = rawStatus ? ANALYTICS_STATUS_ALIASES.get(rawStatus) : null;
+  if (rawStatus && !status) {
+    throw analyticsFilterError('Invalid analytics status filter.', 'INVALID_STATUS');
+  }
+
+  const rawCategory = query.category ? String(query.category).trim().toLowerCase() : '';
+  if (rawCategory && !ANALYTICS_CATEGORIES.has(rawCategory)) {
+    throw analyticsFilterError('Invalid analytics category filter.', 'INVALID_CATEGORY');
+  }
+
+  const rawModule = query.module ? String(query.module).trim().toLowerCase() : '';
+  if (rawModule && !ANALYTICS_MODULES.has(rawModule)) {
+    throw analyticsFilterError('Invalid analytics module filter.', 'INVALID_CATEGORY');
+  }
+
+  const category = rawCategory || null;
+  const module = rawModule || (category && ANALYTICS_MODULES.has(category) ? category : null);
   return {
     dateFrom,
     dateTo,
-    status: query.status ? String(query.status).trim() : null,
+    status,
+    transactionStatus: status,
     categoryType: query.category_type || query.categoryType || null,
-    module: query.module ? String(query.module).trim().toLowerCase() : null,
+    category,
+    module,
   };
 }
 
